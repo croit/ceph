@@ -2794,6 +2794,7 @@ int main(int argc, const char **argv)
   int remove_bad = false;
   int check_head_obj_locator = false;
   int max_buckets = -1;
+  int objects_from_stdin = false;
   bool max_buckets_specified = false;
   map<string, bool> categories;
   string caps;
@@ -2917,6 +2918,8 @@ int main(int argc, const char **argv)
       pool = rgw_pool(pool_name);
     } else if (ceph_argparse_witharg(args, i, &val, "-o", "--object", (char*)NULL)) {
       object = val;
+    } else if (ceph_argparse_binary_flag(args, i, &objects_from_stdin, NULL, "--objects-from-stdin", (char*)NULL)) {
+      // do nothing
     } else if (ceph_argparse_witharg(args, i, &val, "--object-version", (char*)NULL)) {
       object_version = val;
     } else if (ceph_argparse_witharg(args, i, &val, "--client-id", (char*)NULL)) {
@@ -6080,7 +6083,7 @@ next:
       cerr << "ERROR: bucket not specified" << std::endl;
       return EINVAL;
     }
-    if (object.empty()) {
+    if (object.empty() && !objects_from_stdin) {
       cerr << "ERROR: object not specified" << std::endl;
       return EINVAL;
     }
@@ -6092,23 +6095,48 @@ next:
       return -ret;
     }
 
-    rgw_obj obj(bucket, object);
-    obj.key.set_instance(object_version);
-    bool need_rewrite = true;
-    if (min_rewrite_stripe_size > 0) {
-      ret = check_min_obj_stripe_size(store, bucket_info, obj, min_rewrite_stripe_size, &need_rewrite);
-      if (ret < 0) {
-        ldout(store->ctx(), 0) << "WARNING: check_min_obj_stripe_size failed, r=" << ret << dendl;
-      }
-    }
-    if (need_rewrite) {
-      ret = store->rewrite_obj(bucket_info, obj);
-      if (ret < 0) {
-        cerr << "ERROR: object rewrite returned: " << cpp_strerror(-ret) << std::endl;
-        return -ret;
+    if (objects_from_stdin) {
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        rgw_obj obj(bucket, line);
+        obj.key.set_instance(object_version);
+        bool need_rewrite = true;
+        if (min_rewrite_stripe_size > 0) {
+          ret = check_min_obj_stripe_size(store, bucket_info, obj, min_rewrite_stripe_size, &need_rewrite);
+          if (ret < 0) {
+            ldout(store->ctx(), 0) << "WARNING: check_min_obj_stripe_size failed, r=" << ret << dendl;
+          }
+        }
+        if (need_rewrite) {
+          ret = store->rewrite_obj(bucket_info, obj);
+          if (ret < 0) {
+            cerr << "ERROR: rewrite for " << line << " returned: " << cpp_strerror(-ret) << std::endl;
+          } else {
+            cout << "rewrote object " << line << "\n";
+          }
+        } else {
+          cerr << "skipped object " << line << "\n";
+        }
       }
     } else {
-      ldout(store->ctx(), 20) << "skipped object" << dendl;
+      rgw_obj obj(bucket, object);
+      obj.key.set_instance(object_version);
+      bool need_rewrite = true;
+      if (min_rewrite_stripe_size > 0) {
+        ret = check_min_obj_stripe_size(store, bucket_info, obj, min_rewrite_stripe_size, &need_rewrite);
+        if (ret < 0) {
+          ldout(store->ctx(), 0) << "WARNING: check_min_obj_stripe_size failed, r=" << ret << dendl;
+        }
+      }
+      if (need_rewrite) {
+        ret = store->rewrite_obj(bucket_info, obj);
+        if (ret < 0) {
+          cerr << "ERROR: object rewrite returned: " << cpp_strerror(-ret) << std::endl;
+          return -ret;
+        }
+      } else {
+        ldout(store->ctx(), 20) << "skipped object" << dendl;
+      }
     }
   }
 
