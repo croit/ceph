@@ -1,3 +1,9 @@
+ceph (14.2.9-1.1) stable; urgency=medium
+
+  * Backport for librbd https://github.com/ceph/ceph/pull/35385
+
+ -- croit GmbH <matthias.grandl@croit.io>  Fri, 10 Jul 2020 16:06:26 +0200 
+
 ceph (14.2.9-1) stable; urgency=medium
 
   * New upstream release
