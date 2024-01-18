@@ -922,7 +922,8 @@ int RGWAsyncRemoveObj::_send_request(const DoutPrefixProvider *dpp)
     del_op->params.unmod_since = timestamp;
   }
   if (versioned) {
-    del_op->params.versioning_status = BUCKET_VERSIONED | bucket->get_info().versioning_status();
+    del_op->params.versioning_status =
+        BUCKET_VERSIONED | bucket->get_info().versioning_status();
   }
   del_op->params.olh_epoch = versioned_epoch;
   del_op->params.marker_version_id = marker_version_id;
@@ -931,6 +932,7 @@ int RGWAsyncRemoveObj::_send_request(const DoutPrefixProvider *dpp)
   del_op->params.mtime = timestamp;
   del_op->params.high_precision_time = true;
   del_op->params.zones_trace = &zones_trace;
+  del_op->params.null_verid = false;
 
   ret = del_op->delete_obj(dpp, null_yield, true);
   if (ret < 0) {

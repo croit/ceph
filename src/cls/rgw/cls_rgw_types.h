@@ -110,6 +110,7 @@ inline std::ostream& operator<<(std::ostream& out, RGWModifyOp op) {
 
 enum RGWBILogFlags {
   RGW_BILOG_FLAG_VERSIONED_OP = 0x1,
+  RGW_BILOG_NULL_VERSION = 0x2,
 };
 
 enum RGWCheckMTimeType {
@@ -659,6 +660,8 @@ struct rgw_bi_log_entry {
   bool is_versioned() {
     return ((bilog_flags & RGW_BILOG_FLAG_VERSIONED_OP) != 0);
   }
+
+  bool is_null_verid() { return ((bilog_flags & RGW_BILOG_NULL_VERSION) != 0); }
 };
 WRITE_CLASS_ENCODER(rgw_bi_log_entry)
 

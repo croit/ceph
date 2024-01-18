@@ -4290,6 +4290,7 @@ class RGWBucketSyncSingleEntryCR : public RGWCoroutine {
 
   rgw_obj_key key;
   bool versioned;
+  bool null_verid;
   std::optional<uint64_t> versioned_epoch;
   rgw_bucket_entry_owner owner;
   real_time timestamp;
@@ -4314,24 +4315,20 @@ class RGWBucketSyncSingleEntryCR : public RGWCoroutine {
   std::string zone_name;
 
 public:
-  RGWBucketSyncSingleEntryCR(RGWDataSyncCtx *_sc,
-                             rgw_bucket_sync_pipe& _sync_pipe,
-                             const rgw_obj_key& _key, bool _versioned,
-                             std::optional<uint64_t> _versioned_epoch,
-                             real_time& _timestamp,
-                             const rgw_bucket_entry_owner& _owner,
-                             RGWModifyOp _op, RGWPendingState _op_state,
-		             const T& _entry_marker, RGWSyncShardMarkerTrack<T, K> *_marker_tracker, rgw_zone_set& _zones_trace,
-                             RGWSyncTraceNodeRef& _tn_parent) : RGWCoroutine(_sc->cct),
-						      sc(_sc), sync_env(_sc->env),
-                                                      sync_pipe(_sync_pipe), bs(_sync_pipe.info.source_bs),
-                                                      key(_key), versioned(_versioned), versioned_epoch(_versioned_epoch),
-                                                      owner(_owner),
-                                                      timestamp(_timestamp), op(_op),
-                                                      op_state(_op_state),
-                                                      entry_marker(_entry_marker),
-                                                      marker_tracker(_marker_tracker),
-                                                      sync_status(0){
+  RGWBucketSyncSingleEntryCR(
+      RGWDataSyncCtx *_sc, rgw_bucket_sync_pipe &_sync_pipe,
+      const rgw_obj_key &_key, bool _versioned, bool _null_verid,
+      std::optional<uint64_t> _versioned_epoch, real_time &_timestamp,
+      const rgw_bucket_entry_owner &_owner, RGWModifyOp _op,
+      RGWPendingState _op_state, const T &_entry_marker,
+      RGWSyncShardMarkerTrack<T, K> *_marker_tracker,
+      rgw_zone_set &_zones_trace, RGWSyncTraceNodeRef &_tn_parent)
+      : RGWCoroutine(_sc->cct), sc(_sc), sync_env(_sc->env),
+        sync_pipe(_sync_pipe), bs(_sync_pipe.info.source_bs), key(_key),
+        versioned(_versioned), null_verid(_null_verid),
+        versioned_epoch(_versioned_epoch), owner(_owner), timestamp(_timestamp),
+        op(_op), op_state(_op_state), entry_marker(_entry_marker),
+        marker_tracker(_marker_tracker), sync_status(0) {
     stringstream ss;
     ss << bucket_shard_str{bs} << "/" << key << "[" << versioned_epoch.value_or(0) << "]";
     set_description() << "bucket sync single entry (source_zone=" << sc->source_zone << ") b=" << ss.str() << " log_entry=" << entry_marker << " op=" << (int)op << " op_state=" << (int)op_state;
@@ -4402,6 +4399,9 @@ public:
 	    }
             if (op == CLS_RGW_OP_UNLINK_INSTANCE) {
               versioned = true;
+            }
+            if (null_verid) {
+              key.instance = "null";
             }
             tn->log(10, SSTR("removing obj: " << sc->source_zone << "/" << bs.bucket << "/" << key << "[" << versioned_epoch.value_or(0) << "]"));
             call(data_sync_module->remove_object(dpp, sc, sync_pipe, key, timestamp, versioned, versioned_epoch.value_or(0), &zones_trace));
@@ -4611,12 +4611,15 @@ int RGWBucketFullSyncCR::operate(const DoutPrefixProvider *dpp)
           tn->log(0, SSTR("ERROR: cannot start syncing " << entry->key << ". Duplicate entry?"));
         } else {
           using SyncCR = RGWBucketSyncSingleEntryCR<rgw_obj_key, rgw_obj_key>;
-          yield spawn(new SyncCR(sc, sync_pipe, entry->key,
-                                 false, /* versioned, only matters for object removal */
-                                 entry->versioned_epoch, entry->mtime,
-                                 entry->owner, entry->get_modify_op(), CLS_RGW_STATE_COMPLETE,
-                                 entry->key, &marker_tracker, zones_trace, tn),
-                      false);
+          yield spawn(
+              new SyncCR(
+                  sc, sync_pipe, entry->key,
+                  false, /* versioned, only matters for object removal */
+                  false, /* null_verid, only matters for object removal */
+                  entry->versioned_epoch, entry->mtime, entry->owner,
+                  entry->get_modify_op(), CLS_RGW_STATE_COMPLETE, entry->key,
+                  &marker_tracker, zones_trace, tn),
+              false);
         }
         drain_with_cb(sc->lcc.adj_concurrency(cct->_conf->rgw_bucket_sync_spawn_window),
                       [&](uint64_t stack_id, int ret) {
@@ -5020,8 +5023,8 @@ int RGWBucketShardIncrementalSyncCR::operate(const DoutPrefixProvider *dpp)
             }
             tn->log(20, SSTR("entry->timestamp=" << entry->timestamp));
             using SyncCR = RGWBucketSyncSingleEntryCR<string, rgw_obj_key>;
-            spawn(new SyncCR(sc, sync_pipe, key,
-                             entry->is_versioned(), versioned_epoch,
+            spawn(new SyncCR(sc, sync_pipe, key, entry->is_versioned(),
+                             entry->is_null_verid(), versioned_epoch,
                              entry->timestamp, owner, entry->op, entry->state,
                              cur_id, &marker_tracker, entry->zones_trace, tn),
                   false);
