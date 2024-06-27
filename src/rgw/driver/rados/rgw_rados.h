@@ -1346,7 +1346,7 @@ public:
       const rgw_obj &obj_instance, const std::string &op_tag,
       const std::string &olh_tag, uint64_t olh_epoch,
       rgw_zone_set *zones_trace = nullptr, bool log_op = true,
-      bool null_verid = false);
+      uint16_t bilog_flags = 0);
   int bucket_index_read_olh_log(const DoutPrefixProvider *dpp,
                                 RGWBucketInfo& bucket_info, RGWObjState& state,
                                 const rgw_obj& obj_instance, uint64_t ver_marker,
@@ -1382,7 +1382,7 @@ public:
                           uint64_t olh_epoch, optional_yield y,
                           rgw_zone_set *zones_trace = nullptr,
                           bool log_op = true, const bool force = false,
-                          bool null_verid = false);
+                          uint16_t bilog_flags = 0, bool null_verid = false);
 
   void check_pending_olh_entries(const DoutPrefixProvider *dpp, std::map<std::string, bufferlist>& pending_entries, std::map<std::string, bufferlist> *rm_pending_entries);
   int remove_olh_pending_entries(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, RGWObjState& state, const rgw_obj& olh_obj, std::map<std::string, bufferlist>& pending_attrs);

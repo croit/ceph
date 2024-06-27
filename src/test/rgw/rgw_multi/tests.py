@@ -760,6 +760,44 @@ def test_versioned_object_incremental_sync():
     for _, bucket in zone_bucket:
         zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
 
+def test_null_version_id_delete():
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    zone = zonegroup_conns.rw_zones[0]
+
+    # create a non-versioned bucket
+    bucket = zone.create_bucket(gen_bucket_name())
+    log.debug('created bucket=%s', bucket.name)
+    zonegroup_meta_checkpoint(zonegroup)
+    obj = 'obj'
+
+    # sync the initial null version, forcing full sync to finish before deletion
+    key1 = new_key(zone, bucket, obj)
+    key1.set_contents_from_string('null version payload')
+    log.debug('created initial version id=%s', key1.version_id)
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    bucket.configure_versioning(True)
+    zonegroup_meta_checkpoint(zonegroup)
+
+    # sync a numbered version so the null deletion must preserve the current head
+    key2 = new_key(zone, bucket, obj)
+    key2.set_contents_from_string('numbered version payload')
+    log.debug('created new version id=%s', key2.version_id)
+    assert key2.version_id and key2.version_id != 'null'
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    bucket.delete_key(obj, version_id='null')
+    versions = list(bucket.list_versions(obj))
+    assert len(versions) == 1
+    assert versions[0].version_id == key2.version_id
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # deleting the remaining numbered version must leave no delete marker
+    bucket.delete_key(obj, version_id=key2.version_id)
+    assert not list(bucket.list_versions(obj))
+    zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
 def test_concurrent_versioned_object_incremental_sync():
     zonegroup = realm.master_zonegroup()
     zonegroup_conns = ZonegroupConns(zonegroup)
