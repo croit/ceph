@@ -550,10 +550,13 @@ void MDLog::_prepare_new_segment()
   uint64_t seq = event_seq + 1;
   dout(7) << __func__ << " seq " << seq << dendl;
 
-  segments[seq] = new LogSegment(seq);
+  auto *ls = new LogSegment(seq);;
+  segments[seq] = ls;
 
   logger->inc(l_mdl_segadd);
   logger->set(l_mdl_seg, segments.size());
+
+  dout(20) << __func__ << ": starting new segment " << *ls << dendl;
 
   // Adjust to next stray dir
   mds->mdcache->advance_stray();
