@@ -2452,6 +2452,8 @@ public:
         }
       }
 
+      drain_all();
+
       return set_cr_done();
     }
     return 0;
