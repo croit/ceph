@@ -7883,6 +7883,11 @@ int RGWRados::apply_olh_log(
       ldpp_dout(dpp, 20) << "olh_log_entry: epoch=" << iter->first << " op=" << (int)entry.op
                      << " key=" << entry.key.name << "[" << entry.key.instance << "] "
                      << (entry.delete_marker ? "(delete)" : "") << dendl;
+
+      if (link_epoch == iter->first)
+        ldpp_dout(dpp, 1) << "apply_olh_log epoch collision detected for " << entry.key
+                          << "; incoming op: " << entry.op << "(" << entry.op_tag << ")" << dendl;
+
       switch (entry.op) {
       case CLS_RGW_OLH_OP_REMOVE_INSTANCE:
         remove_instances.push_back(entry.key);
@@ -10375,4 +10380,3 @@ void RGWOLHPendingInfo::dump(Formatter *f) const
   utime_t ut(time);
   encode_json("time", ut, f);
 }
-

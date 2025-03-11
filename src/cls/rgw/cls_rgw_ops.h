@@ -234,6 +234,7 @@ WRITE_CLASS_ENCODER(rgw_cls_link_olh_op)
 struct rgw_cls_unlink_instance_op {
   cls_rgw_obj_key key;
   std::string op_tag;
+  // remote versioned epoch during multisite sync, or zero for a local op
   uint64_t olh_epoch;
   bool log_op;
   uint16_t bilog_flags;

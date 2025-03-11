@@ -555,6 +555,7 @@ WRITE_CLASS_ENCODER(rgw_bucket_olh_log_entry)
 struct rgw_bucket_olh_entry {
   cls_rgw_obj_key key;
   bool delete_marker;
+  // versioned_epoch of the current target (legacy records use counters)
   uint64_t epoch;
   std::map<uint64_t, std::vector<struct rgw_bucket_olh_log_entry> > pending_log;
   std::string tag;
