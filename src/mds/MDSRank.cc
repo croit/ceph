@@ -4206,6 +4206,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_use_global_snaprealm_seq_for_subvol_case_e",
     "mds_use_global_snaprealm_seq_for_subvol_case_f",
     "mds_use_global_snaprealm_seq_for_subvol_case_g"
+    "mds_use_global_snaprealm_seq_for_subvol"
   });
   static_assert(std::is_sorted(as_sv.begin(), as_sv.end()),
                 "keys are not sorted!");

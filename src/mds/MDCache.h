@@ -257,6 +257,10 @@ class MDCache {
     return symlink_recovery;
   }
 
+  bool get_use_global_snaprealm_seq(void) const {
+    return use_global_snaprealm_seq;
+  }
+
   /**
    * Call this when you know that a CDentry is ready to be passed
    * on to StrayManager (i.e. this is a stray you've just created)
@@ -1598,6 +1602,7 @@ private:
   bool use_global_snaprealm_seq_for_subvol_case_a = true;
   bool use_global_snaprealm_seq_for_subvol_case_c = true;
   bool use_global_snaprealm_seq_for_subvol_case_d = true;
+  bool use_global_snaprealm_seq = true;
 
   std::map<dirfrag_t, ufragment> uncommitted_fragments;
 
