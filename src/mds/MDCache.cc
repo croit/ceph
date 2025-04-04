@@ -191,6 +191,7 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   kill_dirfrag_at = static_cast<enum dirfrag_killpoint>(g_conf().get_val<int64_t>("mds_kill_dirfrag_at"));
 
   kill_shutdown_at = g_conf().get_val<uint64_t>("mds_kill_shutdown_at");
+  use_global_snaprealm_seq = g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol");
 
   use_global_snaprealm_seq_for_subvol_case_a =
     g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_a");
@@ -287,6 +288,10 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
   if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_d")) {
     use_global_snaprealm_seq_for_subvol_case_d =
       g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_d");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol")) {
+    use_global_snaprealm_seq = g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol");
+    dout(20) << __func__ << " mds_use_global_snaprealm_seq_for_subvol now " << use_global_snaprealm_seq << dendl;
   }
 
   migrator->handle_conf_change(changed, mdsmap);
