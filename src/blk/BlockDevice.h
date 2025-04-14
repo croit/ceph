@@ -245,7 +245,7 @@ public:
   uint64_t get_optimal_io_size() const { return optimal_io_size; }
 
   /// hook to provide utilization of thinly-provisioned device
-  virtual int get_ebd_state(ExtBlkDevState &state) const {
+  virtual int get_ebd_statfs(store_statfs_t &statfs) const {
     return -ENOENT;
   }
 
