@@ -402,6 +402,9 @@ void MDSDaemon::set_up_admin_socket()
 				     asok_hook,
 				     "Remove a damage table entry");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("damage clear", asok_hook,
+                                     "clear the damage list");
+  ceph_assert(r == 0);
   r = admin_socket->register_command("osdmap barrier name=target_epoch,type=CephInt",
 				     asok_hook,
 				     "Wait until the MDS has this OSD map epoch");

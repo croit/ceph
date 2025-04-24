@@ -1555,3 +1555,27 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_damage_log_to_file
+  type: bool
+  level: advanced
+  desc: send mds damage lines to a file
+  fmt_desc: Determines if damages should appear in a file.
+  default: false
+  see_also:
+  - log_file
+  with_legacy: true
+- name: mds_damage_log_file
+  type: str
+  level: advanced
+  desc: path to log file where damage will be written
+  fmt_desc: The location of the logging file for where damage of mds will be written.
+  daemon_default: /var/log/ceph/$cluster-$name-damages.log
+  with_legacy: true
+- name: mds_scrub_hard_link
+  type: bool
+  level: advanced
+  desc: force scrubbing hard link
+  default: false
+  services:
+  - mds
+  with_legacy: true

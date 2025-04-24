@@ -305,6 +305,8 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
 
     bool last_scrub_dirty = false; /// are our stamps dirty with respect to disk state?
     bool scrub_in_progress = false; /// are we currently scrubbing?
+    std::vector<std::pair<std::string, inodeno_t>> remote_links;
+    bool forward_scrub = true;
 
     fragset_t queued_frags;
 
@@ -457,6 +459,15 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   void scrub_finished();
 
   void scrub_aborted();
+
+  void scrub_add_remote_link(
+      std::vector<std::pair<std::string, inodeno_t>> &&remote_links);
+
+  void scrub_reset_remote_links();
+
+  std::vector<std::pair<std::string, inodeno_t>> &&scrub_move_remote_links();
+
+  void set_forward_scrub(bool forward_scrub);
 
   fragset_t& scrub_queued_frags() {
     ceph_assert(scrub_infop);
