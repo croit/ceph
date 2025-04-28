@@ -1288,6 +1288,7 @@ protected:
 
 
 public:
+  int64_t get_pg_stat_adjustment();
   int pg_stat_adjust(osd_stat_t *new_stat);
 protected:
   bool delete_needs_sleep = false;
