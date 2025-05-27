@@ -75,3 +75,6 @@
 [submodule "src/qatzip"]
 	path = src/qatzip
 	url = https://github.com/intel/qatzip.git
+[submodule "src/nvme"]
+	path = src/nvme
+	url = https://github.com/linux-nvme/libnvme
