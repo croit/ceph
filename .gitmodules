@@ -72,3 +72,6 @@
 [submodule "src/jaegertracing/opentelemetry-cpp"]
 	path = src/jaegertracing/opentelemetry-cpp
 	url = https://github.com/open-telemetry/opentelemetry-cpp.git
+[submodule "src/nvme"]
+	path = src/nvme
+	url = https://github.com/linux-nvme/libnvme
