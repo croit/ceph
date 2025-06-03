@@ -1,3 +1,8 @@
+
+if (WITH_CEPHFS_NOTIFICATION)
+  find_package(RDKafka 0.9.2 REQUIRED)
+endif()
+
 set(mds_srcs
   BatchOp.cc
   Capability.cc
@@ -48,9 +53,29 @@ set(mds_srcs
   ${CMAKE_SOURCE_DIR}/src/common/TrackedOp.cc
   ${CMAKE_SOURCE_DIR}/src/common/MemoryModel.cc
   ${CMAKE_SOURCE_DIR}/src/osdc/Journaler.cc
-  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc)
+  ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc
+  MDSNotificationManager.cc)
+
+if (WITH_CEPHFS_NOTIFICATION)
+  list(APPEND mds_srcs MDSKafka.cc MDSUDPEndpoint.cc MDSNotificationMessage.cc)
+endif()
+
 add_library(mds STATIC ${mds_srcs})
 target_link_libraries(mds PRIVATE
   legacy-option-headers Boost::url
-  heap_profiler cpu_profiler osdc ${LUA_LIBRARIES})
+  heap_profiler cpu_profiler osdc ${LUA_LIBRARIES}
+  ${Boost_LIBRARIES})
+
+if (WITH_CEPHFS_NOTIFICATION)
+  target_link_libraries(mds PRIVATE RDKafka::RDKafka)
+endif()
+
+if (WITH_CEPHFS_NOTIFICATION AND WITH_LIBURING)
+  target_link_libraries(mds PRIVATE uring::uring)
+endif()
+
 target_include_directories(mds PRIVATE "${LUA_INCLUDE_DIR}")
+
+if (WITH_CEPHFS_NOTIFICATION)
+  target_include_directories(mds PRIVATE ${Boost_INCLUDE_DIRS})
+endif()
