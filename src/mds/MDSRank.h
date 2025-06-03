@@ -31,6 +31,7 @@
 #include "PurgeQueue.h"
 #include "MetricsHandler.h"
 #include "mon/MonClient.h"
+#include "MDSNotificationManager.h"
 
 // Full .h import instead of forward declaration for PerfCounter, for the
 // benefit of those including this header and using MDSRank::logger
@@ -150,6 +151,7 @@ class ScrubStack;
 class C_ExecAndReply;
 class QuiesceDbManager;
 class QuiesceAgent;
+class MDSNotificationManager;
 
 /**
  * The public part of this class's interface is what's exposed to all
@@ -195,6 +197,7 @@ class MDSRank {
     }
 
     bool is_daemon_stopping() const;
+    void send_to_peers(const ref_t<Message>& m);
 
     MDSTableClient *get_table_client(int t);
     MDSTableServer *get_table_server(int t);
@@ -421,6 +424,7 @@ class MDSRank {
 
     SnapServer *snapserver = nullptr;
     SnapClient *snapclient = nullptr;
+    std::unique_ptr <MDSNotificationManager> notification_manager;
 
     SessionMap sessionmap;
 

@@ -3127,6 +3127,8 @@ bool Locker::check_inode_max_size(CInode *in, bool force_wrlock,
       if (new_mtime > pi.inode->rstat.rctime)
 	pi.inode->rstat.rctime = new_mtime;
     }
+    mds->notification_manager->push_notification(
+        mds->get_nodeid(), in, CEPH_MDS_NOTIFY_MODIFY, false, in->is_dir(), -1);
   }
 
   // use EOpen if the file is still open; otherwise, use EUpdate.
@@ -3983,8 +3985,12 @@ void Locker::_update_cap_fields(CInode *in, int dirty, const cref_t<MClientCaps>
       dout(7) << "  mtime " << pi->mtime << " -> " << mtime
 	      << " for " << *in << dendl;
       pi->mtime = mtime;
-      if (mtime > pi->rstat.rctime)
-	pi->rstat.rctime = mtime;
+      if (mtime > pi->rstat.rctime) {
+	      pi->rstat.rctime = mtime;
+      }
+      mds->notification_manager->push_notification(
+          mds->get_nodeid(), in, CEPH_MDS_NOTIFY_MODIFY, false, in->is_dir(),
+          m->get_source().num());
     }
     if (in->is_file() &&   // ONLY if regular file
 	size > pi->size) {

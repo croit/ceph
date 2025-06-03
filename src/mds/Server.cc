@@ -4711,6 +4711,9 @@ void Server::handle_client_open(const MDRequestRef& mdr)
     mds->locker->check_inode_max_size(cur);
 
   // make sure this inode gets into the journal
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_OPEN | CEPH_MDS_NOTIFY_ACCESS,
+      true, cur->is_dir(), mdr->get_client());
   if (cur->is_auth() && cur->last == CEPH_NOSNAP &&
       mdcache->open_file_table.should_log_open(cur)) {
     EOpen *le = new EOpen(mds->mdlog);
@@ -4946,6 +4949,10 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
   C_MDS_openc_finish *fin = new C_MDS_openc_finish(this, mdr, dn, newi);
 
   set_reply_extra_bl(req, _inode->ino, mdr->reply_extra_bl);
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), newi, CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_OPEN,
+      true, newi->is_dir(), mdr->get_client());
 
   journal_and_reply(mdr, newi, dn, le, fin);
 
@@ -5624,7 +5631,12 @@ void Server::handle_client_setattr(const MDRequestRef& mdr)
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
-  
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur,
+      CEPH_MDS_NOTIFY_SET_ATTRIB | CEPH_MDS_NOTIFY_ACCESS, true, cur->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
 								   truncating_smaller, changed_ranges));
 
@@ -5688,6 +5700,11 @@ void Server::do_open_truncate(const MDRequestRef& mdr, int cmode)
     ceph_assert(mdr->dn[0].size());
     dn = mdr->dn[0].back();
   }
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), in,
+      CEPH_MDS_NOTIFY_MODIFY | CEPH_MDS_NOTIFY_ACCESS | CEPH_MDS_NOTIFY_OPEN,
+      true, in->is_dir(), mdr->get_client());
 
   journal_and_reply(mdr, in, dn, le, new C_MDS_inode_update_finish(this, mdr, in, old_size > 0,
 								   changed_ranges));
@@ -5777,7 +5794,11 @@ void Server::handle_client_setlayout(const MDRequestRef& mdr)
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
-  
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_LAYOUT, true, cur->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
 
@@ -5893,6 +5914,11 @@ void Server::handle_client_setdirlayout(const MDRequestRef& mdr)
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
   mdr->no_early_reply = true;
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_LAYOUT, true, cur->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
 
@@ -6720,6 +6746,10 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_XATTRIB, true, cur->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur,
 								   false, false, adjust_realm));
   return;
@@ -7002,6 +7032,10 @@ void Server::handle_client_setxattr(const MDRequestRef& mdr)
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
 
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_SET_XATTRIB, true, cur->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
 
@@ -7070,6 +7104,10 @@ void Server::handle_client_removexattr(const MDRequestRef& mdr)
   le->metablob.add_client_req(req->get_reqid(), req->get_oldest_client_tid());
   mdcache->predirty_journal_parents(mdr, &le->metablob, cur, 0, PREDIRTY_PRIMARY);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, cur);
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), cur, CEPH_MDS_NOTIFY_REM_XATTRIB, true, cur->is_dir(),
+      mdr->get_client());
 
   journal_and_reply(mdr, cur, 0, le, new C_MDS_inode_update_finish(this, mdr, cur));
 }
@@ -7425,6 +7463,11 @@ void Server::handle_client_mknod(const MDRequestRef& mdr)
 				    PREDIRTY_PRIMARY|PREDIRTY_DIR, 1);
   le->metablob.add_primary_dentry(dn, newi, true, true, true);
 
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), newi,
+      CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_SET_ATTRIB, true, newi->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
   mds->balancer->maybe_fragment(dn->get_dir(), false);
 }
@@ -7525,6 +7568,10 @@ void Server::handle_client_mkdir(const MDRequestRef& mdr)
   // make sure this inode gets into the journal
   le->metablob.add_opened_ino(newi->ino());
 
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), newi, CEPH_MDS_NOTIFY_CREATE, true, newi->is_dir(),
+      mdr->get_client());
+
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
 
   // We hit_dir (via hit_inode) in our finish callback, but by then we might
@@ -7592,6 +7639,10 @@ void Server::handle_client_symlink(const MDRequestRef& mdr)
   journal_allocated_inos(mdr, &le->metablob);
   mdcache->predirty_journal_parents(mdr, &le->metablob, newi, dn->get_dir(), PREDIRTY_PRIMARY|PREDIRTY_DIR, 1);
   le->metablob.add_primary_dentry(dn, newi, true, true);
+
+  mds->notification_manager->push_notification(
+      mds->get_nodeid(), newi, CEPH_MDS_NOTIFY_CREATE, true, newi->is_dir(),
+      mdr->get_client());
 
   journal_and_reply(mdr, newi, dn, le, new C_MDS_mknod_finish(this, mdr, dn, newi));
   mds->balancer->maybe_fragment(dir, false);
@@ -7728,6 +7779,10 @@ void Server::handle_client_link(const MDRequestRef& mdr)
 
   // go!
   ceph_assert(g_conf()->mds_kill_link_at != 1);
+
+  mds->notification_manager->push_notification_link(
+      mds->get_nodeid(), targeti, destdn, CEPH_MDS_NOTIFY_SET_ATTRIB,
+      CEPH_MDS_NOTIFY_CREATE, targeti->is_dir(), mdr->get_client());
 
   // local or remote?
   if (targeti->is_auth()) 
@@ -8457,6 +8512,10 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
 
   if (mds_allow_async_dirops && !rmdir && dnl->is_primary() && mdr->dn[0].size() == 1)
     mds->locker->create_lock_cache(mdr, diri);
+
+  mds->notification_manager->push_notification_link(
+      mds->get_nodeid(), in, dn, CEPH_MDS_NOTIFY_SET_ATTRIB,
+      CEPH_MDS_NOTIFY_DELETE, in->is_dir(), mdr->get_client());
 
   // ok!
   if (dnl->is_remote() && !dnl->get_inode()->is_auth()) 
@@ -9501,6 +9560,9 @@ void Server::handle_client_rename(const MDRequestRef& mdr)
 
   // -- commit locally --
   C_MDS_rename_finish *fin = new C_MDS_rename_finish(this, mdr, srcdn, destdn, straydn);
+
+  mds->notification_manager->push_notification_move(
+      mds->get_nodeid(), srcdn, destdn, srci->is_dir(), mdr->get_client());
 
   journal_and_reply(mdr, srci, destdn, le, fin);
   mds->balancer->maybe_fragment(destdn->get_dir(), false);
@@ -11473,6 +11535,11 @@ void Server::handle_client_mksnap(const MDRequestRef& mdr)
   mdcache->predirty_journal_parents(mdr, &le->metablob, diri, 0, PREDIRTY_PRIMARY, false);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, diri);
 
+  mds->notification_manager->push_notification_snap(
+      mds->get_nodeid(), diri, std::string(snapname),
+      CEPH_MDS_NOTIFY_CREATE | CEPH_MDS_NOTIFY_SET_ATTRIB, diri->is_dir(),
+      mdr->get_client());
+
   // journal the snaprealm changes
   submit_mdlog_entry(le, new C_MDS_mksnap_finish(this, mdr, diri, info),
                      mdr, __func__);
@@ -11604,6 +11671,11 @@ void Server::handle_client_rmsnap(const MDRequestRef& mdr)
   le->metablob.add_table_transaction(TABLE_SNAP, stid);
   mdcache->predirty_journal_parents(mdr, &le->metablob, diri, 0, PREDIRTY_PRIMARY, false);
   mdcache->journal_dirty_inode(mdr.get(), &le->metablob, diri);
+
+  mds->notification_manager->push_notification_snap(
+      mds->get_nodeid(), diri, std::string(snapname),
+      CEPH_MDS_NOTIFY_DELETE | CEPH_MDS_NOTIFY_SET_ATTRIB, diri->is_dir(),
+      mdr->get_client());
 
   submit_mdlog_entry(le, new C_MDS_rmsnap_finish(this, mdr, diri, snapid),
                      mdr, __func__);
