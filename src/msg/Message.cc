@@ -155,6 +155,11 @@
 #include "messages/MMDSFragmentNotify.h"
 #include "messages/MMDSFragmentNotifyAck.h"
 
+#ifdef WITH_CEPHFS_NOTIFICATION
+#include "messages/MNotificationInfoKafkaTopic.h"
+#include "messages/MNotificationInfoUDPEndpoint.h"
+#endif
+
 #include "messages/MExportDirDiscover.h"
 #include "messages/MExportDirDiscoverAck.h"
 #include "messages/MExportDirCancel.h"
@@ -861,6 +866,16 @@ Message *decode_message(CephContext *cct,
   case MSG_MDS_PING:
     m = make_message<MMDSPing>();
     break;
+
+#ifdef WITH_CEPHFS_NOTIFICATION
+  case MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC:
+    m = make_message <MNotificationInfoKafkaTopic> ();
+    break;
+
+  case MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT:
+    m = make_message <MNotificationInfoUDPEndpoint> ();
+    break;
+#endif
 
   case MSG_MGR_BEACON:
     m = make_message<MMgrBeacon>();
