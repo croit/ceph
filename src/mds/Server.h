@@ -35,6 +35,7 @@
 #include "Mutation.h"
 #include "MDSContext.h"
 
+// class MDSNotificationManager;
 class OSDMap;
 class LogEvent;
 class EMetaBlob;

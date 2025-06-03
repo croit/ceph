@@ -203,6 +203,11 @@
 #define MSG_MDS_PING               0x502  // for mds pinger
 #define MSG_MDS_SCRUB_STATS        0x503  // for mds scrub stack
 
+#ifdef WITH_CEPHFS_NOTIFICATION
+#define MSG_MDS_NOTIFICATION_INFO_KAFKA_TOPIC        0x507
+#define MSG_MDS_NOTIFICATION_INFO_UDP_ENDPOINT   0x508
+#endif
+
 // *** generic ***
 #define MSG_TIMECHECK             0x600
 #define MSG_MON_HEALTH            0x601
