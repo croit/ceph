@@ -585,7 +585,11 @@ static int remove_expired_obj(
   RGWObjState* obj_state{nullptr};
   ret = obj->get_obj_state(dpp, &obj_state, null_yield, true);
   if (ret < 0) {
-    return ret;
+    /* for delete markers, we expect get_obj_state() to "fail"
+     * with -ENOENT */
+    if (!(o.is_delete_marker() && ret == -ENOENT)) {
+      return ret;
+    }
   }
 
   std::unique_ptr<rgw::sal::Object::DeleteOp> del_op
@@ -621,10 +625,9 @@ static int remove_expired_obj(
       "ERROR: publishing notification failed, with error: " << ret << dendl;
   } else {
     // send request to notification manager
-    (void) notify->publish_commit(dpp, obj_state->size,
-				  ceph::real_clock::now(),
-				  obj_state->attrset[RGW_ATTR_ETAG].to_str(),
-				  version_id);
+    (void)notify->publish_commit(
+        dpp, obj->get_obj_size(), ceph::real_clock::now(),
+        obj->get_attrs()[RGW_ATTR_ETAG].to_str(), version_id);
   }
 
   return ret;
@@ -1221,13 +1224,15 @@ public:
 			<< oc.wq->thr_name() << dendl;
       return false;
     }
+    /* don't remove the delete marker if that would expose a non-current
+     * version as current */
     if (oc.next_has_same_name(o.key.name)) {
-      ldpp_dout(dpp, 20) << __func__ << "(): key=" << o.key
-			<< ": next is same object, skipping "
-			<< oc.wq->thr_name() << dendl;
+      ldpp_dout(dpp, 20)
+          << __func__ << "(): key=" << o.key
+          << ": dm expiration would expose a non-current version, skipping "
+          << oc.wq->thr_name() << dendl;
       return false;
     }
-
     *exp_time = real_clock::now();
 
     return true;
