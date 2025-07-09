@@ -67,6 +67,7 @@ RGWObjState::RGWObjState(const RGWObjState& rhs) : obj (rhs.obj) {
   is_atomic = rhs.is_atomic;
   has_attrs = rhs.has_attrs;
   exists = rhs.exists;
+  is_dm = rhs.is_dm;
   size = rhs.size;
   accounted_size = rhs.accounted_size;
   mtime = rhs.mtime;

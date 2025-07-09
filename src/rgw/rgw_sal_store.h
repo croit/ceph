@@ -191,6 +191,7 @@ class StoreObject : public Object {
     virtual bool is_prefetch_data() override { return state.prefetch_data; }
     virtual void set_compressed() override { state.compressed = true; }
     virtual bool is_compressed() override { return state.compressed; }
+    virtual bool is_delete_marker() override { return state.is_dm; }
     virtual void invalidate() override {
       rgw_obj obj = state.obj;
       bool is_atomic = state.is_atomic;

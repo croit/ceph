@@ -107,6 +107,7 @@ struct RGWObjState {
   bool is_atomic{false};
   bool has_attrs{false};
   bool exists{false};
+  bool is_dm{false};
   uint64_t size{0}; //< size of raw object
   uint64_t accounted_size{0}; //< size before compression, encryption
   ceph::real_time mtime;
@@ -1006,6 +1007,8 @@ class Object {
     virtual void set_compressed() = 0;
     /** Check if this object is compressed */
     virtual bool is_compressed() = 0;
+    /** True if this object is a delete marker (newest version is deleted) */
+    virtual bool is_delete_marker() = 0;
     /** Invalidate cached info about this object, except atomic, prefetch, and
      * compressed */
     virtual void invalidate() = 0;
