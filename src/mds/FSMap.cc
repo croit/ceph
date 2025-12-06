@@ -856,8 +856,7 @@ const MDSMap::mds_info_t* FSMap::find_replacement_for(mds_role_t role) const
   for (const auto& [gid, info] : fs.mds_map.mds_info) {
     if (info.rank == role.rank && info.state == MDSMap::STATE_STANDBY_REPLAY) {
       if (info.is_frozen()) {
-        /* the standby-replay is frozen, do nothing! */
-        return nullptr;
+        continue;
       } else {
         ceph_assert(info.compat.writeable(fs.mds_map.compat));
         return &info;

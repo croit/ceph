@@ -522,7 +522,7 @@ public:
     return get_standby_replay(r) != MDS_GID_NONE;
   }
 
-  bool is_followable(mds_rank_t r) const;
+  int is_followable(mds_rank_t r) const;
   bool is_laggy_gid(mds_gid_t gid) const;
 
   // degraded = some recovery in process.  fixes active membership and
