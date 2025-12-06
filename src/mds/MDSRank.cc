@@ -750,7 +750,8 @@ void MDSRankDispatcher::tick()
 	set_mdsmap_multimds_snaps_allowed();
       }
     }
-
+  }
+  if (is_active() || is_standby_replay()) {
     if (whoami == 0) {
       scrubstack->advance_scrub_status();
       scrubstack->purge_old_scrub_counters();
@@ -2874,7 +2875,7 @@ void MDSRankDispatcher::handle_asok_command(
     r = config_client(client_id, !got_value, option, value, *css);
   } else if (command == "scrub start" ||
 	     command == "scrub_start") {
-    if (!is_active()) {
+    if (!is_active() && ! is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -2905,7 +2906,7 @@ void MDSRankDispatcher::handle_asok_command(
 	}));
     return;
   } else if (command == "scrub abort") {
-    if (!is_active()) {
+    if (!is_active() && !is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -2925,7 +2926,7 @@ void MDSRankDispatcher::handle_asok_command(
         }));
     return;
   } else if (command == "scrub pause") {
-    if (!is_active()) {
+    if (!is_active() && !is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -2945,7 +2946,7 @@ void MDSRankDispatcher::handle_asok_command(
         }));
     return;
   } else if (command == "scrub resume") {
-    if (!is_active()) {
+    if (!is_active() && !is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
