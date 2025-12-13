@@ -20,12 +20,13 @@
 // This plugin does not require any capabilities to be set
 int ExtBlkDevPluginThinNVMe::get_required_cap_set(cap_t caps)
 {
-  cap_value_t arr[1];
+  cap_value_t arr[2];
   arr[0] = CAP_SYS_ADMIN;
-  if (cap_set_flag(caps, CAP_PERMITTED, 1, arr, CAP_SET) < 0) {
+  arr[1] = CAP_DAC_OVERRIDE; // to permit namespace device open
+  if (cap_set_flag(caps, CAP_PERMITTED, 2, arr, CAP_SET) < 0) {
     return -errno;
   }
-  if (cap_set_flag(caps, CAP_EFFECTIVE, 1, arr, CAP_SET) < 0) {
+  if (cap_set_flag(caps, CAP_EFFECTIVE, 2, arr, CAP_SET) < 0) {
     return -errno;
   }
   return 0;
