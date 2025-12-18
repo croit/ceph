@@ -482,43 +482,30 @@ private:
   }
 };
 
-MDSRank::MDSRank(
-    mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
-    LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
-    Beacon &beacon_,
-    std::unique_ptr<MDSMap>& mdsmap_,
-    Messenger *msgr,
-    MonClient *monc_,
-    MgrClient *mgrc,
-    Context *respawn_hook_,
-    Context *suicide_hook_,
-    boost::asio::io_context& ioc) :
-    cct(msgr->cct), mds_lock(mds_lock_), clog(clog_),
-    timer(timer_), mdsmap(mdsmap_),
-    objecter(new Objecter(g_ceph_context, msgr, monc_, ioc)),
-    damage_table(whoami_), sessionmap(this),
-    op_tracker(g_ceph_context, g_conf()->mds_enable_op_tracker,
-               g_conf()->osd_num_op_tracker_shard),
-    progress_thread(this), whoami(whoami_),
-    purge_queue(g_ceph_context, whoami_,
-      mdsmap_->get_metadata_pool(), objecter,
-      new LambdaContext([this](int r) {
-	  std::lock_guard l(mds_lock);
-	  handle_write_error(r);
-	}
-      )
-    ),
-    metrics_handler(cct, this),
-    beacon(beacon_),
-    messenger(msgr), monc(monc_), mgrc(mgrc),
-    respawn_hook(respawn_hook_),
-    suicide_hook(suicide_hook_),
-    inject_journal_corrupt_dentry_first(g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
-    starttime(mono_clock::now()),
-    ioc(ioc)
-{
+MDSRank::MDSRank(mds_rank_t whoami_, ceph::fair_mutex &mds_lock_,
+                 LogChannelRef &clog_,
+                 CommonSafeTimer<ceph::fair_mutex> &timer_, Beacon &beacon_,
+                 std::unique_ptr<MDSMap> &mdsmap_, Messenger *msgr,
+                 MonClient *monc_, MgrClient *mgrc, Context *respawn_hook_,
+                 Context *suicide_hook_, boost::asio::io_context &ioc)
+    : cct(msgr->cct), mds_lock(mds_lock_), clog(clog_), timer(timer_),
+      mdsmap(mdsmap_), objecter(new Objecter(g_ceph_context, msgr, monc_, ioc)),
+      damage_table(whoami_, g_conf().get_val<bool>("mds_damage_log_to_file"),
+                   g_conf().get_val<std::string>("mds_damage_log_file")),
+      sessionmap(this),
+      op_tracker(g_ceph_context, g_conf()->mds_enable_op_tracker,
+                 g_conf()->osd_num_op_tracker_shard),
+      progress_thread(this), whoami(whoami_),
+      purge_queue(g_ceph_context, whoami_, mdsmap_->get_metadata_pool(),
+                  objecter, new LambdaContext([this](int r) {
+                    std::lock_guard l(mds_lock);
+                    handle_write_error(r);
+                  })),
+      metrics_handler(cct, this), beacon(beacon_), messenger(msgr), monc(monc_),
+      mgrc(mgrc), respawn_hook(respawn_hook_), suicide_hook(suicide_hook_),
+      inject_journal_corrupt_dentry_first(
+          g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
+      starttime(mono_clock::now()), ioc(ioc) {
   hb = g_ceph_context->get_heartbeat_map()->add_worker("MDSRank", pthread_self());
 
   // The metadata pool won't change in the whole life time
@@ -2929,6 +2916,9 @@ void MDSRankDispatcher::handle_asok_command(
       goto out;
     }
     damage_table.erase(id);
+  } else if (command == "damage clear") {
+    std::lock_guard l(mds_lock);
+    damage_table.clear();
   } else {
     r = -CEPHFS_ENOSYS;
   }
@@ -3866,6 +3856,8 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_inject_rename_corrupt_dentry_first",
     "mds_inject_journal_corrupt_dentry_first",
     "mds_session_metadata_threshold",
+    "mds_damage_log_to_file",
+    "mds_damage_log_file",
     NULL
   };
   return KEYS;
@@ -3935,6 +3927,14 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
   }
   if (changed.count("mds_inject_journal_corrupt_dentry_first")) {
     inject_journal_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first");
+  }
+  if (changed.count("mds_damage_log_to_file")) {
+    damage_table.set_log_to_file(
+        g_conf().get_val<bool>("mds_damage_log_to_file"));
+  }
+  if (changed.count("mds_damage_log_file")) {
+    damage_table.set_log_file(
+        g_conf().get_val<std::string>("mds_damage_log_file"));
   }
 
   finisher->queue(new LambdaContext([this, changed](int) {

@@ -8493,6 +8493,12 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
           if (mds->damage_table.is_remote_damaged(dnl->get_remote_ino())) {
             dout(4) << "traverse: remote dentry points to damaged ino "
                     << *dn << dendl;
+            std::string path;
+            dn->get_dir()->get_inode()->make_path_string(path);
+            path += "/";
+            path += dn->get_name();
+            mds->damage_table.notify_remote_link_damaged(dnl->get_remote_ino(),
+                                                         path);
             return -CEPHFS_EIO;
           }
           open_remote_dentry(dn, true, cf.build(),
@@ -8817,7 +8823,7 @@ void MDCache::_open_remote_dentry_finish(CDentry *dn, inodeno_t ino, MDSContext 
         path += dn->get_name();
       }
 
-      bool fatal = mds->damage_table.notify_remote_damaged(ino, path);
+      bool fatal = mds->damage_table.notify_remote_link_damaged(ino, path);
       if (fatal) {
 	mds->damaged();
 	ceph_abort();  // unreachable, damaged() respawns us

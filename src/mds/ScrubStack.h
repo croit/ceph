@@ -154,8 +154,12 @@ private:
   friend std::ostream &operator<<(std::ostream &os, const State &state);
 
   friend class C_InodeValidated;
+  friend class C_RemoteInodeOpenned;
+  friend class C_RemoteLinkCheckFinished;
 
-  int _enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top);
+  int _enqueue(
+      MDSCacheObject *obj, ScrubHeaderRef &header, bool top,
+      std::vector<std::pair<std::string, inodeno_t>> &&remote_links = {});
   /**
    * Remove the inode/dirfrag from the stack.
    */
@@ -189,6 +193,12 @@ private:
   void scrub_file_inode(CInode *in);
 
   /**
+   * Scrub a file inode.
+   * @param dn The remote dentry to identify
+   */
+  CInode *remote_link_checkup(CDentry *dn, ScrubHeaderRef &header);
+
+  /**
    * Callback from completion of CInode::validate_disk_state
    * @param in The inode we were validating
    * @param r The return status from validate_disk_state
@@ -211,9 +221,10 @@ private:
    * scrub of the dirfrag.
    *
    * @param dir The dirfrag to scrub (must be auth)
+   * @param added_children set to true if we pushed some of our children
    * @param done set to true if we started to do final scrub
    */
-  void scrub_dirfrag(CDir *dir, bool *done);
+  void scrub_dirfrag(CDir *dir, bool *added_children, bool *done);
   /**
    * Scrub a directory-representing dentry.
    *
@@ -267,6 +278,7 @@ private:
 
   void handle_scrub(const cref_t<MMDSScrub> &m);
   void handle_scrub_stats(const cref_t<MMDSScrubStats> &m);
+  void add_remote_link_damage(const std::string &path, inodeno_t ino);
 
   State state = STATE_IDLE;
   bool clear_stack = false;
