@@ -1263,16 +1263,25 @@ mds_gid_t MDSMap::get_standby_replay(mds_rank_t r) const {
   return MDS_GID_NONE;
 }
 
-bool MDSMap::is_followable(mds_rank_t r) const {
+int MDSMap::is_followable(mds_rank_t r) const {
+  bool found = true;
+  bool degraded = false;
+  int standby_replay_count = 0;
   if (auto it1 = up.find(r); it1 != up.end()) {
-    if (auto it2 = mds_info.find(it1->second); it2 != mds_info.end()) {
-      auto& info = it2->second;
-      if (!info.is_degraded() && !has_standby_replay(r)) {
-        return true;
+    for (auto& [gid,info] : mds_info) {
+      if (gid == it1->second) {
+        found = true;
+        if (info.is_degraded()) {
+          degraded = true;
+          break;
+        }
+      }
+      if (info.rank == r && info.state == STATE_STANDBY_REPLAY) {
+        ++standby_replay_count;
       }
     }
   }
-  return false;
+  return found && !degraded ? standby_replay_count : 0;
 }
 
 bool MDSMap::is_laggy_gid(mds_gid_t gid) const {
