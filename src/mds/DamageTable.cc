@@ -29,6 +29,12 @@ namespace {
  * Record damage to a particular dirfrag, implicitly affecting
  * any dentries within it.
  */
+inline std::ostream& operator<<(std::ostream& os, const DamageEntry& entry)
+{
+  entry.print(os);
+  return os;
+}
+
 class DirFragDamage : public DamageEntry
 {
   public:
@@ -123,6 +129,28 @@ class BacktraceDamage : public DamageEntry
     f->close_section();
   }
 };
+
+class RemoteLinkDamage : public DamageEntry {
+public:
+  inodeno_t ino;
+  std::string head_path;
+  RemoteLinkDamage(inodeno_t ino_, const std::string &head_path_ = "")
+      : ino(ino_), head_path(head_path_) {}
+
+  damage_entry_type_t get_type() const override {
+    return DAMAGE_ENTRY_REMOTE_LINK;
+  }
+
+  void dump(Formatter *f) const override {
+    f->open_object_section("remote_link_damage");
+    f->dump_string("damage_type", "remote_link");
+    f->dump_int("id", id);
+    f->dump_int("ino", ino);
+    f->dump_string("path", path);
+    f->dump_string("head_path", head_path);
+    f->close_section();
+  }
+};
 }
 
 DamageEntry::~DamageEntry()
@@ -132,28 +160,34 @@ bool DamageTable::notify_dentry(
     inodeno_t ino, frag_t frag,
     snapid_t snap_id, std::string_view dname, std::string_view path)
 {
-  if (oversized()) {
+  bool over_sized = oversized();
+  if (!log_to_file && over_sized) {
     return true;
   }
 
   // Special cases: damage to these dirfrags is considered fatal to
   // the MDS rank that owns them.
-  if (
-      (MDS_INO_IS_MDSDIR(ino) && MDS_INO_MDSDIR_OWNER(ino) == rank)
-      ||
-      (MDS_INO_IS_STRAY(ino) && MDS_INO_STRAY_OWNER(ino) == rank)
-     ) {
+  if ((MDS_INO_IS_MDSDIR(ino) && MDS_INO_MDSDIR_OWNER(ino) == rank) ||
+      (MDS_INO_IS_STRAY(ino) && MDS_INO_STRAY_OWNER(ino) == rank)) {
     derr << "Damage to dentries in fragment " << frag << " of ino " << ino
          << "is fatal because it is a system directory for this rank" << dendl;
     return true;
   }
 
-  auto& df_dentries = dentries[DirFragIdent(ino, frag)];
-  if (auto [it, inserted] = df_dentries.try_emplace(DentryIdent(dname, snap_id)); inserted) {
-    auto entry = std::make_shared<DentryDamage>(ino, frag, dname, snap_id);
-    entry->path = path;
-    it->second = entry;
-    by_id[entry->id] = std::move(entry);
+  auto entry = std::make_shared<DentryDamage>(ino, frag, dname, snap_id);
+  entry->path = path;
+  if (log_to_file && log_file_opened) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    auto &df_dentries = dentries[DirFragIdent(ino, frag)];
+    if (auto [it, inserted] =
+            df_dentries.try_emplace(DentryIdent(dname, snap_id));
+        inserted) {
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
   }
 
   return false;
@@ -171,15 +205,24 @@ bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag,
     return true;
   }
 
-  if (oversized()) {
+  bool over_sized = oversized();
+
+  if (!log_to_file && over_sized) {
     return true;
   }
 
-  if (auto [it, inserted] = dirfrags.try_emplace(DirFragIdent(ino, frag)); inserted) {
-    DamageEntryRef entry = std::make_shared<DirFragDamage>(ino, frag);
-    entry->path = path;
-    it->second = entry;
-    by_id[entry->id] = std::move(entry);
+  DamageEntryRef entry = std::make_shared<DirFragDamage>(ino, frag);
+  entry->path = path;
+  if (log_to_file && log_file_opened) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    if (auto [it, inserted] = dirfrags.try_emplace(DirFragIdent(ino, frag));
+        inserted) {
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
   }
 
   return false;
@@ -187,15 +230,47 @@ bool DamageTable::notify_dirfrag(inodeno_t ino, frag_t frag,
 
 bool DamageTable::notify_remote_damaged(inodeno_t ino, std::string_view path)
 {
-  if (oversized()) {
+  bool over_sized = oversized();
+  if (!log_to_file && over_sized) {
     return true;
   }
 
-  if (auto [it, inserted] = remotes.try_emplace(ino); inserted) {
-    auto entry = std::make_shared<BacktraceDamage>(ino);
-    entry->path = path;
-    it->second = entry;
-    by_id[entry->id] = std::move(entry);
+  auto entry = std::make_shared<BacktraceDamage>(ino);
+  entry->path = path;
+  if (log_to_file && log_file_opened) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    if (auto [it, inserted] = remotes.try_emplace(ino); inserted) {
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
+  }
+
+  return false;
+}
+
+bool DamageTable::notify_remote_link_damaged(inodeno_t ino,
+                                             const std::string &path,
+                                             const std::string &head_path) {
+  bool over_sized = oversized();
+  if (!log_to_file && over_sized) {
+    return true;
+  }
+
+  auto entry = std::make_shared<RemoteLinkDamage>(ino, head_path);
+  entry->path = path;
+  if (log_to_file && log_file_opened) {
+    fout << *entry << std::endl;
+  }
+
+  if (!over_sized) {
+    auto& df_remote_links = remote_links[ino];
+    if (auto [it, inserted] = df_remote_links.try_emplace(path); inserted) {
+      it->second = entry;
+      by_id[entry->id] = std::move(entry);
+    }
   }
 
   return false;
@@ -263,6 +338,10 @@ bool DamageTable::is_remote_damaged(
   return remotes.count(ino) > 0;
 }
 
+bool DamageTable::is_remote_link_damaged(const inodeno_t ino) const {
+  return remote_links.count(ino) > 0;
+}
+
 void DamageTable::dump(Formatter *f) const
 {
   f->open_array_section("damage_table");
@@ -293,6 +372,18 @@ void DamageTable::erase(damage_entry_id_t damage_id)
   } else if (type == DAMAGE_ENTRY_BACKTRACE) {
     auto backtrace_entry = std::static_pointer_cast<BacktraceDamage>(entry);
     remotes.erase(backtrace_entry->ino);
+  } else if (type == DAMAGE_ENTRY_REMOTE_LINK) {
+    auto remote_link_entry = std::static_pointer_cast<RemoteLinkDamage>(entry);
+    auto df_remote_link_it = remote_links.find(remote_link_entry->ino);
+    if (df_remote_link_it != remote_links.end()) {
+      auto damage_it = df_remote_link_it->second.find(entry->path);
+      if (damage_it != df_remote_link_it->second.end()) {
+        df_remote_link_it->second.erase(damage_it);
+      }
+      if(df_remote_link_it->second.empty()) {
+        remote_links.erase(df_remote_link_it);
+      }
+    }
   } else {
     derr << "Invalid type " << type << dendl;
     ceph_abort();
@@ -301,3 +392,57 @@ void DamageTable::erase(damage_entry_id_t damage_id)
   by_id.erase(by_id_entry);
 }
 
+void DamageTable::open_damage_log_file(std::ofstream &fout,
+                                       const std::filesystem::path &file_path) {
+  namespace fs = std::filesystem;
+  log_file_opened = false;
+  if (fout.is_open()) {
+    fout.close();
+  }
+  fout.clear();
+
+  const fs::path dir = file_path.parent_path();
+
+  if (!dir.empty()) {
+    std::error_code ec;
+
+    if (!fs::exists(dir, ec)) {
+      if (ec) {
+        dout(0) << "error checking existence of damage dir: " << dir << " ("
+                << ec.message() << ")" << dendl;
+        return;
+      }
+
+      if (!fs::create_directories(dir, ec)) {
+        dout(0) << "failed to create directories for damage file: " << dir
+                << " (" << ec.message() << ")" << dendl;
+        return;
+      }
+    }
+  }
+
+  fout.open(file_path, std::ios::out | std::ios::app);
+
+  if (!fout.is_open()) {
+    dout(0) << "failed to open damage file: " << file_path << dendl;
+    return;
+  }
+
+  log_file_opened = true;
+}
+
+void DamageTable::close_damage_log_file() {
+  if (fout.is_open()) {
+    fout.close();
+  }
+  fout.clear();
+  log_file_opened = false;
+}
+
+void DamageTable::clear() {
+  dirfrags.clear();
+  dentries.clear();
+  remotes.clear();
+  remote_links.clear();
+  by_id.clear();
+}
