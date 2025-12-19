@@ -213,7 +213,7 @@ private:
    * @param dir The dirfrag to scrub (must be auth)
    * @param done set to true if we started to do final scrub
    */
-  void scrub_dirfrag(CDir *dir, bool *done);
+  void scrub_dirfrag(CDir *dir, bool *added_children, bool *done);
   /**
    * Scrub a directory-representing dentry.
    *
