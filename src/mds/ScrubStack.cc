@@ -103,7 +103,7 @@ int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
     scrub_stack.push_front(&obj->item_scrub);
   else
     scrub_stack.push_back(&obj->item_scrub);
-  return 0;
+  return 1;
 }
 
 int ScrubStack::enqueue(CInode *in, ScrubHeaderRef& header, bool top)
@@ -242,16 +242,16 @@ void ScrubStack::kick_off_scrubs()
 	}
       }
     } else if (CDir *dir = dynamic_cast<CDir*>(*it)) {
-      auto next = it;
-      ++next;
+      ++it;
+      bool added_children = false;
       bool done = false; // it's done, so pop it off the stack
-      scrub_dirfrag(dir, &done);
+      scrub_dirfrag(dir, &added_children, &done);
       if (done) {
-	dout(20) << __func__ << " dirfrag, done" << dendl;
-	++it; // child inodes were queued at bottom of stack
-	dequeue(dir);
-      } else {
-	it = next;
+        dout(20) << __func__ << " dirfrag, done" << dendl;
+        dequeue(dir);
+      }
+      if (added_children) {
+        it = scrub_stack.begin();
       }
     } else {
       ceph_assert(0 == "dentry in scrub stack");
@@ -414,10 +414,9 @@ void ScrubStack::scrub_dir_inode_final(CInode *in)
   return;
 }
 
-void ScrubStack::scrub_dirfrag(CDir *dir, bool *done)
+void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
 {
   ceph_assert(dir != NULL);
-
   dout(10) << __func__ << " " << *dir << dendl;
 
   if (!dir->is_complete()) {
@@ -455,7 +454,9 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *done)
 	continue;
       }
       if (dnl->is_primary()) {
-	_enqueue(dnl->get_inode(), header, false);
+        if (_enqueue(dnl->get_inode(), header, true) == 1) {
+          *added_children = true;
+        }
       } else if (dnl->is_remote()) {
 	// TODO: check remote linkage
       }
@@ -476,7 +477,6 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *done)
   *done = true;
   dout(10) << __func__ << " done" << dendl;
 }
-
 void ScrubStack::scrub_file_inode(CInode *in)
 {
   C_InodeValidated *fin = new C_InodeValidated(mdcache->mds, this, in);
