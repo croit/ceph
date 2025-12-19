@@ -2007,7 +2007,7 @@ void CDir::_omap_fetched(bufferlist &hdrbl, map<string, bufferlist> &omap,
     clog->error() << "dir " << dirfrag() << " object missing on disk; some "
                      "files may be lost (" << get_path() << ")";
 
-    go_bad(complete | from_scrub);
+    go_bad(complete || from_scrub);
     return;
   }
 
@@ -2021,14 +2021,14 @@ void CDir::_omap_fetched(bufferlist &hdrbl, map<string, bufferlist> &omap,
 	   << ": " << err.what() << dendl;
       clog->warn() << "Corrupt fnode header in " << dirfrag() << ": "
 		   << err.what() << " (" << get_path() << ")";
-      go_bad(complete | from_scrub);
+      go_bad(complete || from_scrub);
       return;
     }
     if (!p.end()) {
       clog->warn() << "header buffer of dir " << dirfrag() << " has "
 		  << hdrbl.length() - p.get_off() << " extra bytes ("
                   << get_path() << ")";
-      go_bad(complete | from_scrub);
+      go_bad(complete || from_scrub);
       return;
     }
   }
