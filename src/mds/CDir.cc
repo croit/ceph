@@ -1585,8 +1585,8 @@ void CDir::fetch(std::string_view dname, snapid_t last,
   mdcache->mds->balancer->hit_dir(this, META_POP_FETCH);
 }
 
-void CDir::fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c)
-{
+void CDir::fetch_keys(const std::vector<dentry_key_t> &keys, MDSContext *c,
+                      bool from_scrub) {
   dout(10) << __func__ << " " << keys.size() << " keys on " << *this << dendl;
   ceph_assert(is_auth());
   ceph_assert(!is_complete());
@@ -1643,7 +1643,7 @@ void CDir::fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c)
   }
 
   auth_pin(this);
-  _omap_fetch(&str_keys, c);
+  _omap_fetch(&str_keys, c, from_scrub);
 
   if (mdcache->mds->logger)
     mdcache->mds->logger->inc(l_mds_dir_fetch_keys);
@@ -1698,6 +1698,7 @@ public:
   map<string, bufferlist> omap;
   bufferlist btbl;
   int ret1, ret2, ret3;
+  bool from_scrub = false;
 
   C_IO_Dir_OMAP_Fetched(CDir *d, MDSContext *f) :
     CDirIOContext(d), fin(f),
@@ -1719,7 +1720,7 @@ public:
       return;
     }
 
-    dir->_omap_fetched(hdrbl, omap, complete, keys, r);
+    dir->_omap_fetched(hdrbl, omap, complete, keys, r, from_scrub);
     if (fin)
       fin->complete(r);
   }
@@ -1728,8 +1729,7 @@ public:
   }
 };
 
-void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c)
-{
+void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c, bool from_scrub) {
   C_IO_Dir_OMAP_Fetched *fin = new C_IO_Dir_OMAP_Fetched(this, c);
   object_t oid = get_ondisk_object();
   object_locator_t oloc(mdcache->mds->mdsmap->get_metadata_pool());
@@ -1737,6 +1737,7 @@ void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c)
   rd.omap_get_header(&fin->hdrbl, &fin->ret1);
   if (keys) {
     fin->complete = false;
+    fin->from_scrub = from_scrub;
     fin->keys.swap(*keys);
     rd.omap_get_vals_by_keys(fin->keys, &fin->omap, &fin->ret2);
   } else {
@@ -1989,9 +1990,9 @@ CDentry *CDir::_load_dentry(
   return dn;
 }
 
-void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
-			 bool complete, const std::set<string>& keys, int r)
-{
+void CDir::_omap_fetched(bufferlist &hdrbl, map<string, bufferlist> &omap,
+                         bool complete, const std::set<string> &keys, int r,
+                         bool from_scrub) {
   LogChannelRef clog = mdcache->mds->clog;
   dout(10) << "_fetched header " << hdrbl.length() << " bytes "
 	   << omap.size() << " keys for " << *this << dendl;
@@ -2006,7 +2007,7 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
     clog->error() << "dir " << dirfrag() << " object missing on disk; some "
                      "files may be lost (" << get_path() << ")";
 
-    go_bad(complete);
+    go_bad(complete | from_scrub);
     return;
   }
 
@@ -2020,14 +2021,14 @@ void CDir::_omap_fetched(bufferlist& hdrbl, map<string, bufferlist>& omap,
 	   << ": " << err.what() << dendl;
       clog->warn() << "Corrupt fnode header in " << dirfrag() << ": "
 		   << err.what() << " (" << get_path() << ")";
-      go_bad(complete);
+      go_bad(complete | from_scrub);
       return;
     }
     if (!p.end()) {
       clog->warn() << "header buffer of dir " << dirfrag() << " has "
 		  << hdrbl.length() - p.get_off() << " extra bytes ("
                   << get_path() << ")";
-      go_bad(complete);
+      go_bad(complete | from_scrub);
       return;
     }
   }
