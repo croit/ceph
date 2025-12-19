@@ -113,7 +113,7 @@ int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
     scrub_stack.push_front(&obj->item_scrub);
   else
     scrub_stack.push_back(&obj->item_scrub);
-  return 0;
+  return 1;
 }
 
 void ScrubStack::purge_scrub_counters(std::string_view tag)
@@ -503,7 +503,6 @@ void ScrubStack::identify_remote_link_damage(CDentry *dn) {
 void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
 {
   ceph_assert(dir != NULL);
-
   dout(10) << __func__ << " " << *dir << dendl;
 
   if (!dir->is_complete()) {
@@ -539,8 +538,9 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
 	continue;
       }
       if (dnl->is_primary()) {
-  *added_children = true;
-	_enqueue(dnl->get_inode(), header, true);
+        if (_enqueue(dnl->get_inode(), header, true) == 1) {
+          *added_children = true;
+        }
       } else if (dnl->is_remote()) {
         identify_remote_link_damage(dn);
       }
@@ -562,7 +562,6 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
   *done = true;
   dout(10) << __func__ << " done" << dendl;
 }
-
 void ScrubStack::scrub_file_inode(CInode *in)
 {
   C_InodeValidated *fin = new C_InodeValidated(mdcache->mds, this, in);
