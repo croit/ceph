@@ -483,7 +483,8 @@ public:
   void fetch(MDSContext *c, bool ignore_authpinnability=false) {
     fetch("", CEPH_NOSNAP, c, ignore_authpinnability);
   }
-  void fetch_keys(const std::vector<dentry_key_t>& keys, MDSContext *c);
+  void fetch_keys(const std::vector<dentry_key_t> &keys, MDSContext *c,
+                  bool from_scrub = false);
 
 #if 0  // unused?
   void wait_for_commit(Context *c, version_t v=0);
@@ -653,7 +654,8 @@ protected:
   friend class C_IO_Dir_Committed;
   friend class C_IO_Dir_Commit_Ops;
 
-  void _omap_fetch(std::set<std::string> *keys, MDSContext *fin=nullptr);
+  void _omap_fetch(std::set<std::string> *keys, MDSContext *fin = nullptr,
+                   bool from_scrub = false);
   void _omap_fetch_more(version_t omap_version, bufferlist& hdrbl,
 			std::map<std::string, bufferlist>& omap, MDSContext *fin);
   CDentry *_load_dentry(
@@ -671,8 +673,10 @@ protected:
    */
   void go_bad(bool complete);
 
-  void _omap_fetched(ceph::buffer::list& hdrbl, std::map<std::string, ceph::buffer::list>& omap,
-		     bool complete, const std::set<std::string>& keys, int r);
+  void _omap_fetched(ceph::buffer::list &hdrbl,
+                     std::map<std::string, ceph::buffer::list> &omap,
+                     bool complete, const std::set<std::string> &keys, int r,
+                     bool from_scrub = false);
 
   // -- commit --
   void _commit(version_t want, int op_prio);
