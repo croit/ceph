@@ -466,6 +466,7 @@ public:
     return id;
   }
 
+  size_t get_spawned() const { return spawned.entries.size(); }
   int operate(const DoutPrefixProvider *dpp, RGWCoroutinesEnv *env);
 
   bool is_done() {

@@ -1623,6 +1623,7 @@ public:
       error_repo(_error_repo), timestamp(_timestamp), lease_cr(std::move(_lease_cr)),
       bucket_shard_cache(_bucket_shard_cache), marker_tracker(_marker_tracker), tn(_tn) {
         error_inject = (sync_env->cct->_conf->rgw_sync_data_full_inject_err_probability > 0);
+        set_description() << "data full sync single entry (source_zone=" << sc->source_zone << ") ";
       }
 
 
@@ -1697,6 +1698,7 @@ public:
 
       yield call(marker_tracker->finish(key));
       if (retcode < 0) {
+          tn->log(3, SSTR("ERROR: data full sync, spawned:" << num_spawned()));
           return set_cr_error(retcode);
         }
 
