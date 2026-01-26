@@ -1698,7 +1698,6 @@ public:
 
       yield call(marker_tracker->finish(key));
       if (retcode < 0) {
-          tn->log(3, SSTR("ERROR: data full sync, spawned:" << num_spawned()));
           return set_cr_error(retcode);
         }
 

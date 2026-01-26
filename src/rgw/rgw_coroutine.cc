@@ -136,9 +136,9 @@ void RGWCompletionManager::_wakeup(void *opaque)
 }
 
 RGWCoroutine::~RGWCoroutine() {
-  ldout(cct, 3) << "op dtor " << " this: " << (void *)this
-                              << " spawned:" << spawned.entries.size()
-                              << dendl;
+  ldout(cct, 20) << "op dtor " << " this: " << (void *)this
+                               << " spawned:" << spawned.entries.size()
+                               << dendl;
   for (auto stack : spawned.entries) {
     stack->put();
   }
@@ -237,7 +237,7 @@ RGWCoroutinesStack::RGWCoroutinesStack(CephContext *_cct, RGWCoroutinesManager *
 
 RGWCoroutinesStack::~RGWCoroutinesStack()
 {
-  ldout(cct, 3) << "dtor " << " this: " << (void *)this
+  ldout(cct, 20) << "dtor " << " this: " << (void *)this
                            << " spawned:" << spawned.entries.size()
                            << dendl;
   for (auto op : ops) {
@@ -257,7 +257,7 @@ int RGWCoroutinesStack::operate(const DoutPrefixProvider *dpp, RGWCoroutinesEnv 
   ldpp_dout(dpp, 20) << *op << ": operate()" << dendl;
   int r = op->operate_wrapper(dpp);
   if (r < 0) {
-    ldpp_dout(dpp, 3) << *op << ": operate() returned r=" << r
+    ldpp_dout(dpp, 20) << *op << ": operate() returned r=" << r
                       << " spawned:" << op->num_spawned()
                       << dendl;
   }
@@ -326,13 +326,13 @@ RGWCoroutinesStack *RGWCoroutinesStack::spawn(RGWCoroutine *source_op, RGWCorout
   s->add_pending(stack);
   stack->parent = this;
 
-  ldout(cct, 3) << __func__ << " parent: " << (void *)this
+  ldout(cct, 20) << __func__ << " parent: " << (void *)this
                             << " child: " << (void *)stack
-                            << " op: " << (void *)op 
+                            << " op: " << (void *)op
                             << " " << op->set_description().str()
-                            << " source_op: " << (void *)source_op 
+                            << " source_op: " << (void *)source_op
                             << " " << source_op->set_description().str()
-                            << " wait: " << wait 
+                            << " wait: " << wait
                             << dendl;
 
   stack->get(); /* we'll need to collect the stack */
@@ -425,15 +425,13 @@ bool RGWCoroutinesStack::collect(RGWCoroutine *op, int *ret, RGWCoroutinesStack 
       *stack_id = stack->get_id();
     }
     int r = stack->get_ret_status();
-    //ceph_assert(stack->parent == this);
-    //stack->parent = nullptr;
     stack->put();
     if (r < 0) {
       *ret = r;
-      ldout(cct, 3) << "collect(): s=" << (void *)this << " stack=" << (void *)stack
-                    << " parent=" << (void *)stack->parent
-                    << " done=" << stack->is_done()
-                    << " encountered error (r=" << r << "), skipping next stacks" << dendl;
+      ldout(cct, 20) << "collect(): s=" << (void *)this << " stack=" << (void *)stack
+                     << " parent=" << (void *)stack->parent
+                     << " done=" << stack->is_done()
+                     << " encountered error (r=" << r << "), skipping next stacks" << dendl;
       new_list.insert(new_list.end(), ++iter, s->entries.end());
       need_retry = (iter != s->entries.end());
       break;
@@ -606,7 +604,6 @@ void RGWCoroutinesManager::handle_unblocked_stack(set<RGWCoroutinesStack *>& con
     }
   } else {
 
-    ldout(cct, 3) << __func__ << " erasing stack:" << (void*) stack << dendl;
     context_stacks.erase(stack);
     stack->put();
   }
@@ -620,10 +617,6 @@ void RGWCoroutinesManager::schedule(RGWCoroutinesEnv *env, RGWCoroutinesStack *s
 
 void RGWCoroutinesManager::_schedule(RGWCoroutinesEnv *env, RGWCoroutinesStack *stack)
 {
-  ldout(cct, 4) << __func__ << " " << (void*)env << " " << (void*) stack << dendl;
-  if (env) {
-    ldout(cct, 4) << __func__ << " " << env->scheduled_stacks << " " << env->run_context << dendl;
-  }
   ceph_assert(ceph_mutex_is_wlocked(lock));
   if (!stack->is_scheduled) {
     env->scheduled_stacks->push_back(stack);
@@ -686,7 +679,7 @@ int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesS
 
     stack->set_is_scheduled(false);
     if (ret < 0) {
-      ldpp_dout(dpp, 3) << "stack->operate() returned ret=" << ret << dendl;
+      ldpp_dout(dpp, 20) << "stack->operate() returned ret=" << ret << dendl;
     }
 
     if (stack->is_error()) {
@@ -708,8 +701,8 @@ int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesS
       ldout(cct, 20) << __func__ << ":" << " stack=" << (void *)stack << " is_blocked_by_stack()=" << stack->is_blocked_by_stack()
 	             << " is_sleeping=" << stack->is_sleeping() << " waiting_for_child()=" << stack->waiting_for_child() << dendl;
     } else if (stack->is_done()) {
-      ldout(cct, 3) << __func__ << ":" << " stack=" << (void *)stack << " is done, "
-                    << stack->get_spawned() << dendl;
+      ldout(cct, 20) << __func__ << ":" << " stack=" << (void *)stack << " is done, "
+                     << stack->get_spawned() << dendl;
       RGWCoroutinesStack *s;
       while (stack->unblock_stack(&s)) {
 	if (!s->is_blocked_by_stack() && !s->is_done()) {
@@ -719,14 +712,14 @@ int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesS
             }
 	    blocked_count++;
 	  } else {
-            ldout(cct, 3) << __func__ << ":" << " stack=" << (void *)stack
+            ldout(cct, 20) << __func__ << ":" << " stack=" << (void *)stack
                                               << " unblocked s=" << (void *)s
                            << dendl;
 	    s->_schedule();
 	  }
 	}
       }
-      ldout(cct, 3) << __func__ << ":" << " stack=" << (void *)stack
+      ldout(cct, 20) << __func__ << ":" << " stack=" << (void *)stack
                                  << " parent=" << (void *)(stack->parent)
                                  << " waiting=" << (stack->parent ? stack->parent->waiting_for_child() : false)
                                  << dendl;
@@ -740,8 +733,8 @@ int RGWCoroutinesManager::run(const DoutPrefixProvider *dpp, list<RGWCoroutinesS
     } else {
       op_not_blocked = true;
       stack->run_count++;
-      ldout(cct, 5) << __func__ << ": scheduling " << " stack=" << (void *)stack
-                    << dendl;
+      ldout(cct, 20) << __func__ << ": scheduling " << " stack=" << (void *)stack
+                     << dendl;
       stack->_schedule();
     }
 
@@ -1059,7 +1052,7 @@ bool RGWCoroutine::drain_children(int num_cr_left,
     }
     done = true;
   }
-  ldout(cct, 3) << __func__ << " op:" << (void*)this << " spawned:" << spawned.entries.size()
+  ldout(cct, 20) << __func__ << " op:" << (void*)this << " spawned:" << spawned.entries.size()
                 << " num_cr:" << num_cr_left
                 << " done:" << done << dendl;
 
