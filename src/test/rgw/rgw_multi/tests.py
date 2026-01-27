@@ -3174,3 +3174,72 @@ def test_copy_object_different_bucket():
         CopySource = source_bucket.name + '/' + objname)
     
     zonegroup_bucket_checkpoint(zonegroup_conns, dest_bucket.name)
+
+
+def bucket_check_olh(zone, bucket, args=None):
+    cmd = ['bucket', 'check', 'olh', '--bucket', bucket,
+           '--dump-keys', '--hide-progress'] + (args or [])
+    keys, _ = zone.cluster.admin(cmd, read_only=True)
+    return json.loads(keys)
+
+
+def bucket_check_unlinked(zone, bucket, args=None):
+    cmd = ['bucket', 'check', 'unlinked', '--bucket', bucket,
+           '--dump-keys', '--hide-progress'] + (args or [])
+    keys, _ = zone.cluster.admin(cmd, read_only=True)
+    return json.loads(keys)
+
+
+def bucket_lc_process(zone, bucket, args=None):
+    cmd = ['lc', 'process', '--bucket', bucket] + (args or [])
+    zone.cluster.admin(cmd)
+
+
+def test_versioned_lifecycle_deletes():
+    zonegroup = realm.master_zonegroup()
+    zonegroup_conns = ZonegroupConns(zonegroup)
+    lifecycle = {
+        'Rules': [{
+            'ID': 'ExpireVersions',
+            'Status': 'Enabled',
+            'Prefix': '',
+            'Expiration': {'ExpiredObjectDeleteMarker': True},
+            'NoncurrentVersionExpiration': {'NoncurrentDays': 1},
+        }]
+    }
+
+    _, zone_bucket = create_bucket_per_zone(zonegroup_conns)
+    for zone, bucket in zone_bucket:
+        zone.s3_client.put_bucket_versioning(
+            Bucket=bucket.name, VersioningConfiguration={'Status': 'Enabled'})
+        zone.s3_client.put_bucket_lifecycle_configuration(
+            Bucket=bucket.name, LifecycleConfiguration=lifecycle)
+    realm_meta_checkpoint(realm)
+
+    num_objects = 20
+    num_versions = 20
+    for zone, bucket in zone_bucket:
+        for i in range(num_objects):
+            key = f'obj-{i}.txt'
+            for version in range(num_versions):
+                zone.s3_client.put_object(
+                    Bucket=bucket.name, Key=key, Body=f'This is version {version}')
+            zone.s3_client.delete_object(Bucket=bucket.name, Key=key)
+        log.info('Finished uploads on zone=%s bucket=%s', zone.name, bucket.name)
+    for _, bucket in zone_bucket:
+        zonegroup_bucket_checkpoint(zonegroup_conns, bucket.name)
+
+    # Lifecycle changes are local to each zone, so validate immediately after
+    # the two passes without waiting for another replication checkpoint.
+    for zone, bucket in zone_bucket:
+        bucket_lc_process(zone.zone, bucket.name, ['--rgw-lc-debug-interval=1'])
+        response = zone.s3_client.list_object_versions(Bucket=bucket.name)
+        assert not response.get('Versions')
+        assert response.get('DeleteMarkers')
+
+        bucket_lc_process(zone.zone, bucket.name, ['--rgw-lc-debug-interval=1'])
+        response = zone.s3_client.list_object_versions(Bucket=bucket.name)
+        assert not response.get('Versions')
+        assert not response.get('DeleteMarkers')
+        assert not bucket_check_olh(zone.zone, bucket.name)
+        assert not bucket_check_unlinked(zone.zone, bucket.name)
