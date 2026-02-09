@@ -169,7 +169,8 @@ class DamageTable
      */
     bool notify_remote_damaged(inodeno_t ino, std::string_view path);
 
-    bool notify_remote_link_damaged(inodeno_t ino, const std::string &path,
+    bool notify_remote_link_damaged(inodeno_t ino, inodeno_t parent_ino,
+                                    const std::string &path,
                                     const std::string &head_path = "");
 
     void remove_dentry_damage_entry(CDir *dir);

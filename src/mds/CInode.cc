@@ -5218,36 +5218,40 @@ void CInode::scrub_maybe_delete_info()
   }
 }
 
-void CInode::scrub_initialize(ScrubHeaderRef& header)
-{
+void CInode::scrub_initialize(ScrubHeaderRef &header,
+                              std::vector<remote_link_info_t> &&remote_links) {
   dout(20) << __func__ << " with scrub_version " << get_version() << dendl;
 
   scrub_info();
   scrub_infop->scrub_in_progress = true;
   scrub_infop->queued_frags.clear();
   scrub_infop->header = header;
+  if (!remote_links.empty()) {
+    scrub_infop->remote_links.swap(remote_links);
+    scrub_infop->forward_scrub = false;
+  }
   header->inc_num_pending();
   // right now we don't handle remote inodes
 }
 
-void CInode::set_forward_scrub(bool forward_scrub) {
-  scrub_infop->forward_scrub = forward_scrub;
-}
-
-void CInode::scrub_add_remote_link(
-    std::vector<std::pair<std::string, inodeno_t>> &&remote_links) {
-
-  for (auto &p : remote_links) {
-    scrub_infop->remote_links.emplace_back(std::move(p));
+bool CInode::maybe_update_scrub_in_progress(
+    std::vector<remote_link_info_t> &&remote_links) {
+  bool ret = false;
+  if (scrub_is_in_progress()) {
+    if (!remote_links.empty()) {
+      for (auto& p : remote_links) {
+	scrub_infop->remote_links.emplace_back(std::move(p));
+      }
+      //leaving forward mode as-is
+    } else {
+      scrub_infop->forward_scrub = true; //[re-]request forward mode, it's fine if it's already been requested
+    }
+    ret = true;
   }
+  return ret;
 }
 
-void CInode::scrub_reset_remote_links() {
-  scrub_infop->remote_links.clear();
-}
-
-std::vector<std::pair<std::string, inodeno_t>> &&
-CInode::scrub_move_remote_links() {
+std::vector<CInode::remote_link_info_t> &&CInode::scrub_move_remote_links() {
   return std::move(scrub_infop->remote_links);
 }
 

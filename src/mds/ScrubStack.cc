@@ -61,16 +61,11 @@ void ScrubStack::dequeue(MDSCacheObject *obj)
 
 int ScrubStack::_enqueue(
     MDSCacheObject *obj, ScrubHeaderRef &header, bool top, bool *added,
-    std::vector<std::pair<std::string, inodeno_t>> &&remote_links) {
+    std::vector<CInode::remote_link_info_t> &&remote_links) {
   ceph_assert(ceph_mutex_is_locked_by_me(mdcache->mds->mds_lock));
   if (CInode *in = dynamic_cast<CInode*>(obj)) {
-    if (in->scrub_is_in_progress()) {
+    if (in->maybe_update_scrub_in_progress(std::move(remote_links))) {
       dout(10) << __func__ << " with {" << *in << "}" << ", already in scrubbing" << dendl;
-      if (!remote_links.empty()) {
-        in->scrub_add_remote_link(std::move(remote_links));
-      } else {
-        in->set_forward_scrub(true);
-      }
       return -CEPHFS_EBUSY;
     }
     if(in->state_test(CInode::STATE_PURGING)) {
@@ -78,14 +73,8 @@ int ScrubStack::_enqueue(
       // treating this as success since purge will make sure this inode goes away
       return 0;
     }
-
     dout(10) << __func__ << " with {" << *in << "}" << ", top=" << top << dendl;
-    in->scrub_initialize(header);
-    if (!remote_links.empty()) {
-      in->scrub_add_remote_link(std::move(remote_links));
-      in->set_forward_scrub(false);
-    }
-
+    in->scrub_initialize(header, std::move(remote_links));
   } else if (CDir *dir = dynamic_cast<CDir*>(obj)) {
     if (dir->scrub_is_in_progress()) {
       dout(10) << __func__ << " with {" << *dir << "}" << ", already in scrubbing" << dendl;
@@ -242,32 +231,24 @@ void ScrubStack::kick_off_scrubs()
         // it's a regular file, symlink, or hard link
         dequeue(in); // we only touch it this once, so remove from stack
         scrub_file_inode(in);
-      } else if (in->scrub_info()->forward_scrub) {
-        bool added_children = false;
-        bool done = false; // it's done, so pop it off the stack
-        scrub_dir_inode(in, &added_children, &done);
-        if (done) {
-          dout(20) << __func__ << " dir inode, done" << dendl;
-          in->set_forward_scrub(false);
-          dequeue(in);
-        }
-        if (added_children) {
-          // dirfrags were queued at top of stack
-          it = scrub_stack.begin();
-        }
-      } else if (!in->scrub_info()->remote_links.empty()){
-        dequeue(in);
-        scrub_dir_inode_final(in);
       } else {
-        dequeue(in);
+	bool added_children = false;
+	bool done = scrub_dir_inode(in, &added_children);
+	if (done) {
+	  dout(20) << __func__ << " dir inode, done" << dendl;
+	  dequeue(in);
+	}
+	if (added_children) {
+	  // dirfrags were queued at top of stack
+	  it = scrub_stack.begin();
+	}
       }
     } else if (CDir *dir = dynamic_cast<CDir *>(*it)) {
       ++it;
       bool added_children = false;
-      bool done = false; // it's done, so pop it off the stack
-      scrub_dirfrag(dir, &added_children, &done);
-      if (done) {
-        dout(20) << __func__ << " dirfrag, done" << dendl;
+      if (scrub_dirfrag(dir, &added_children)) {
+	// it's done, so pop it off the stack
+	dout(20) << __func__ << " dirfrag, done" << dendl;
         dequeue(dir);
       }
       if (added_children) {
@@ -324,9 +305,8 @@ bool ScrubStack::validate_inode_auth(CInode *in)
   }
 }
 
-void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
+bool ScrubStack::scrub_dir_inode_forward(CInode* in, bool* added_children)
 {
-  dout(10) << __func__ << " " << *in << dendl;
   ceph_assert(in->is_auth());
   MDSRank *mds = mdcache->mds;
 
@@ -347,7 +327,7 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
     CDir *dir = in->get_or_open_dirfrag(mdcache, fg);
     if (!dir->is_auth()) {
       if (dir->is_ambiguous_auth()) {
-	dout(20) << __func__ << " ambiguous auth " << *dir  << dendl;
+	dout(20) << __func__ << " ambiguous auth " << *dir << dendl;
 	dir->add_waiter(MDSCacheObject::WAIT_SINGLEAUTH, gather.new_sub());
       } else if (mds->is_cluster_degraded()) {
 	dout(20) << __func__ << " cluster degraded" << dendl;
@@ -357,10 +337,10 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
 	scrub_remote[auth].insert_raw(fg);
       }
     } else if (!dir->can_auth_pin()) {
-      dout(20) << __func__ << " freezing/frozen " << *dir  << dendl;
+      dout(20) << __func__ << " freezing/frozen " << *dir << dendl;
       dir->add_waiter(CDir::WAIT_UNFREEZE, gather.new_sub());
     } else if (dir->get_version() == 0) {
-      dout(20) << __func__ << " barebones " << *dir  << dendl;
+      dout(20) << __func__ << " barebones " << *dir << dendl;
       dir->fetch_keys({}, gather.new_sub(), true);
     } else {
       _enqueue(dir, header, true);
@@ -374,7 +354,7 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
   if (gather.has_subs()) {
     gather.set_finisher(new C_RetryScrub(this, in));
     gather.activate();
-    return;
+    return false;
   }
 
   if (!scrub_remote.empty()) {
@@ -386,7 +366,7 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
     scrub_r.tag = header->get_tag();
 
     for (auto& p : scrub_remote) {
-      dout(20) << __func__ << " forward " << p.second  << " to mds." << p.first << dendl;
+      dout(20) << __func__ << " forward " << p.second << " to mds." << p.first << dendl;
       auto r = make_message<MMDSScrub>(MMDSScrub::OP_QUEUEDIR, in->ino(),
 				       std::move(p.second), header->get_tag(),
 				       header->get_origin(), header->is_internal_tag(),
@@ -397,142 +377,245 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
     }
     // wait for ACKs
     add_to_waiting(in);
-    return;
+    return false;
   }
-
-  scrub_dir_inode_final(in);
-
-  *done = true;
-  dout(10) << __func__ << " done" << dendl;
+  return true;
 }
 
-class C_InodeValidated : public MDSInternalContext
+bool ScrubStack::scrub_dir_inode(CInode* in, bool* added_children)
 {
-public:
-  ScrubStack *stack;
-  CInode::validated_data result;
-  CInode *target;
-  MDCache* mdcache;
-
-  C_InodeValidated(MDSRank *mds, ScrubStack *stack_, CInode *target_)
-    : MDSInternalContext(mds), stack(stack_), target(target_), mdcache(mds->mdcache)
-  {
-    stack->scrubs_in_progress++;
+  dout(10) << __func__ << " " << *in << dendl;
+  if (in->scrub_info()->forward_scrub && !scrub_dir_inode_forward(in, added_children)) {
+    return false;
   }
-  void finish(int r) override {
-    stack->_validate_inode_done(target, r, result);
-    stack->scrubs_in_progress--;
-    stack->kick_off_scrubs();
-  }
-};
+  in->reset_forward_scrub(); //we've just completed forward scrub, let's reset the flag
+  scrub_inode_validate(in);
+  return true; // if we get here we're done unconditionally
+}
 
-void ScrubStack::scrub_dir_inode_final(CInode *in)
+void ScrubStack::scrub_file_inode(CInode* in)
 {
-  dout(20) << __func__ << " " << *in << dendl;
-  ScrubHeaderRef header = in->scrub_info()->header;
-  if (!in->scrub_info()->forward_scrub &&
-      !in->scrub_info()->remote_links.empty()) {
+  dout(10) << __func__ << " " << *in << dendl;
+  scrub_inode_validate(in);
+}
+
+void ScrubStack::scrub_inode_validate(CInode *in)
+{
+  if (!in->scrub_info()->remote_links.empty()) {
     auto parent = in->get_projected_parent_dn();
     if (mdcache->mds->damage_table.is_remote_damaged(in->ino()) ||
         (parent && mdcache->mds->damage_table.is_dentry_damaged(
                        parent->get_dir(), parent->get_name(), parent->last))) {
-      for (auto &[remote_link_path, remote_ino] :
-           in->scrub_info()->remote_links) {
-        add_remote_link_damage(remote_link_path, remote_ino, header);
+      ScrubHeaderRef header = in->scrub_info()->header;
+      for (auto &p : in->scrub_info()->remote_links) {
+        add_remote_link_damage(p.path, p.ino, p.parent_ino, header);
       }
+      dout(20) << __func__ << " damaged " << *in << dendl;
       in->scrub_finished();
       return;
     }
   }
 
+  class C_InodeValidated : public MDSInternalContext
+  {
+  public:
+    ScrubStack* stack;
+    CInode::validated_data result;
+    CInode* target;
+
+    C_InodeValidated(MDSRank* mds, ScrubStack* stack_, CInode* target_)
+      : MDSInternalContext(mds), stack(stack_), target(target_)
+    {
+      stack->scrubs_in_progress++;
+    }
+    void finish(int r) override {
+      stack->scrubs_in_progress--;
+      stack->_validate_inode_done(target, r, result);
+    }
+  };
   C_InodeValidated *fin = new C_InodeValidated(mdcache->mds, this, in);
   in->validate_disk_state(&fin->result, fin);
   return;
 }
 
+void ScrubStack::_validate_inode_done(CInode* in, int r,
+  const CInode::validated_data& result)
+{
+  LogChannelRef clog = mdcache->mds->clog;
+  ScrubHeaderRef header = in->scrub_info()->header;
+
+  std::string path;
+  if (!result.passed_validation) {
+    // Build path string for use in messages
+    in->make_path_string(path, true);
+  }
+
+  if (result.backtrace.checked && !result.backtrace.passed &&
+    !result.backtrace.repaired)
+  {
+    // Record backtrace fails as remote linkage damage, as
+    // we may not be able to resolve hard links to this inode
+    mdcache->mds->damage_table.notify_remote_damaged(in->ino(), path);
+  } else if (result.inode.checked && !result.inode.passed &&
+    !result.inode.repaired) {
+    // Record damaged inode structures as damaged dentries as
+    // that is where they are stored
+    auto parent = in->get_projected_parent_dn();
+    if (parent) {
+      auto dir = parent->get_dir();
+      mdcache->mds->damage_table.notify_dentry(
+	dir->inode->ino(), dir->frag, parent->last, parent->get_name(), path);
+    }
+  }
+
+  // Inform the cluster log if we found an error
+  if (!result.passed_validation) {
+    if (result.all_damage_repaired()) {
+      clog->info() << "Scrub repaired inode " << in->ino()
+	<< " (" << path << ")";
+    } else {
+      clog->warn() << "Scrub error on inode " << in->ino()
+	<< " (" << path << ") see " << g_conf()->name
+	<< " log and `damage ls` output for details";
+    }
+
+    // Put the verbose JSON output into the MDS log for later inspection
+    JSONFormatter f;
+    result.dump(&f);
+    CachedStackStringStream css;
+    f.flush(*css);
+    derr << __func__ << " scrub error on inode " << *in << ": " << css->strv()
+      << dendl;
+  } else {
+    dout(10) << __func__ << " scrub passed on inode " << *in << dendl;
+  }
+
+  if (!in->scrub_info()->remote_links.empty()) {
+    if (!result.passed_validation) {
+      for (auto &p : in->scrub_info()->remote_links) {
+        add_remote_link_damage(p.path, p.ino, p.parent_ino, header);
+      }
+    } else {
+      CDentry *pdn = in->get_parent_dn();
+      if (pdn) {
+        CInode *diri = pdn->get_dir()->get_inode();
+        _enqueue(diri, header, true, nullptr,
+                 std::move(in->scrub_move_remote_links()));
+      } else {
+        header->inc_scrubbed_remote_link_count(
+            in->scrub_info()->remote_links.size());
+      }
+    }
+  }
+  // re-run forward scrub if we've got such a request while validating
+  bool retry = in->scrub_info()->forward_scrub && in->is_dir();
+  in->scrub_finished();
+  if (retry) {
+    // scrub_finished above should keep forward_scrub set.
+    ceph_assert(in->scrub_info()->forward_scrub);
+    _enqueue(in, header, true);
+  }
+
+  header->inc_scrubbed_inode_count();
+  kick_off_scrubs();
+}
+
 void ScrubStack::add_remote_link_damage(const std::string &path, inodeno_t ino,
+                                        inodeno_t parent_ino,
                                         ScrubHeaderRef &header) {
-  CInode* remote_inode = mdcache->get_inode(ino);
   std::string head_path = "";
+  CInode* remote_inode = mdcache->get_inode(ino);
   if (remote_inode) {
     remote_inode->make_path_string(head_path);
   }
-  mdcache->mds->damage_table.notify_remote_link_damaged(ino, path, head_path);
+  add_remote_link_damage(path, head_path, ino, parent_ino, header);
+}
+
+void ScrubStack::add_remote_link_damage(const std::string &path,
+                                        const std::string &head_path,
+                                        inodeno_t ino, inodeno_t parent_ino,
+                                        ScrubHeaderRef &header) {
+  mdcache->mds->damage_table.notify_remote_link_damaged(ino, parent_ino, path,
+                                                        head_path);
   header->inc_scrubbed_remote_link_count();
 }
 
-class C_RemoteInodeOpened : public MDSInternalContext {
-public:
-  ScrubStack *stack;
-  CDentry *dn;
-  ScrubHeaderRef header;
-  inodeno_t ino;
-  MDCache* mdcache;
-  C_RemoteInodeOpened(MDSRank *mds, ScrubStack *stack_,
-                       ScrubHeaderRef &header_, CDentry *dn_, inodeno_t ino_)
-      : MDSInternalContext(mds), stack(stack_), header(header_), dn(dn_),
-        ino(ino_), mdcache(stack_->mdcache) {
-    stack->scrubs_in_progress++;
-    header->inc_num_pending();
-    dn->get(MDSCacheObject::PIN_SCRUBQUEUE);
-  }
-  void finish(int r) override {
-    std::string path;
-    CDir *dir = dn->get_dir();
-    CInode *remote_inode = nullptr;
-
-    stack->scrubs_in_progress--;
-    CDentry::linkage_t *dnl = dn->get_projected_linkage();
-    if (r < 0 || !(dnl->is_remote() && dnl->get_remote_ino() == ino)) {
-      goto safe_exit;
+void ScrubStack::remote_link_checkup(CDentry *dn, ScrubHeaderRef &header, bool *added)
+{
+  class C_RemoteInodeOpened : public MDSInternalContext {
+  public:
+    ScrubStack* stack;
+    ScrubHeaderRef header;
+    CDentry* dn;
+    inodeno_t ino;
+    C_RemoteInodeOpened(ScrubStack* stack_,
+      ScrubHeaderRef& header_, CDentry* dn_, inodeno_t ino_)
+      : MDSInternalContext(stack_->mdcache->mds), stack(stack_), header(header_), dn(dn_) {
+      header->inc_num_pending();
+      dn->get(MDSCacheObject::PIN_SCRUBQUEUE);
+      stack->scrubs_in_progress++;
     }
-    remote_inode = mds->mdcache->get_inode(dnl->get_remote_ino());
-    if (!remote_inode) {
-      std::string path;
-      if (dir) {
-        dir->get_inode()->make_path_string(path);
-        path += "/";
-        path += dn->get_name();
-      }
-      stack->add_remote_link_damage(path, ino, header);
-      goto safe_exit;
+    void finish(int r) override {
+      stack->scrubs_in_progress--;
+      stack->_validate_remote_inode_opened(r, header, dn);
     }
-    stack->_enqueue(remote_inode, header, true, nullptr,
-                    {std::make_pair(std::move(path), ino)});
-    stack->kick_off_scrubs();
-  safe_exit:
-    dn->put(MDSCacheObject::PIN_SCRUBQUEUE);
-    header->dec_num_pending();
-  }
-};
+    ~C_RemoteInodeOpened() override {
+      dn->put(MDSCacheObject::PIN_SCRUBQUEUE);
+      header->dec_num_pending();
+    }
+  };
 
-CInode *ScrubStack::remote_link_checkup(CDentry *dn, ScrubHeaderRef &header) {
-
-  CDentry::linkage_t *dnl = dn->get_linkage();
-  CInode *remote_inode = mdcache->get_inode(dnl->get_remote_ino());
+  ceph_assert(dn->get_linkage());
+  auto remote_ino = dn->get_linkage()->get_remote_ino();
+  CInode *remote_inode = mdcache->get_inode(remote_ino);
+  bool do_hardlink_scrub = !header->get_repair() && g_conf()->mds_force_hard_link_scrubbing;
   if (!remote_inode) {
-    if (mdcache->mds->damage_table.is_remote_damaged(dnl->get_remote_ino())) {
+    if (mdcache->mds->damage_table.is_remote_damaged(remote_ino)) {
       dout(4) << "scrub: remote dentry points to damaged ino " << *dn << dendl;
-      std::string path;
-      dn->get_dir()->get_inode()->make_path_string(path);
-      path += "/";
-      path += dn->get_name();
-      mdcache->mds->damage_table.notify_remote_link_damaged(
-          dnl->get_remote_ino(), path);
-      return nullptr;
+      add_remote_link_damage(get_dn_path(dn), "", remote_ino,
+                             get_dn_parent_ino(dn), header);
+      return ;
     }
-    MDSContext *ctx =
-        (!header->get_repair() && g_conf()->mds_force_hard_link_scrubbing)
-            ? (MDSContext *)(new C_RemoteInodeOpened(
-                  mdcache->mds, this, header, dn, dnl->get_remote_ino()))
-            : (MDSContext *)(new C_MDSInternalNoop());
 
+    MDSContext *ctx = (do_hardlink_scrub) ?
+      (MDSContext*)new C_RemoteInodeOpened(this, header, dn, remote_ino) :
+      (MDSContext*)(new C_MDSInternalNoop());
     mdcache->open_remote_dentry(dn, true, ctx);
+  } else if (do_hardlink_scrub) {
+    _enqueue(remote_inode, header, true, added,
+             {CInode::remote_link_info_t(std::move(get_dn_path(dn)), remote_ino,
+                                         get_dn_parent_ino(dn))});
   }
-  return remote_inode;
+}
+void ScrubStack::_validate_remote_inode_opened(int r, ScrubHeaderRef& header,
+                                               CDentry* dn)
+{
+
+  if (r >= 0) {
+    CDentry::linkage_t* dnl = dn->get_projected_linkage();
+    ceph_assert(dnl);
+    ceph_assert(dnl->is_remote());
+
+    string path = get_dn_path(dn);
+    inodeno_t parent_ino = get_dn_parent_ino(dn);
+    auto remote_ino = dnl->get_remote_ino();
+    CInode* remote_inode = mdcache->get_inode(remote_ino);
+    if (!remote_inode) {
+      add_remote_link_damage(path, "", remote_ino, parent_ino, header);
+    } else {
+      _enqueue(remote_inode, header, true, nullptr,
+               {CInode::remote_link_info_t(std::move(path), remote_ino,
+                                           parent_ino)});
+    }
+  } else {
+    // Most of error handling is in MDCache::_open_remote_dentry_finish,
+    // what's left is relevant scrub counter incrementing
+    header->inc_scrubbed_remote_link_count();
+  }
+  kick_off_scrubs();
 }
 
-void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
+bool ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children)
 {
   ceph_assert(dir != NULL);
   dout(10) << __func__ << " " << *dir << dendl;
@@ -540,7 +623,7 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
   if (!dir->is_complete()) {
     dir->fetch(new C_RetryScrub(this, dir), true); // already auth pinned
     dout(10) << __func__ << " incomplete, fetching" << dendl;
-    return;
+    return false;
   }
 
   ScrubHeaderRef header = dir->get_scrub_header();
@@ -574,17 +657,7 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
       if (dnl->is_primary()) {
         _enqueue(dnl->get_inode(), header, true, added_children);
       } else if (dnl->is_remote()) {
-        auto remote_ino = dnl->get_remote_ino();
-        CInode *remote_inode = remote_link_checkup(dn, header);
-        if (remote_inode && !header->get_repair() &&
-            g_conf()->mds_force_hard_link_scrubbing) {
-          std::string remote_path;
-          dir->get_inode()->make_path_string(remote_path);
-          remote_path += "/";
-          remote_path += dn->get_name();
-          _enqueue(remote_inode, header, true, added_children,
-                   {std::make_pair(std::move(remote_path), remote_ino)});
-        }
+        remote_link_checkup(dn, header, added_children);
       }
     }
   }
@@ -600,114 +673,8 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
   dir->scrub_finished();
   dir->auth_unpin(this);
 
-  *done = true;
   dout(10) << __func__ << " done" << dendl;
-}
-
-void ScrubStack::scrub_file_inode(CInode *in)
-{
-  ScrubHeaderRef header = in->scrub_info()->header;
-  if (!in->scrub_info()->forward_scrub &&
-      !in->scrub_info()->remote_links.empty()) {
-    auto parent = in->get_projected_parent_dn();
-    if (mdcache->mds->damage_table.is_remote_damaged(in->ino()) ||
-        (parent && mdcache->mds->damage_table.is_dentry_damaged(
-                       parent->get_dir(), parent->get_name(), parent->last))) {
-      for (auto &[remote_link_path, remote_ino] :
-           in->scrub_info()->remote_links) {
-        add_remote_link_damage(remote_link_path, remote_ino, header);
-      }
-      in->scrub_finished();
-      return;
-    }
-  }
-
-  C_InodeValidated *fin = new C_InodeValidated(mdcache->mds, this, in);
-  // At this stage the DN is already past scrub_initialize, so
-  // it's in the cache, it has PIN_SCRUBQUEUE and it is authpinned
-  in->validate_disk_state(&fin->result, fin);
-}
-
-void ScrubStack::_validate_inode_done(CInode *in, int r,
-				      const CInode::validated_data &result)
-{
-  LogChannelRef clog = mdcache->mds->clog;
-  ScrubHeaderRef header = in->scrub_info()->header;
-
-  std::string path;
-  if (!result.passed_validation) {
-    // Build path string for use in messages
-    in->make_path_string(path, true);
-  }
-
-  if (result.backtrace.checked && !result.backtrace.passed &&
-      !result.backtrace.repaired)
-  {
-    // Record backtrace fails as remote linkage damage, as
-    // we may not be able to resolve hard links to this inode
-    mdcache->mds->damage_table.notify_remote_damaged(in->ino(), path);
-  } else if (result.inode.checked && !result.inode.passed &&
-             !result.inode.repaired) {
-    // Record damaged inode structures as damaged dentries as
-    // that is where they are stored
-    auto parent = in->get_projected_parent_dn();
-    if (parent) {
-      auto dir = parent->get_dir();
-      mdcache->mds->damage_table.notify_dentry(
-          dir->inode->ino(), dir->frag, parent->last, parent->get_name(), path);
-    }
-  }
-
-  // Inform the cluster log if we found an error
-  if (!result.passed_validation) {
-    if (result.all_damage_repaired()) {
-      clog->info() << "Scrub repaired inode " << in->ino()
-                   << " (" << path << ")";
-    } else {
-      clog->warn() << "Scrub error on inode " << in->ino()
-                   << " (" << path << ") see " << g_conf()->name
-                   << " log and `damage ls` output for details";
-    }
-
-    // Put the verbose JSON output into the MDS log for later inspection
-    JSONFormatter f;
-    result.dump(&f);
-    CachedStackStringStream css;
-    f.flush(*css);
-    derr << __func__ << " scrub error on inode " << *in << ": " << css->strv()
-         << dendl;
-  } else {
-    dout(10) << __func__ << " scrub passed on inode " << *in << dendl;
-  }
-
-  if (!in->scrub_info()->remote_links.empty()) {
-    if (!result.passed_validation) {
-      for (auto &[remote_link_path, remote_ino] :
-           in->scrub_info()->remote_links) {
-        add_remote_link_damage(remote_link_path, remote_ino, header);
-      }
-    } else {
-      CDentry *pdn = in->get_parent_dn();
-      if (pdn) {
-        CInode *diri = pdn->get_dir()->get_inode();
-        _enqueue(diri, header, true, nullptr,
-                 std::move(in->scrub_move_remote_links()));
-      } else {
-        header->inc_scrubbed_remote_link_count(
-            in->scrub_info()->remote_links.size());
-      }
-    }
-  }
-  in->scrub_reset_remote_links();
-
-  if (in->scrub_info()->forward_scrub && in->is_dir()) {
-    in->scrub_finished();
-    _enqueue(in, header, true);
-  } else {
-    in->scrub_finished();
-  }
-
-  header->inc_scrubbed_inode_count();
+  return true;
 }
 
 void ScrubStack::complete_control_contexts(int r) {

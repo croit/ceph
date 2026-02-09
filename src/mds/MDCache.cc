@@ -8497,8 +8497,8 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
             dn->get_dir()->get_inode()->make_path_string(path);
             path += "/";
             path += dn->get_name();
-            mds->damage_table.notify_remote_link_damaged(dnl->get_remote_ino(),
-                                                         path);
+            mds->damage_table.notify_remote_link_damaged(
+                dnl->get_remote_ino(), dn->get_dir()->get_inode()->ino(), path);
             return -CEPHFS_EIO;
           }
           open_remote_dentry(dn, true, cf.build(),
@@ -8817,13 +8817,16 @@ void MDCache::_open_remote_dentry_finish(CDentry *dn, inodeno_t ino, MDSContext 
 
       std::string path;
       CDir *dir = dn->get_dir();
+      inodeno_t parent_ino;
       if (dir) {
 	dir->get_inode()->make_path_string(path);
 	path += "/";
         path += dn->get_name();
+        parent_ino = dir->get_inode()->ino();
       }
 
-      bool fatal = mds->damage_table.notify_remote_link_damaged(ino, path);
+      bool fatal =
+          mds->damage_table.notify_remote_link_damaged(ino, parent_ino, path);
       if (fatal) {
 	mds->damaged();
 	ceph_abort();  // unreachable, damaged() respawns us

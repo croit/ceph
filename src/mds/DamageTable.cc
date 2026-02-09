@@ -133,9 +133,11 @@ class BacktraceDamage : public DamageEntry
 class RemoteLinkDamage : public DamageEntry {
 public:
   inodeno_t ino;
+  inodeno_t parent_ino;
   std::string head_path;
-  RemoteLinkDamage(inodeno_t ino_, const std::string &head_path_ = "")
-      : ino(ino_), head_path(head_path_) {}
+  RemoteLinkDamage(inodeno_t ino_, inodeno_t parent_ino_,
+                   const std::string &head_path_ = "")
+      : ino(ino_), parent_ino(parent_ino_), head_path(head_path_) {}
 
   damage_entry_type_t get_type() const override {
     return DAMAGE_ENTRY_REMOTE_LINK;
@@ -146,6 +148,7 @@ public:
     f->dump_string("damage_type", "remote_link");
     f->dump_int("id", id);
     f->dump_int("ino", ino);
+    f->dump_int("parent_ino", parent_ino);
     f->dump_string("path", path);
     f->dump_string("head_path", head_path);
     f->close_section();
@@ -252,6 +255,7 @@ bool DamageTable::notify_remote_damaged(inodeno_t ino, std::string_view path)
 }
 
 bool DamageTable::notify_remote_link_damaged(inodeno_t ino,
+                                             inodeno_t parent_ino,
                                              const std::string &path,
                                              const std::string &head_path) {
   bool over_sized = oversized();
@@ -259,7 +263,7 @@ bool DamageTable::notify_remote_link_damaged(inodeno_t ino,
     return true;
   }
 
-  auto entry = std::make_shared<RemoteLinkDamage>(ino, head_path);
+  auto entry = std::make_shared<RemoteLinkDamage>(ino, parent_ino, head_path);
   entry->path = path;
   if (log_to_file && log_file_opened) {
     fout << *entry << std::endl;
