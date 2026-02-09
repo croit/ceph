@@ -197,7 +197,7 @@ private:
    * Scrub a file inode.
    * @param dn The remote dentry to identify
    */
-  CInode *remote_link_checkup(CDentry *dn, ScrubHeaderRef &header);
+  void remote_link_checkup(CDentry *dn, ScrubHeaderRef &header, bool* added);
 
   /**
    * Callback from completion of CInode::validate_disk_state
@@ -208,30 +208,32 @@ private:
   void _validate_inode_done(CInode *in, int r,
 			    const CInode::validated_data &result);
 
+  void _validate_remote_inode_opened(int r, ScrubHeaderRef& header,
+                                     CDentry* dn);
+
   /**
    * Scrub a directory inode. It queues child dirfrags, then does
    * final scrub of the inode.
    *
    * @param in The directory indoe to scrub
    * @param added_children set to true if we pushed some of our children
-   * @param done set to true if we started to do final scrub
    */
-  void scrub_dir_inode(CInode *in, bool *added_children, bool *done);
+  bool scrub_dir_inode(CInode* in, bool* added_children);
+  bool scrub_dir_inode_forward(CInode *in, bool *added_children);
   /**
    * Scrub a dirfrag. It queues child dentries, then does final
    * scrub of the dirfrag.
    *
    * @param dir The dirfrag to scrub (must be auth)
    * @param added_children set to true if we pushed some of our children
-   * @param done set to true if we started to do final scrub
    */
-  void scrub_dirfrag(CDir *dir, bool *added_children, bool *done);
+  bool scrub_dirfrag(CDir *dir, bool *added_children);
   /**
    * Scrub a directory-representing dentry.
    *
-   * @param in The directory inode we're doing final scrub on.
+   * @param in The inode we're doing final scrub on.
    */
-  void scrub_dir_inode_final(CInode *in);
+  void scrub_inode_validate(CInode *in);
   /**
    * Set scrub state
    * @param next_state State to move the scrub to.
@@ -281,6 +283,21 @@ private:
   void handle_scrub_stats(const cref_t<MMDSScrubStats> &m);
   void add_remote_link_damage(const std::string &path, inodeno_t ino,
                               ScrubHeaderRef &header);
+  void add_remote_link_damage(const std::string& path, const std::string& head_path,
+    inodeno_t ino, ScrubHeaderRef& header);
+
+  std::string get_dn_path(CDentry* dn) {
+    std::string path;
+    if (dn && dn->get_dir() && dn->get_dir()->get_inode()) {
+      dn->get_dir()->get_inode()->make_path_string(path);
+      path += "/";
+      path += dn->get_name();
+    } else {
+      path = "???";
+    }
+    return path;
+  }
+
 
   State state = STATE_IDLE;
   bool clear_stack = false;

@@ -448,7 +448,18 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
    * @param scrub_version What version are we scrubbing at (usually, parent
    * directory's get_projected_version())
    */
-  void scrub_initialize(ScrubHeaderRef& header);
+  void scrub_initialize(ScrubHeaderRef& header,
+    std::vector<std::pair<std::string, inodeno_t>>&& remote_links = {});
+
+  bool maybe_update_scrub_in_progress(
+    std::vector<std::pair<std::string, inodeno_t>>&& remote_links = {});
+
+  void reset_forward_scrub() {
+    if (scrub_infop) {
+      scrub_infop->forward_scrub = false;
+    }
+  }
+
   /**
    * Call this once the scrub has been completed, whether it's a full
    * recursive scrub on a directory or simply the data on a file (or
@@ -460,14 +471,7 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
 
   void scrub_aborted();
 
-  void scrub_add_remote_link(
-      std::vector<std::pair<std::string, inodeno_t>> &&remote_links);
-
-  void scrub_reset_remote_links();
-
   std::vector<std::pair<std::string, inodeno_t>> &&scrub_move_remote_links();
-
-  void set_forward_scrub(bool forward_scrub);
 
   fragset_t& scrub_queued_frags() {
     ceph_assert(scrub_infop);
