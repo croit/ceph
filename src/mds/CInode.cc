@@ -5198,7 +5198,6 @@ void CInode::scrub_info_create() const
 {
   dout(25) << __func__ << dendl;
   ceph_assert(!scrub_infop);
-
   // break out of const-land to set up implicit initial state
   CInode *me = const_cast<CInode*>(this);
   const auto& pi = me->get_projected_inode();
@@ -5231,23 +5230,46 @@ void CInode::scrub_initialize(ScrubHeaderRef& header)
   // right now we don't handle remote inodes
 }
 
+void CInode::set_forward_scrub(bool forward_scrub) {
+  scrub_infop->forward_scrub = forward_scrub;
+}
+
+void CInode::scrub_add_remote_link(
+    std::vector<std::pair<std::string, inodeno_t>> &&remote_links) {
+
+  for (auto& [remote_link_path, remote_ino]: remote_links) {
+    scrub_infop->remote_links.emplace_back(std::move(remote_link_path),
+                                           remote_ino);
+  }
+}
+
+void CInode::scrub_reset_remote_links() {
+  scrub_infop->remote_links.clear();
+}
+
+std::vector<std::pair<std::string, inodeno_t>> &&
+CInode::scrub_move_remote_links() {
+  return std::move(scrub_infop->remote_links);
+}
+
 void CInode::scrub_aborted() {
   dout(20) << __func__ << dendl;
   ceph_assert(scrub_is_in_progress());
-
   scrub_infop->scrub_in_progress = false;
   scrub_infop->header->dec_num_pending();
+  scrub_infop->remote_links.clear();
   scrub_maybe_delete_info();
 }
 
 void CInode::scrub_finished() {
   dout(20) << __func__ << dendl;
   ceph_assert(scrub_is_in_progress());
-
   scrub_infop->last_scrub_version = get_version();
   scrub_infop->last_scrub_stamp = ceph_clock_now();
   scrub_infop->last_scrub_dirty = true;
   scrub_infop->scrub_in_progress = false;
+  scrub_infop->remote_links.clear();
+  scrub_infop->forward_scrub = true;
   scrub_infop->header->dec_num_pending();
 }
 
