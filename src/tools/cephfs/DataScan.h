@@ -269,6 +269,24 @@ class DataScan : public MDSUtility, public MetadataTool
     int scan_extents();
 
     /**
+     * Scan damage entries from a line-delimited JSON input file and apply
+     * candidate-index worker slicing.
+     */
+    int scan_extents_for_damage_file();
+
+    /**
+     * Scan inode entries from a line-delimited input file and apply
+     * candidate-index worker slicing.
+     */
+    int scan_extents_for_inode_file();
+
+    /**
+     * Targeted extent scan for one inode using extent windows.
+     */
+    int scan_extent_for_inode(inodeno_t ino,
+                              const std::vector<librados::IoCtx *> &data_ios);
+
+    /**
      * Scan metadata pool for 0th dirfrags to link orphaned
      * directory inodes.
      */
@@ -296,11 +314,28 @@ class DataScan : public MDSUtility, public MetadataTool
     // Only scan inodes without this scrub tag
     std::string filter_tag;
 
+    // Parser state for scan_extents damage/inode inputs.
+    std::string damage_file_path;
+    std::string damage_type_expr;
+    std::vector<std::string> damage_type_tokens;
+    bool damage_type_filter_set;
+    bool damage_type_all;
+    std::string inode_file_path;
+    uint64_t extent_period;
+    bool extent_period_set;
+    uint64_t extent_limit;
+    bool extent_limit_set;
+    bool force_create_head_inode;
+
+    int parse_damage_type_expr(const std::string &expr,
+                               std::vector<std::string> *tokens);
+
     /**
      * @param r set to error on valid key with invalid value
      * @return true if argument consumed, else false
      */
     bool parse_kwarg(
+        const std::string &command,
         const std::vector<const char*> &args,
         std::vector<const char *>::const_iterator &i,
         int *r);
@@ -329,16 +364,14 @@ class DataScan : public MDSUtility, public MetadataTool
     int main(const std::vector<const char *> &args);
 
     DataScan()
-      : driver(NULL), fscid(FS_CLUSTER_ID_NONE),
-	data_pool_id(-1), n(0), m(1),
-        force_pool(false), force_corrupt(false),
-        force_init(false)
-    {
-    }
+        : driver(NULL), fscid(FS_CLUSTER_ID_NONE), data_pool_id(-1), n(0), m(1),
+          force_pool(false), force_corrupt(false), force_init(false),
+          damage_type_filter_set(false), damage_type_all(false),
+          extent_period(1), extent_period_set(false), extent_limit(1),
+          extent_limit_set(false), force_create_head_inode(false) {}
 
     ~DataScan() override
     {
       delete driver;
     }
 };
-

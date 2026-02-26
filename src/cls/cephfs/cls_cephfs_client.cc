@@ -27,21 +27,50 @@ using ceph::decode;
 #define XATTR_MAX_SIZE "scan_max_size"
 #define XATTR_POOL_ID "scan_pool_id"
 
+namespace {
+
+void update_accumulate_result(AccumulateResult *accum_res,
+                              const uint64_t obj_index, const uint64_t obj_size,
+                              const int64_t obj_pool_id, const time_t mtime) {
+  ceph_assert(accum_res != nullptr);
+
+  if (obj_index > accum_res->ceiling_obj_index ||
+      (obj_index == accum_res->ceiling_obj_index &&
+       accum_res->ceiling_obj_size == 0)) {
+    accum_res->ceiling_obj_index = obj_index;
+    accum_res->ceiling_obj_size = obj_size;
+  }
+
+  if (obj_size > accum_res->max_obj_size) {
+    accum_res->max_obj_size = obj_size;
+  }
+
+  if (mtime > accum_res->max_mtime) {
+    accum_res->max_mtime = mtime;
+  }
+
+  if (obj_pool_id != -1) {
+    accum_res->obj_pool_id = obj_pool_id;
+  }
+}
+
+} // namespace
+
 int ClsCephFSClient::accumulate_inode_metadata(
-  librados::IoCtx &ctx,
-  inodeno_t inode_no,
-  const uint64_t obj_index,
-  const uint64_t obj_size,
-  const int64_t obj_pool_id,
-  const time_t mtime)
-{
-  AccumulateArgs args(
-      obj_index,
-      obj_size,
-      mtime,
-      XATTR_CEILING,
-      XATTR_MAX_MTIME,
-      XATTR_MAX_SIZE);
+    librados::IoCtx &ctx, inodeno_t inode_no, const uint64_t obj_index,
+    const uint64_t obj_size, const int64_t obj_pool_id, const time_t mtime,
+    AccumulateResult *accum_res, const bool immediate_write) {
+  if (!immediate_write) {
+    if (accum_res == nullptr) {
+      return -EINVAL;
+    }
+    update_accumulate_result(accum_res, obj_index, obj_size, obj_pool_id,
+                             mtime);
+    return 0;
+  }
+
+  AccumulateArgs args(obj_index, obj_size, mtime, XATTR_CEILING,
+                      XATTR_MAX_MTIME, XATTR_MAX_SIZE);
 
   // Generate 0th object name, where we will accumulate sizes/mtimes
   object_t zeroth_object = InodeStore::get_object_name(inode_no, frag_t(), "");
@@ -59,6 +88,24 @@ int ClsCephFSClient::accumulate_inode_metadata(
   }
 
   // Execute op
+  return ctx.operate(zeroth_object.name, &op);
+}
+
+int ClsCephFSClient::flush_inode_accumulate_result(
+    librados::IoCtx &ctx, inodeno_t inode_no,
+    const AccumulateResult &accum_res) {
+  object_t zeroth_object = InodeStore::get_object_name(inode_no, frag_t(), "");
+
+  SetAccumulatedArgs args(accum_res.ceiling_obj_index,
+                          accum_res.ceiling_obj_size, accum_res.max_obj_size,
+                          accum_res.max_mtime, accum_res.obj_pool_id != -1,
+                          accum_res.obj_pool_id, XATTR_CEILING, XATTR_MAX_MTIME,
+                          XATTR_MAX_SIZE, XATTR_POOL_ID);
+  librados::ObjectWriteOperation op;
+  bufferlist inbl;
+  args.encode(inbl);
+  op.exec("cephfs", "set_accumulated_inode_metadata", inbl);
+
   return ctx.operate(zeroth_object.name, &op);
 }
 

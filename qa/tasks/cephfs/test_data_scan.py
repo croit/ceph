@@ -364,6 +364,149 @@ class NonDefaultLayout(Workload):
 class TestDataScan(CephFSTestCase):
     MDSS_REQUIRED = 2
 
+    def _write_tool_file(self, path, content):
+        self.fs.tool_remote.sh(script=[
+            'python3', '-c',
+            ("from pathlib import Path; "
+             "Path({path!r}).write_text({content!r}, encoding='utf-8')".format(path=path, content=content))
+        ])
+
+    def _read_pool_xattr(self, pool, oid, xattr):
+        return self.fs.rados(['getxattr', oid, xattr, '-'], pool=pool, stdout=BytesIO()).stdout.getvalue()
+
+    def _clear_scan_xattrs(self, oid, pools=None):
+        if pools is None:
+            pools = self.fs.get_data_pool_names()
+
+        for pool in pools:
+            for xattr in ['scan_ceiling', 'scan_max_size', 'scan_max_mtime', 'scan_pool_id']:
+                try:
+                    self.fs.rados(['rmxattr', oid, xattr], pool=pool)
+                except CommandFailedError:
+                    pass
+
+    def _create_targeted_scan_fixture(self, file_count=10, extent_count=20, object_size=4194304):
+        default_pool_name = self.fs.get_data_pool_name()
+        extra_pool_name = self._prepare_extra_data_pool(set_root_layout=False)
+
+        layout_default = {
+            'stripe_unit': object_size,
+            'stripe_count': 1,
+            'object_size': object_size,
+            'pool': default_pool_name,
+        }
+        layout_extra = {
+            'stripe_unit': object_size,
+            'stripe_count': 1,
+            'object_size': object_size,
+            'pool': extra_pool_name,
+        }
+
+        self.mount_a.run_shell(['mkdir', 'targeted_default'])
+        self.mount_a.run_shell(['mkdir', 'targeted_extra'])
+        self.fs.set_dir_layout(self.mount_a, 'targeted_default', layout_default)
+        self.fs.set_dir_layout(self.mount_a, 'targeted_extra', layout_extra)
+
+        target_size = object_size * extent_count
+        files = []
+        for i in range(file_count):
+            if i % 2 == 0:
+                path = 'targeted_default/file_{0}'.format(i)
+                pool = default_pool_name
+                is_extra_pool = False
+            else:
+                path = 'targeted_extra/file_{0}'.format(i)
+                pool = extra_pool_name
+                is_extra_pool = True
+
+            self.mount_a.write_test_pattern(path, target_size)
+            ino = self.mount_a.path_to_ino(path)
+            files.append({'path': path, 'ino': ino, 'pool': pool, 'is_extra_pool': is_extra_pool})
+
+        self.fs.mds_asok(['flush', 'journal'])
+        self.mount_a.umount_wait()
+        self.fs.fail()
+
+        for i, f in enumerate(files):
+            if i in (0, 5):
+                missing_extents = tuple(range(0, extent_count))
+            elif i in (1, 6, 9):
+                missing_extents = tuple(range(4, 8))
+            elif i in (2, 4, 7):
+                missing_extents = tuple(range(0, 4))
+            else:
+                missing_extents = (3, 7, 11, 17)
+
+            f['missing_extents'] = set(missing_extents)
+            for extent_id in missing_extents:
+                oid = '{0:x}.{1:08x}'.format(f['ino'], extent_id)
+                try:
+                    self.fs.rados(['rm', oid], pool=f['pool'])
+                except CommandFailedError:
+                    pass
+
+                if f['is_extra_pool'] and extent_id == 0:
+                    try:
+                        self.fs.rados(['rm', oid], pool=default_pool_name)
+                    except CommandFailedError:
+                        pass
+
+        return {
+            'files': files,
+            'default_pool': default_pool_name,
+            'extra_pool': extra_pool_name,
+            'extent_limit': extent_count,
+            'object_size': object_size,
+        }
+
+    def _decode_u64_xattr(self, raw):
+        if len(raw) == 0:
+            return 0
+        self.assertEqual(len(raw), 8)
+        return int.from_bytes(raw, byteorder='little', signed=False)
+
+    def _decode_obj_ceiling_xattr(self, raw):
+        if len(raw) == 0:
+            return (0, 0)
+
+        if len(raw) >= 6:
+            payload_len = int.from_bytes(raw[2:6], byteorder='little', signed=False)
+            payload = raw[6:6 + payload_len]
+            if len(payload) == 0:
+                return (0, 0)
+            if len(payload) >= 16:
+                obj_id = int.from_bytes(payload[0:8], byteorder='little', signed=False)
+                obj_size = int.from_bytes(payload[8:16], byteorder='little', signed=False)
+                return (obj_id, obj_size)
+
+        self.assertGreaterEqual(len(raw), 16)
+        obj_id = int.from_bytes(raw[0:8], byteorder='little', signed=False)
+        obj_size = int.from_bytes(raw[8:16], byteorder='little', signed=False)
+        return (obj_id, obj_size)
+
+    def _expected_inode_scan_result(self, file_info, extent_limit, extent_period, object_size):
+        ceiling = None
+        for window_start in range(0, extent_limit, extent_period):
+            window_end = min(window_start + extent_period, extent_limit)
+            present = [extent_id for extent_id in range(window_start, window_end)
+                       if extent_id not in file_info['missing_extents']]
+            if not present:
+                break
+            ceiling = max(present)
+
+        if ceiling is None:
+            return {
+                'scan_max_size': 0,
+                'scan_ceiling_id': 0,
+                'scan_ceiling_size': 0,
+            }
+
+        return {
+            'scan_max_size': object_size,
+            'scan_ceiling_id': ceiling,
+            'scan_ceiling_size': object_size,
+        }
+
     def is_marked_damaged(self, rank):
         mds_map = self.fs.get_mds_map()
         return rank in mds_map['damaged']
@@ -455,6 +598,313 @@ class TestDataScan(CephFSTestCase):
 
     def test_rebuild_simple(self):
         self._rebuild_metadata(SimpleWorkload(self.fs, self.mount_a))
+
+    def test_scan_extents_targeted_arg_validation(self):
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_extents', '--extent-period', '0', '--inode-file', '/tmp/nope'])
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_extents', '--extent-limit', '0', '--inode-file', '/tmp/nope'])
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_extents', '--extent-period', 'abc', '--inode-file', '/tmp/nope'])
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_extents', '--extent-limit', 'abc', '--inode-file', '/tmp/nope'])
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_extents', '--extent-period', '1'])
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_extents', '--force-create-head-inode'])
+
+        with self.assertRaises(CommandFailedError):
+            self.fs.data_scan(['scan_inodes', '--force-create-head-inode'])
+
+    def test_scan_extents_inode_file_matches_manual_expectation(self):
+        fixture = self._create_targeted_scan_fixture(file_count=10, extent_count=20)
+        try:
+            inode_file = '/tmp/dscan_0005_inode_period_default.txt'
+            inode_lines = '\n'.join([str(f['ino']) for f in fixture['files']]) + '\n'
+            self._write_tool_file(inode_file, inode_lines)
+
+            self.fs.data_scan([
+                'scan_extents', '--force-pool', '--force-create-head-inode', '--inode-file', inode_file,
+                '--extent-period', '4', '--extent-limit', str(fixture['extent_limit']),
+                fixture['default_pool'], fixture['extra_pool']
+            ])
+
+            for f in fixture['files']:
+
+                oid = '{0:x}.00000000'.format(f['ino'])
+                expected = self._expected_inode_scan_result(f, fixture['extent_limit'], 4, fixture['object_size'])
+
+                scan_max_size = self._decode_u64_xattr(self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size'))
+                self.assertEqual(
+                    expected['scan_max_size'],
+                    scan_max_size,
+                    'path={0} ino=0x{1:x} expected scan_max_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_max_size'], scan_max_size))
+
+                scan_ceiling_id, scan_ceiling_size = self._decode_obj_ceiling_xattr(
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling'))
+                self.assertEqual(
+                    expected['scan_ceiling_id'],
+                    scan_ceiling_id,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_id={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_id'], scan_ceiling_id))
+                self.assertEqual(
+                    expected['scan_ceiling_size'],
+                    scan_ceiling_size,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_size'], scan_ceiling_size))
+        finally:
+            self.fs.set_joinable()
+            self.fs.wait_for_daemons()
+            self.mount_a.mount_wait()
+
+    def test_scan_extents_damage_file_matches_manual_expectation(self):
+        fixture = self._create_targeted_scan_fixture(file_count=10, extent_count=20)
+        try:
+            damage_file = '/tmp/dscan_0005_damage_period_default.jsonl'
+            damage_lines = []
+            for f in fixture['files']:
+                damage_lines.append(json.dumps({'damage_type': 'backtrace', 'ino': f['ino']}))
+            self._write_tool_file(damage_file, '\n'.join(damage_lines) + '\n')
+
+
+            self.fs.data_scan([
+                'scan_extents', '--force-pool', '--force-create-head-inode', '--damage-file', damage_file,
+                '--extent-period', '4', '--extent-limit', str(fixture['extent_limit']),
+                fixture['default_pool'], fixture['extra_pool']
+            ])
+
+            for f in fixture['files']:
+
+                oid = '{0:x}.00000000'.format(f['ino'])
+                expected = self._expected_inode_scan_result(f, fixture['extent_limit'], 4, fixture['object_size'])
+
+                scan_max_size = self._decode_u64_xattr(self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size'))
+                self.assertEqual(
+                    expected['scan_max_size'],
+                    scan_max_size,
+                    'path={0} ino=0x{1:x} expected scan_max_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_max_size'], scan_max_size))
+
+                scan_ceiling_id, scan_ceiling_size = self._decode_obj_ceiling_xattr(
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling'))
+                self.assertEqual(
+                    expected['scan_ceiling_id'],
+                    scan_ceiling_id,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_id={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_id'], scan_ceiling_id))
+                self.assertEqual(
+                    expected['scan_ceiling_size'],
+                    scan_ceiling_size,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_size'], scan_ceiling_size))
+        finally:
+            self.fs.set_joinable()
+            self.fs.wait_for_daemons()
+            self.mount_a.mount_wait()
+
+    def test_scan_extents_inode_file_no_force_skips_empty_flush(self):
+        fixture = self._create_targeted_scan_fixture(file_count=10, extent_count=20)
+        try:
+            inode_file = '/tmp/dscan_0006_inode_no_force.txt'
+            inode_lines = '\n'.join([str(f['ino']) for f in fixture['files']]) + '\n'
+            self._write_tool_file(inode_file, inode_lines)
+
+            self.fs.data_scan([
+                'scan_extents', '--force-pool', '--inode-file', inode_file,
+                '--extent-period', '4', '--extent-limit', str(fixture['extent_limit']),
+                fixture['default_pool'], fixture['extra_pool']
+            ])
+
+            for f in fixture['files']:
+                oid = '{0:x}.00000000'.format(f['ino'])
+                expected = self._expected_inode_scan_result(f, fixture['extent_limit'], 4, fixture['object_size'])
+
+                if expected['scan_max_size'] == 0 and expected['scan_ceiling_id'] == 0:
+                    with self.assertRaises(CommandFailedError):
+                        self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size')
+                    with self.assertRaises(CommandFailedError):
+                        self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling')
+                    continue
+
+                scan_max_size = self._decode_u64_xattr(
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size'))
+                self.assertEqual(
+                    expected['scan_max_size'],
+                    scan_max_size,
+                    'path={0} ino=0x{1:x} expected scan_max_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_max_size'], scan_max_size))
+
+                scan_ceiling_id, scan_ceiling_size = self._decode_obj_ceiling_xattr(
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling'))
+                self.assertEqual(
+                    expected['scan_ceiling_id'],
+                    scan_ceiling_id,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_id={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_id'], scan_ceiling_id))
+                self.assertEqual(
+                    expected['scan_ceiling_size'],
+                    scan_ceiling_size,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_size'], scan_ceiling_size))
+        finally:
+            self.fs.set_joinable()
+            self.fs.wait_for_daemons()
+            self.mount_a.mount_wait()
+
+    def test_scan_extents_damage_file_no_force_skips_empty_flush(self):
+        fixture = self._create_targeted_scan_fixture(file_count=10, extent_count=20)
+        try:
+            damage_file = '/tmp/dscan_0006_damage_no_force.jsonl'
+            damage_lines = []
+            for f in fixture['files']:
+                damage_lines.append(json.dumps({'damage_type': 'backtrace', 'ino': f['ino']}))
+            self._write_tool_file(damage_file, '\n'.join(damage_lines) + '\n')
+
+            self.fs.data_scan([
+                'scan_extents', '--force-pool', '--damage-file', damage_file,
+                '--extent-period', '4', '--extent-limit', str(fixture['extent_limit']),
+                fixture['default_pool'], fixture['extra_pool']
+            ])
+
+            for f in fixture['files']:
+                oid = '{0:x}.00000000'.format(f['ino'])
+                expected = self._expected_inode_scan_result(f, fixture['extent_limit'], 4, fixture['object_size'])
+
+                if expected['scan_max_size'] == 0 and expected['scan_ceiling_id'] == 0:
+                    with self.assertRaises(CommandFailedError):
+                        self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size')
+                    with self.assertRaises(CommandFailedError):
+                        self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling')
+                    continue
+
+                scan_max_size = self._decode_u64_xattr(
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size'))
+                self.assertEqual(
+                    expected['scan_max_size'],
+                    scan_max_size,
+                    'path={0} ino=0x{1:x} expected scan_max_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_max_size'], scan_max_size))
+
+                scan_ceiling_id, scan_ceiling_size = self._decode_obj_ceiling_xattr(
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling'))
+                self.assertEqual(
+                    expected['scan_ceiling_id'],
+                    scan_ceiling_id,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_id={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_id'], scan_ceiling_id))
+                self.assertEqual(
+                    expected['scan_ceiling_size'],
+                    scan_ceiling_size,
+                    'path={0} ino=0x{1:x} expected scan_ceiling_size={2} actual={3}'.format(
+                        f['path'], f['ino'], expected['scan_ceiling_size'], scan_ceiling_size))
+        finally:
+            self.fs.set_joinable()
+            self.fs.wait_for_daemons()
+            self.mount_a.mount_wait()
+
+    def test_scan_extents_damage_file_parity_with_inode_file(self):
+        fixture = self._create_targeted_scan_fixture(file_count=10, extent_count=20)
+        try:
+            inode_file = '/tmp/dscan_0005_inode_parity.txt'
+            damage_file = '/tmp/dscan_0005_damage_parity.jsonl'
+            inode_lines = []
+            damage_lines = []
+            for f in fixture['files']:
+                inode_lines.append(str(f['ino']))
+                damage_lines.append(json.dumps({'damage_type': 'backtrace', 'ino': f['ino']}))
+
+            self._write_tool_file(inode_file, '\n'.join(inode_lines) + '\n')
+            self._write_tool_file(damage_file, '\n'.join(damage_lines) + '\n')
+
+            self.fs.data_scan([
+                'scan_extents', '--force-pool', '--force-create-head-inode', '--inode-file', inode_file,
+                '--extent-period', '4', '--extent-limit', str(fixture['extent_limit']),
+                fixture['default_pool'], fixture['extra_pool']
+            ])
+
+            inode_scan_result = {}
+            for f in fixture['files']:
+
+                oid = '{0:x}.00000000'.format(f['ino'])
+                try:
+                    baseline_scan_pool_id = self._read_pool_xattr(fixture['default_pool'], oid, 'scan_pool_id')
+                except CommandFailedError:
+                    baseline_scan_pool_id = None
+
+                inode_scan_result[f['ino']] = {
+                    'scan_max_size': self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size'),
+                    'scan_max_mtime': self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_mtime'),
+                    'scan_ceiling': self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling'),
+                    'scan_pool_id': baseline_scan_pool_id,
+                }
+
+            for f in fixture['files']:
+                oid = '{0:x}.00000000'.format(f['ino'])
+                self._clear_scan_xattrs(oid, pools=[fixture['default_pool']])
+                if 0 in f['missing_extents']:
+                    for pool in [fixture['default_pool'], fixture['extra_pool']]:
+                        try:
+                            self.fs.rados(['rm', oid], pool=pool)
+                        except CommandFailedError:
+                            pass
+
+            self.fs.data_scan([
+                'scan_extents', '--force-pool', '--force-create-head-inode', '--damage-file', damage_file,
+                '--extent-period', '4', '--extent-limit', str(fixture['extent_limit']),
+                fixture['default_pool'], fixture['extra_pool']
+            ])
+
+            for f in fixture['files']:
+
+                oid = '{0:x}.00000000'.format(f['ino'])
+                damage_max_size_raw = self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_size')
+                self.assertEqual(
+                    inode_scan_result[f['ino']]['scan_max_size'],
+                    damage_max_size_raw,
+                    'path={0} ino=0x{1:x} expected scan_max_size={2} actual={3}'.format(
+                        f['path'],
+                        f['ino'],
+                        self._decode_u64_xattr(inode_scan_result[f['ino']]['scan_max_size']),
+                        self._decode_u64_xattr(damage_max_size_raw),
+                    ),
+                )
+                baseline_mtime = self._decode_u64_xattr(inode_scan_result[f['ino']]['scan_max_mtime'])
+                damage_mtime = self._decode_u64_xattr(self._read_pool_xattr(fixture['default_pool'], oid, 'scan_max_mtime'))
+                self.assertGreaterEqual(
+                    damage_mtime,
+                    baseline_mtime,
+                    'path={0} ino=0x{1:x} expected scan_max_mtime >= {2} actual={3}'.format(
+                        f['path'], f['ino'], baseline_mtime, damage_mtime),
+                )
+                self.assertEqual(
+                    inode_scan_result[f['ino']]['scan_ceiling'],
+                    self._read_pool_xattr(fixture['default_pool'], oid, 'scan_ceiling'),
+                    'path={0} ino=0x{1:x} scan_ceiling mismatch'.format(f['path'], f['ino']),
+                )
+
+            for f in fixture['files']:
+
+                oid = '{0:x}.00000000'.format(f['ino'])
+                baseline_scan_pool_id = inode_scan_result[f['ino']]['scan_pool_id']
+                if baseline_scan_pool_id is None:
+                    with self.assertRaises(CommandFailedError):
+                        self._read_pool_xattr(fixture['default_pool'], oid, 'scan_pool_id')
+                else:
+                    self.assertEqual(
+                        baseline_scan_pool_id,
+                        self._read_pool_xattr(fixture['default_pool'], oid, 'scan_pool_id'),
+                        'path={0} ino=0x{1:x} scan_pool_id mismatch'.format(f['path'], f['ino']),
+                    )
+        finally:
+            self.fs.set_joinable()
+            self.fs.wait_for_daemons()
+            self.mount_a.mount_wait()
 
     def test_rebuild_symlink(self):
         self._rebuild_metadata(SymlinkWorkload(self.fs, self.mount_a))
