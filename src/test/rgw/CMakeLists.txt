@@ -35,6 +35,10 @@ add_executable(unittest_rgw_period_history test_rgw_period_history.cc)
 add_ceph_unittest(unittest_rgw_period_history)
 target_link_libraries(unittest_rgw_period_history ${rgw_libs})
 
+add_executable(unittest_rgw_olh test_rgw_olh.cc $<TARGET_OBJECTS:unit-main>)
+add_ceph_unittest(unittest_rgw_olh)
+target_link_libraries(unittest_rgw_olh ${rgw_libs} ${UNITTEST_LIBS})
+
 # unitttest_rgw_compression
 add_executable(unittest_rgw_compression
   test_rgw_compression.cc

@@ -510,15 +510,19 @@ struct rgw_cls_bi_entry {
 WRITE_CLASS_ENCODER(rgw_cls_bi_entry)
 
 enum OLHLogOp {
-  CLS_RGW_OLH_OP_UNKNOWN         = 0,
-  CLS_RGW_OLH_OP_LINK_OLH        = 1,
-  CLS_RGW_OLH_OP_UNLINK_OLH      = 2, /* object does not exist */
+  CLS_RGW_OLH_OP_UNKNOWN = 0,
+  CLS_RGW_OLH_OP_LINK_OLH = 1,
+  CLS_RGW_OLH_OP_UNLINK_OLH = 2, /* object does not exist */
   CLS_RGW_OLH_OP_REMOVE_INSTANCE = 3,
+  // acknowledge an op without changing the OLH target
+  CLS_RGW_OLH_OP_STALE = 4,
 };
 
 struct rgw_bucket_olh_log_entry {
+  // local log ordering, independent of the target's versioned_epoch
   uint64_t epoch;
   OLHLogOp op;
+  // identifies the olh.pending.* xattr to remove after applying this op
   std::string op_tag;
   cls_rgw_obj_key key;
   bool delete_marker;
@@ -557,6 +561,7 @@ struct rgw_bucket_olh_entry {
   bool delete_marker;
   // versioned_epoch of the current target (legacy records use counters)
   uint64_t epoch;
+  // local epoch -> pending ops; these keys must not follow remote epochs
   std::map<uint64_t, std::vector<struct rgw_bucket_olh_log_entry> > pending_log;
   std::string tag;
   bool exists;
