@@ -89,7 +89,9 @@ void DataScan::usage() {
          "[<data pool name> [<extra data pool "
          "name> ...]]\n"
       << "  cephfs-data-scan scan_inodes [--force-pool] [--force-corrupt] "
-         "[--worker_n N --worker_m M] [<data pool name>]\n"
+         "[--force-restore-all-ancestors] "
+         "[--worker_n N --worker_m M] [--damage-file PATH] "
+         "[--type 'TYPE|TYPE'] [--inode-file PATH] [<data pool name>]\n"
       << "  cephfs-data-scan pg_files <path> <pg id> [<pg id>...]\n"
       << "  cephfs-data-scan scan_links\n"
       << "\n"
@@ -100,6 +102,10 @@ void DataScan::usage() {
       << "    --worker_n: Worker number, range 0-(worker_m-1)\n"
       << "    --force-create-head-inode: force flushing inode 0th object in "
          "targeted scan_extents even when no extents are found\n"
+      << "    --force-restore-all-ancestors: force restoring all ancestor "
+         "dirfrags during targeted scan_inodes\n"
+      << "      with targeted scan_inodes (--damage-file/--inode-file), "
+         "requires single worker (--worker_n 0 --worker_m 1)\n"
       << "\n"
       << "  cephfs-data-scan scan_frags [--force-corrupt]\n"
       << "  cephfs-data-scan cleanup [<data pool name>]\n"
@@ -165,8 +171,9 @@ bool DataScan::parse_kwarg(
     dout(10) << "Applying tag filter: '" << filter_tag << "'" << dendl;
     return true;
   } else if (arg == std::string("--damage-file")) {
-    if (command != "scan_extents") {
-      std::cerr << "Option '--damage-file' is only valid with scan_extents"
+    if (command != "scan_extents" && command != "scan_inodes") {
+      std::cerr << "Option '--damage-file' is only valid with scan_extents "
+                   "or scan_inodes"
                 << std::endl;
       *r = -EINVAL;
       return false;
@@ -174,8 +181,9 @@ bool DataScan::parse_kwarg(
     damage_file_path = val;
     return true;
   } else if (arg == std::string("--type")) {
-    if (command != "scan_extents") {
-      std::cerr << "Option '--type' is only valid with scan_extents"
+    if (command != "scan_extents" && command != "scan_inodes") {
+      std::cerr << "Option '--type' is only valid with scan_extents or "
+                   "scan_inodes"
                 << std::endl;
       *r = -EINVAL;
       return false;
@@ -192,8 +200,9 @@ bool DataScan::parse_kwarg(
     damage_type_all = false;
     return true;
   } else if (arg == std::string("--inode-file")) {
-    if (command != "scan_extents") {
-      std::cerr << "Option '--inode-file' is only valid with scan_extents"
+    if (command != "scan_extents" && command != "scan_inodes") {
+      std::cerr << "Option '--inode-file' is only valid with scan_extents "
+                   "or scan_inodes"
                 << std::endl;
       *r = -EINVAL;
       return false;
@@ -309,6 +318,9 @@ bool DataScan::parse_arg(
   } else if (arg == "--force-create-head-inode") {
     force_create_head_inode = true;
     return true;
+  } else if (arg == "--force-restore-all-ancestors") {
+    force_restore_all_ancestors = true;
+    return true;
   } else {
     return false;
   }
@@ -395,22 +407,28 @@ int DataScan::main(const std::vector<const char*> &args)
     return -EINVAL;
   }
 
-  if (command != "scan_extents") {
+  if (command != "scan_extents" && command != "scan_inodes") {
     if (!damage_file_path.empty()) {
-      std::cerr << "Option '--damage-file' is only valid with scan_extents"
+      std::cerr << "Option '--damage-file' is only valid with scan_extents "
+                   "or scan_inodes"
                 << std::endl;
       return -EINVAL;
     }
     if (damage_type_filter_set) {
-      std::cerr << "Option '--type' is only valid with scan_extents"
+      std::cerr << "Option '--type' is only valid with scan_extents or "
+                   "scan_inodes"
                 << std::endl;
       return -EINVAL;
     }
     if (!inode_file_path.empty()) {
-      std::cerr << "Option '--inode-file' is only valid with scan_extents"
+      std::cerr << "Option '--inode-file' is only valid with scan_extents "
+                   "or scan_inodes"
                 << std::endl;
       return -EINVAL;
     }
+  }
+
+  if (command != "scan_extents") {
     if (extent_period_set) {
       std::cerr << "Option '--extent-period' is only valid with scan_extents"
                 << std::endl;
@@ -429,12 +447,27 @@ int DataScan::main(const std::vector<const char*> &args)
     }
   }
 
+  if (command != "scan_inodes") {
+    if (force_restore_all_ancestors) {
+      std::cerr << "Option '--force-restore-all-ancestors' is only valid with "
+                   "scan_inodes"
+                << std::endl;
+      return -EINVAL;
+    }
+  }
+
   if (command == "scan_extents" && (extent_period_set || extent_limit_set) &&
       damage_file_path.empty() && inode_file_path.empty()) {
     std::cerr << "Options '--extent-period'/'--extent-limit' require "
                  "'--damage-file' or "
                  "'--inode-file'"
               << std::endl;
+    return -EINVAL;
+  }
+
+  if ((command == "scan_extents" || command == "scan_inodes") &&
+      damage_type_filter_set && damage_file_path.empty()) {
+    std::cerr << "Option '--type' requires '--damage-file'" << std::endl;
     return -EINVAL;
   }
 
@@ -446,9 +479,28 @@ int DataScan::main(const std::vector<const char*> &args)
     return -EINVAL;
   }
 
-  if (command == "scan_extents" &&
-      !damage_file_path.empty() &&
-      !damage_type_filter_set) {
+  if (command == "scan_inodes" && force_restore_all_ancestors &&
+      damage_file_path.empty() && inode_file_path.empty()) {
+    std::cerr << "Option '--force-restore-all-ancestors' requires "
+                 "'--damage-file' or '--inode-file'"
+              << std::endl;
+    return -EINVAL;
+  }
+
+  const bool targeted_scan_inodes =
+      command == "scan_inodes" &&
+      (!damage_file_path.empty() || !inode_file_path.empty());
+  if (targeted_scan_inodes && force_restore_all_ancestors &&
+      (m != 1 || n != 0)) {
+    std::cerr << "Targeted 'scan_inodes' with "
+                 "'--force-restore-all-ancestors' requires single worker "
+                 "('--worker_n 0 --worker_m 1')"
+              << std::endl;
+    return -EINVAL;
+  }
+
+  if ((command == "scan_extents" || command == "scan_inodes") &&
+      !damage_file_path.empty() && !damage_type_filter_set) {
     damage_type_all = true;
   }
 
@@ -467,7 +519,7 @@ int DataScan::main(const std::vector<const char*> &args)
 
   // Default to output to metadata pool
   if (driver == NULL) {
-    driver = new MetadataDriver();
+    driver = new MetadataDriver(this);
     driver->set_force_corrupt(force_corrupt);
     driver->set_force_init(force_init);
     dout(4) << "Using metadata pool output" << dendl;
@@ -587,7 +639,8 @@ int DataScan::main(const std::vector<const char*> &args)
   }
 
   // Initialize metadata_io from MDSMap for scan_frags
-  if (command == "scan_frags" || command == "scan_links") {
+  if (command == "scan_frags" || command == "scan_links" ||
+      command == "scan_inodes") {
     const auto fs = fsmap->get_filesystem(fscid);
     if (fs == nullptr) {
       std::cerr << "Filesystem id " << fscid << " does not exist" << std::endl;
@@ -599,7 +652,7 @@ int DataScan::main(const std::vector<const char*> &args)
     int r = rados.pool_reverse_lookup(metadata_pool_id, &metadata_pool_name);
     if (r < 0) {
       std::cerr << "Pool " << metadata_pool_id
-        << " identified in MDS map not found in RADOS!" << std::endl;
+                << " identified in MDS map not found in RADOS!" << std::endl;
       return r;
     }
 
@@ -613,6 +666,12 @@ int DataScan::main(const std::vector<const char*> &args)
 
   // Finally, dispatch command
   if (command == "scan_inodes") {
+    if (!damage_file_path.empty()) {
+      return scan_inodes_for_damage_file();
+    }
+    if (!inode_file_path.empty()) {
+      return scan_inodes_for_inode_file();
+    }
     return scan_inodes();
   } else if (command == "scan_extents") {
     if (!damage_file_path.empty()) {
@@ -1139,6 +1198,177 @@ int DataScan::scan_extents_for_inode_file()
   return 0;
 }
 
+int DataScan::scan_inodes_for_damage_file() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  std::ifstream input(damage_file_path);
+  if (!input.is_open()) {
+    int err = errno ? -errno : -ENOENT;
+    std::cerr << "Failed to open damage file '" << damage_file_path
+              << "': " << cpp_strerror(err) << std::endl;
+    return err;
+  }
+
+  uint64_t candidate_index = 0;
+  uint64_t line_no = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    ++line_no;
+    if (trim_whitespace(line).empty()) {
+      continue;
+    }
+
+    JSONParser parser;
+    if (!parser.parse(line.c_str(), static_cast<int>(line.size()))) {
+      std::cerr << "Invalid JSON on line " << line_no << ": "
+                << describe_json_parse_error(line) << std::endl;
+      return -EINVAL;
+    }
+    if (!parser.is_object()) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": JSON value must be an object" << std::endl;
+      return -EINVAL;
+    }
+
+    std::string damage_type;
+    unsigned long long ino = 0;
+    try {
+      JSONDecoder::decode_json("damage_type", damage_type, &parser, true);
+      JSONDecoder::decode_json("ino", ino, &parser, true);
+    } catch (const JSONDecoder::err &e) {
+      std::cerr << "Invalid damage entry on line " << line_no << ": "
+                << e.what() << std::endl;
+      return -EINVAL;
+    }
+
+    JSONObj *damage_type_obj = parser.find_obj("damage_type");
+    ceph_assert(damage_type_obj != nullptr);
+    if (!damage_type_obj->get_data_val().quoted) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": damage_type must be a string" << std::endl;
+      return -EINVAL;
+    }
+
+    JSONObj *ino_obj = parser.find_obj("ino");
+    ceph_assert(ino_obj != nullptr);
+    if (ino_obj->get_data_val().quoted) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": ino must be a numeric JSON value" << std::endl;
+      return -EINVAL;
+    }
+
+    if (trim_whitespace(damage_type).empty()) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": damage_type must be a non-empty string" << std::endl;
+      return -EINVAL;
+    }
+
+    bool type_matched = damage_type_all;
+    if (!damage_type_all) {
+      type_matched =
+          std::find(damage_type_tokens.begin(), damage_type_tokens.end(),
+                    damage_type) != damage_type_tokens.end();
+    }
+    if (!type_matched) {
+      continue;
+    }
+
+    inodeno_t selected_ino = static_cast<inodeno_t>(ino);
+    if ((candidate_index % m) == n) {
+      dout(10) << "selected damage entry line=" << line_no << " damage_type='"
+               << damage_type << "'"
+               << " ino=0x" << std::hex << ino << std::dec
+               << " candidate_index=" << candidate_index << " worker=" << n
+               << "/" << m << dendl;
+      const std::string oid = format_extent_oid(selected_ino, 0);
+      r = scan_inode_from_oid(oid, selected_ino, 0,
+                              force_restore_all_ancestors);
+      if (r < 0) {
+        return r;
+      }
+    }
+
+    ++candidate_index;
+  }
+
+  return 0;
+}
+
+int DataScan::scan_inodes_for_inode_file() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  std::ifstream input(inode_file_path);
+  if (!input.is_open()) {
+    int err = errno ? -errno : -ENOENT;
+    std::cerr << "Failed to open inode file '" << inode_file_path
+              << "': " << cpp_strerror(err) << std::endl;
+    return err;
+  }
+
+  uint64_t candidate_index = 0;
+  uint64_t line_no = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    ++line_no;
+
+    std::string trimmed = trim_whitespace(line);
+    if (trimmed.empty()) {
+      continue;
+    }
+
+    auto ino_val = ceph::parse<uint64_t>(trimmed);
+    if (!ino_val) {
+      std::cerr << "Invalid inode entry on line " << line_no
+                << ": expected unsigned integer inode" << std::endl;
+      return -EINVAL;
+    }
+
+    inodeno_t selected_ino(*ino_val);
+    if ((candidate_index % m) == n) {
+      dout(10) << "selected inode entry line=" << line_no << " ino=0x"
+               << std::hex << static_cast<uint64_t>(selected_ino) << std::dec
+               << " candidate_index=" << candidate_index << " worker=" << n
+               << "/" << m << dendl;
+      const std::string oid = format_extent_oid(selected_ino, 0);
+      r = scan_inode_from_oid(oid, selected_ino, 0,
+                              force_restore_all_ancestors);
+      if (r < 0) {
+        return r;
+      }
+    }
+
+    ++candidate_index;
+  }
+
+  return 0;
+}
+
 int DataScan::probe_filter(librados::IoCtx &ioctx)
 {
   bufferlist filter_bl;
@@ -1247,27 +1477,10 @@ int DataScan::forall_objects(
   return r;
 }
 
-int DataScan::scan_inodes()
-{
-  bool roots_present;
-  int r = driver->check_roots(&roots_present);
-  if (r != 0) {
-    derr << "Unexpected error checking roots: '"
-      << cpp_strerror(r) << "'" << dendl;
-    return r;
-  }
+int DataScan::scan_inode_from_oid(const std::string &oid, uint64_t obj_name_ino,
+                                  uint64_t obj_name_offset,
+                                  bool force_restore_ancestors) {
 
-  if (!roots_present) {
-    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
-      "one node before running 'scan_inodes'" << std::endl;
-    return -EIO;
-  }
-
-  return forall_objects(data_io, true, [this](
-        std::string const &oid,
-        uint64_t obj_name_ino,
-        uint64_t obj_name_offset) -> int
-  {
     int r = 0;
 
     dout(10) << "handling object "
@@ -1495,7 +1708,8 @@ int DataScan::scan_inodes()
         }
       } else {
         /* Happy case: we will inject a named dentry for this inode */
-        r = driver->inject_with_backtrace(backtrace, dentry);
+        r = driver->inject_with_backtrace(backtrace, dentry,
+                                          force_restore_ancestors);
         if (r < 0) {
           dout(4) << "Error injecting 0x" << std::hex << backtrace.ino
             << std::dec << " with backtrace: " << cpp_strerror(r) << dendl;
@@ -1520,7 +1734,30 @@ int DataScan::scan_inodes()
     }
 
     return r;
-  });
+}
+
+int DataScan::scan_inodes() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  return forall_objects(data_io, true,
+                        [this](std::string const &oid, uint64_t obj_name_ino,
+                               uint64_t obj_name_offset) -> int {
+                          return scan_inode_from_oid(oid, obj_name_ino,
+                                                     obj_name_offset);
+                        });
 }
 
 int DataScan::cleanup()
@@ -1970,11 +2207,23 @@ int DataScan::scan_frags()
     return -EIO;
   }
 
-  return forall_objects(metadata_io, true, [this](
-        std::string const &oid,
-        uint64_t obj_name_ino,
-        uint64_t obj_name_offset) -> int
-  {
+  return forall_objects(metadata_io, true,
+                        [this](std::string const &oid, uint64_t obj_name_ino,
+                               uint64_t obj_name_offset) -> int {
+                          return scan_frag_from_oid(oid, obj_name_ino,
+                                                    obj_name_offset);
+                        });
+}
+
+int DataScan::scan_frag_from_oid(const std::string &oid, uint64_t obj_name_ino,
+                                 uint64_t obj_name_offset,
+                                 bool force_restore_ancestors,
+                                 std::unordered_set<uint64_t> &&inode_set) {
+  if (force_restore_ancestors &&
+      inode_set.find(obj_name_ino) != inode_set.end()) {
+    derr << "Found cycle while restoring ancestors" << dendl;
+    return -EINVAL;
+  }
     int r = 0;
     r = parse_oid(oid, &obj_name_ino, &obj_name_offset);
     if (r != 0) {
@@ -2086,7 +2335,8 @@ int DataScan::scan_frags()
         }
       } else {
         /* Happy case: we will inject a named dentry for this inode */
-        r = driver->inject_with_backtrace(backtrace, dentry);
+        r = driver->inject_with_backtrace(
+            backtrace, dentry, force_restore_ancestors, std::move(inode_set));
         if (r < 0) {
           dout(4) << "Error injecting 0x" << std::hex << backtrace.ino
             << std::dec << " with backtrace: " << cpp_strerror(r) << dendl;
@@ -2111,7 +2361,6 @@ int DataScan::scan_frags()
     }
 
     return r;
-  });
 }
 
 int MetadataTool::read_fnode(
@@ -2399,11 +2648,9 @@ int MetadataDriver::get_frag_of(
   }
 }
 
-
 int MetadataDriver::inject_with_backtrace(
-    const inode_backtrace_t &backtrace, const InodeStore &dentry)
-    
-{
+    const inode_backtrace_t &backtrace, const InodeStore &dentry,
+    bool force_inject_ancestors, std::unordered_set<uint64_t> &&inode_set) {
 
   // On dirfrags
   // ===========
@@ -2457,6 +2704,10 @@ int MetadataDriver::inject_with_backtrace(
   dout(10) << "  inode: 0x" << std::hex << ino << std::dec << dendl;
   for (std::vector<inode_backpointer_t>::const_iterator i = backtrace.ancestors.begin();
       i != backtrace.ancestors.end(); ++i) {
+    if (force_inject_ancestors && !inode_set.insert(ino).second) {
+      derr << "Found cycle while restoring ancestors" << dendl;
+      return -EINVAL;
+    }
     const inode_backpointer_t &backptr = *i;
     dout(10) << "  backptr: 0x" << std::hex << backptr.dirino << std::dec
       << "/" << backptr.dname << dendl;
@@ -2567,7 +2818,13 @@ int MetadataDriver::inject_with_backtrace(
       // injecting data.  If there are in fact missing ancestors, this
       // should be fixed up using a separate tool scanning the metadata
       // pool.
-      break;
+      if (force_inject_ancestors) {
+        return dscan->scan_frag_from_oid(
+            InodeStore::get_object_name(parent_ino, frag_t(), "").name,
+            parent_ino, 0, force_inject_ancestors, std::move(inode_set));
+      } else {
+        break;
+      }
     } else {
       // Proceed up the backtrace, creating parents
       ino = parent_ino;
@@ -2757,11 +3014,9 @@ int LocalFileDriver::inject_data(
   return 0;
 }
 
-
 int LocalFileDriver::inject_with_backtrace(
-    const inode_backtrace_t &bt,
-    const InodeStore &dentry)
-{
+    const inode_backtrace_t &bt, const InodeStore &dentry,
+    bool force_inject_ancestors, std::unordered_set<uint64_t> &&inode_set) {
   std::string path_builder = path;
 
   // Iterate through backtrace creating directory parents

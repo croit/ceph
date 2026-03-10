@@ -12,13 +12,11 @@
  *
  */
 
-
 #include "MDSUtility.h"
 #include "include/rados/librados.hpp"
 
 class InodeStore;
 class MDSTable;
-
 class RecoveryDriver {
   protected:
     // If true, overwrite structures that generate decoding errors.
@@ -50,9 +48,11 @@ class RecoveryDriver {
      * Inject an inode + dentry parents into the metadata pool,
      * based on a backtrace recovered from the data pool
      */
-    virtual int inject_with_backtrace(
-        const inode_backtrace_t &bt,
-        const InodeStore &dentry) = 0;
+    virtual int inject_with_backtrace(const inode_backtrace_t &bt,
+                                      const InodeStore &dentry,
+                                      bool force_inject_ancestors = false,
+                                      std::unordered_set<uint64_t> &&inode_set =
+                                          std::unordered_set<uint64_t>()) = 0;
 
     /**
      * Inject an inode + dentry into the lost+found directory,
@@ -124,9 +124,11 @@ class LocalFileDriver : public RecoveryDriver
         const FSMap *fsmap,
         fs_cluster_id_t fscid) override;
 
-    int inject_with_backtrace(
-        const inode_backtrace_t &bt,
-        const InodeStore &dentry) override;
+    int inject_with_backtrace(const inode_backtrace_t &bt,
+                              const InodeStore &dentry,
+                              bool force_inject_ancestors = false,
+                              std::unordered_set<uint64_t> &&inode_set =
+                                  std::unordered_set<uint64_t>()) override;
 
     int inject_lost_and_found(
         inodeno_t ino,
@@ -178,11 +180,16 @@ class MetadataTool
 		  const std::string &dname, InodeStore *inode, snapid_t *dnfirst=nullptr);
 };
 
+class DataScan; // forward declaration for friend declaration in RecoveryDriver
+
 /**
  * A class that knows how to manipulate CephFS metadata pools
  */
 class MetadataDriver : public RecoveryDriver, public MetadataTool
 {
+  public:
+    MetadataDriver(DataScan *dscan) : RecoveryDriver(), dscan(dscan) {}
+
   protected:
     /**
      * Create a .inode object, i.e. root or mydir
@@ -223,9 +230,11 @@ class MetadataDriver : public RecoveryDriver, public MetadataTool
         inodeno_t dir_ino, const std::string &dname,
         const frag_t fragment, const InodeStore &inode, snapid_t dnfirst=CEPH_NOSNAP);
 
-    int inject_with_backtrace(
-        const inode_backtrace_t &bt,
-        const InodeStore &dentry) override;
+    int inject_with_backtrace(const inode_backtrace_t &bt,
+                              const InodeStore &dentry,
+                              bool force_inject_ancestors = false,
+                              std::unordered_set<uint64_t> &&inode_set =
+                                  std::unordered_set<uint64_t>()) override;
 
     int inject_lost_and_found(
         inodeno_t ino,
@@ -237,6 +246,7 @@ class MetadataDriver : public RecoveryDriver, public MetadataTool
 
     int load_table(MDSTable *table);
     int save_table(MDSTable *table);
+    DataScan* dscan;
 };
 
 class DataScan : public MDSUtility, public MetadataTool
@@ -262,6 +272,23 @@ class DataScan : public MDSUtility, public MetadataTool
      * Scan data pool for backtraces, and inject inodes to metadata pool
      */
     int scan_inodes();
+
+    /**
+     * Recover and inject one inode from its 0th object oid.
+     */
+    int scan_inode_from_oid(const std::string &oid, uint64_t obj_name_ino,
+                            uint64_t obj_name_offset,
+                            bool force_restore_ancestors = false);
+
+    /**
+     * Targeted inode scan using line-delimited damage JSON input.
+     */
+    int scan_inodes_for_damage_file();
+
+    /**
+     * Targeted inode scan using line-delimited inode number input.
+     */
+    int scan_inodes_for_inode_file();
 
     /**
      * Scan data pool for file sizes and mtimes
@@ -291,6 +318,16 @@ class DataScan : public MDSUtility, public MetadataTool
      * directory inodes.
      */
     int scan_frags();
+
+    /**
+     * Scan metadata pool for 0th dirfrags to link orphaned
+     * directory for given oid of object.
+     */
+    int scan_frag_from_oid(const std::string &oid, uint64_t obj_name_ino,
+                           uint64_t obj_name_offset,
+                           bool force_restore_ancestors = false,
+                           std::unordered_set<uint64_t> &&inode_set =
+                               std::unordered_set<uint64_t>());
 
     /**
      * Cleanup xattrs from data pool
@@ -326,6 +363,7 @@ class DataScan : public MDSUtility, public MetadataTool
     uint64_t extent_limit;
     bool extent_limit_set;
     bool force_create_head_inode;
+    bool force_restore_all_ancestors;
 
     int parse_damage_type_expr(const std::string &expr,
                                std::vector<std::string> *tokens);
@@ -362,13 +400,15 @@ class DataScan : public MDSUtility, public MetadataTool
   public:
     static void usage();
     int main(const std::vector<const char *> &args);
+    friend class MetadataDriver;
 
     DataScan()
         : driver(NULL), fscid(FS_CLUSTER_ID_NONE), data_pool_id(-1), n(0), m(1),
           force_pool(false), force_corrupt(false), force_init(false),
           damage_type_filter_set(false), damage_type_all(false),
           extent_period(1), extent_period_set(false), extent_limit(1),
-          extent_limit_set(false), force_create_head_inode(false) {}
+          extent_limit_set(false), force_create_head_inode(false),
+          force_restore_all_ancestors(false) {}
 
     ~DataScan() override
     {

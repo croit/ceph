@@ -9,6 +9,7 @@ import os
 import time
 import traceback
 import stat
+import rados
 
 from io import BytesIO, StringIO
 from collections import namedtuple, defaultdict
@@ -365,11 +366,36 @@ class TestDataScan(CephFSTestCase):
     MDSS_REQUIRED = 2
 
     def _write_tool_file(self, path, content):
-        self.fs.tool_remote.sh(script=[
-            'python3', '-c',
-            ("from pathlib import Path; "
-             "Path({path!r}).write_text({content!r}, encoding='utf-8')".format(path=path, content=content))
-        ])
+        self.fs.tool_remote.run(
+            args=[
+                "python3",
+                "-c",
+                "import sys; from pathlib import Path; Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())",
+                path,
+            ],
+            stdin=BytesIO(content.encode("utf-8")),
+        )
+
+    @staticmethod
+    def json_validator(json_out, rc, element, expected_value):
+        if rc != 0:
+            return False, "asok command returned error {rc}".format(rc=rc)
+        element_value = json_out.get(element)
+        if element_value != expected_value:
+            return False, "unexpectedly got {jv} instead of {ev}!".format(
+                jv=element_value, ev=expected_value)
+        return True, "Succeeded"
+
+    def tell_command(self, mds_rank, command, validator=None):
+        command_list = command.split()
+        jout = self.fs.rank_tell(command_list, rank=mds_rank)
+        if validator:
+            success, errstring = validator(jout, 0)
+            if not success:
+                self.fail("command '{cmd}' failed validation: {err}".format(
+                    cmd=command, err=errstring))
+        return jout
+
 
     def _read_pool_xattr(self, pool, oid, xattr):
         return self.fs.rados(['getxattr', oid, xattr, '-'], pool=pool, stdout=BytesIO()).stdout.getvalue()
@@ -1220,6 +1246,324 @@ class TestDataScan(CephFSTestCase):
         self.assertNotEqual(out_json, None)
         self.assertEqual(out_json["return_code"], 0)
         self.assertEqual(self.fs.wait_until_scrub_complete(tag=out_json["scrub_tag"]), True)
+
+    def _build_remote_link_entry_path(self, base_dir, level, serial, branch):
+        path_part = ""
+        cur_serial = serial
+        for cur_level in range(level, -1, -1):
+            name = f"e_{cur_level}_{cur_serial}"
+            if path_part:
+                path_part = os.path.join(name, path_part)
+            else:
+                path_part = name
+            cur_serial //= branch
+        return os.path.join(base_dir, path_part)
+
+    def _create_remote_link_topology(self, base_dir, levels, branch):
+        log.info("creating remote_link topology: base_dir=%s levels=%s branch=%s", base_dir, levels, branch)
+        level0_path = self._build_remote_link_entry_path(base_dir, 0, 0, branch)
+        self.mount_a.run_shell(["mkdir", "-p", level0_path])
+
+        for level in range(1, levels):
+            count = branch ** level
+            for serial in range(count):
+                entry_path = self._build_remote_link_entry_path(base_dir, level, serial, branch)
+                self.mount_a.run_shell(["mkdir", entry_path])
+
+        part_span = branch ** (levels - 1)
+        for x in range(part_span):
+            serial_last = (branch - 1) * part_span + x
+            file_path = self._build_remote_link_entry_path(base_dir, levels, serial_last, branch)
+            self.mount_a.run_shell(["touch", file_path])
+            prev_path = file_path
+            for t in range(branch - 2, -1, -1):
+                serial = t * part_span + x
+                link_path = self._build_remote_link_entry_path(base_dir, levels, serial, branch)
+                self.mount_a.run_shell(["ln", prev_path, link_path])
+                prev_path = link_path
+        return part_span
+
+    def _inject_remote_link_damage(self, test_dir_path, levels, branch, meta_ioctx, data_ioctx):
+        log.info("injecting remote_link damage: test_dir=%s levels=%s branch=%s", test_dir_path, levels, branch)
+        level1_serial = branch - 1
+
+        for i in range(branch):
+            level2_serial = level1_serial * branch + i
+
+            for level in range(2, levels + 1):
+                if level < levels and level % 2 != 0:
+                    continue
+                if level == levels and i != (branch - 1):
+                    continue
+
+                base = branch ** (level - 2)
+                for x in range(base):
+                    serial = level2_serial * base + x
+                    entry_path = self._build_remote_link_entry_path(
+                        test_dir_path, level, serial, branch
+                    )
+                    ino = self.mount_a.path_to_ino(entry_path)
+                    ioctx = data_ioctx if level == levels else meta_ioctx
+                    try:
+                        ioctx.remove_object(f"{ino:x}.00000000")
+                    except rados.ObjectNotFound:
+                        pass
+
+    def _collect_remote_link_damage(self, mds_rank, test_dir_path, levels, branch, part_span):
+        log.info("collecting remote_link damage: rank=%s test_dir=%s levels=%s branch=%s", mds_rank, test_dir_path, levels, branch)
+        success_validator = lambda j, r: self.json_validator(j, r, "return_code", 0)
+        scrub_json = self.tell_command(
+            mds_rank,
+            "scrub start / recursive force",
+            success_validator)
+        self.assertEqual(self.fs.wait_until_scrub_complete(tag=scrub_json["scrub_tag"], sleep=5), True)
+
+        damage_json = self.tell_command(mds_rank, "damage ls")
+        remote_link_paths = set(
+            entry["path"] for entry in damage_json if entry.get("damage_type") == "remote_link"
+        )
+
+        missing_links = []
+        hard_link_serial_range = part_span * (branch - 1)
+        for serial in range(hard_link_serial_range):
+            link_path = "/" + self._build_remote_link_entry_path(test_dir_path, levels, serial, branch)
+            if link_path not in remote_link_paths:
+                missing_links.append(link_path)
+
+        if missing_links:
+            self.fail(
+                "missing remote_link damage entries: {0}".format(
+                    ", ".join(missing_links)
+                )
+            )
+
+    def _remove_openfiles_objects(self, meta_ioctx):
+        log.info("removing openfiles objects")
+        x = 0
+        while True:
+            obj_name = f"mds0_openfiles.{x}"
+            try:
+                meta_ioctx.stat(obj_name)
+            except rados.ObjectNotFound:
+                break
+            meta_ioctx.remove_object(obj_name)
+            x += 1
+
+    def _failover_and_cleanup_for_data_scan(self, meta_ioctx, flush_journal=False, cleanup=True):
+        log.info("failover and cleanup: flush_journal=%s cleanup=%s", flush_journal, cleanup)
+        if flush_journal:
+            self.fs.mds_asok(["flush", "journal"])
+        self.fs.fail()
+        if cleanup:
+            self._remove_openfiles_objects(meta_ioctx)
+            self.fs.journal_tool(["journal", "reset"], 0)
+
+    def _restart_mds_after_data_scan(self):
+        log.info("restarting mds after data scan")
+        self.fs.mds_fail_restart()
+        self.fs.set_down(False)
+        self.fs.set_joinable(True)
+        self.fs.wait_for_daemons()
+        status = self.fs.mds_asok(["status"])
+        self.assertEqual("up:active", str(status["state"]))
+        self.mount_a._run_umount_lf()
+        self.mount_a.mount_wait()
+
+    def _load_damage_log_to_tool_remote(self, damage_log_path):
+        log.info("loading damage entries to tool remote path %s", damage_log_path)
+        mds_rank = self.fs.get_rank()["rank"]
+        damage_json = self.tell_command(mds_rank, "damage ls")
+        self.assertTrue(damage_json, "damage ls returned no entries")
+        damage_log = "\n".join(
+            json.dumps(entry, separators=(",", ":")) for entry in damage_json) + "\n"
+        self._write_tool_file(damage_log_path, damage_log)
+
+    def _verify_no_remote_link_damage(self, mds_rank, test_dir_path):
+        log.info("verifying no remote_link damage remains: rank=%s test_dir=%s", mds_rank, test_dir_path)
+        success_validator = lambda j, r: self.json_validator(j, r, "return_code", 0)
+        scrub_json = self.tell_command(
+            mds_rank,
+            "scrub start / recursive force",
+            success_validator)
+        self.assertEqual(self.fs.wait_until_scrub_complete(tag=scrub_json["scrub_tag"], sleep=5), True)
+
+        damage_json = self.tell_command(mds_rank, "damage ls")
+        for entry in damage_json:
+            if entry.get("damage_type") == "remote_link":
+                self.fail(
+                    "unexpected remote_link damage after data-scan repair: {0}".format(
+                        json.dumps(entry, sort_keys=True)
+                    )
+                )
+
+    def _verify_nlink_counts(self, test_dir_path):
+        log.info("verifying nlink counts from path %s", test_dir_path)
+        out = self.mount_a.run_shell(
+            ["find", test_dir_path, "-printf", "%i %y %n %p\n"],
+            stdout=StringIO()).stdout.getvalue()
+
+        file_inode_map = {}
+        file_nlink_map = {}
+        dir_nlink_map = {}
+        dir_paths = set()
+        dir_parent_counts = {}
+
+        for line in out.splitlines():
+            if not line:
+                continue
+            parts = line.split(" ", 3)
+            if len(parts) < 4:
+                continue
+            inode, ftype, nlink, path_str = parts
+            if ftype == "f":
+                file_inode_map.setdefault(inode, set()).add(os.path.basename(path_str))
+                file_nlink_map[inode] = nlink
+            elif ftype == "d":
+                dir_paths.add(path_str)
+                dir_nlink_map[path_str] = nlink
+
+        for dir_path in dir_paths:
+            parent = os.path.dirname(dir_path)
+            if parent in dir_paths:
+                dir_parent_counts[parent] = dir_parent_counts.get(parent, 0) + 1
+
+        file_mismatches = []
+        for inode, names in file_inode_map.items():
+            actual = int(file_nlink_map.get(inode))
+            expected = len(names)
+            if actual != expected:
+                file_mismatches.append((inode, expected, actual))
+        if file_mismatches:
+            details = ", ".join(
+                "{0}: expected {1}, got {2}".format(i, e, a)
+                for i, e, a in file_mismatches)
+            self.fail("nlink mismatch for files: {0}".format(details))
+
+        dir_mismatches = []
+        for dir_path in dir_paths:
+            expected_subdirs = dir_parent_counts.get(dir_path, 0)
+            expected_nlink = 2 + expected_subdirs
+            actual = dir_nlink_map.get(dir_path)
+            if int(actual) != expected_nlink:
+                dir_mismatches.append((dir_path, expected_nlink, actual))
+        if dir_mismatches:
+            details = ", ".join(
+                "{0}: expected {1}, got {2}".format(path, exp, act)
+                for path, exp, act in dir_mismatches)
+            self.fail("nlink mismatch for directories: {0}".format(details))
+
+    def _run_remote_link_damage_repair_with_offline_data_scan(self, restore_all_ancestors):
+        log.info("running remote_link targeted repair flow: restore_all_ancestors=%s", restore_all_ancestors)
+        test_dir_path = "dscan_remote_link"
+        damage_log_path = "/tmp/damage.log"
+        n = 5
+        b = 10
+
+        self.run_ceph_cmd(
+            "config", "set", "global", "mds_damage_table_max_entries", "1000000"
+        )
+        self.run_ceph_cmd(
+            "config", "set", "global", "mds_force_hard_link_scrubbing", "true"
+        )
+        self.run_ceph_cmd(
+            "config", "set", "global", "mds_damage_log_file", damage_log_path
+        )
+        self.run_ceph_cmd(
+            "config", "set", "global", "mds_damage_log_to_file", "true"
+        )
+
+        for daemon in self.fs.mds_daemons.values():
+            daemon.remote.run(args=["sudo", "rm", "-f", damage_log_path])
+
+        self.mount_a.run_shell(["rm", "-rf", test_dir_path])
+        self.mount_a.run_shell(["mkdir", test_dir_path])
+
+        part_span = self._create_remote_link_topology(test_dir_path, n, b)
+        self.fs.mds_asok(["flush", "journal"])
+
+        meta_pool = self.fs.get_metadata_pool_name()
+        data_pool = self.fs.get_data_pool_name()
+        conf = self.mount_a.config_path
+        keyring = self.mount_a.get_keyring_path()
+
+        cluster = rados.Rados(
+            conffile=conf,
+            name="client.admin",
+            conf={"keyring": keyring})
+        cluster.connect()
+        meta_ioctx = cluster.open_ioctx(meta_pool)
+        data_ioctx = cluster.open_ioctx(data_pool)
+
+        try:
+            mds_rank = self.fs.get_rank()["rank"]
+            self._inject_remote_link_damage(test_dir_path, n, b, meta_ioctx, data_ioctx)
+            self._collect_remote_link_damage(mds_rank, test_dir_path, n, b, part_span)
+
+            self._load_damage_log_to_tool_remote(damage_log_path)
+
+            self._failover_and_cleanup_for_data_scan(meta_ioctx, flush_journal=False, cleanup=True)
+            log.info("running data_scan scan_extents for remote_link damages")
+            self.fs.data_scan([
+                "scan_extents",
+                "--force-create-head-inode",
+                "--damage-file", damage_log_path,
+                "--type", "remote_link",
+                "--extent-period", "1",
+                "--extent-limit", "1",
+            ], worker_count=4)
+
+            scan_inodes_args = [
+                "scan_inodes",
+                "--force-corrupt",
+                "--damage-file", damage_log_path,
+                "--type", "remote_link",
+            ]
+            if restore_all_ancestors:
+                scan_inodes_args.insert(2, "--force-restore-all-ancestors")
+            log.info("running data_scan scan_inodes with args: %s", scan_inodes_args)
+            if restore_all_ancestors:
+                self.fs.data_scan(scan_inodes_args)
+            else:
+                self.fs.data_scan(scan_inodes_args, worker_count=4)
+
+            if not restore_all_ancestors:
+                log.info("running data_scan scan_frags --force-corrupt")
+                self.fs.data_scan(["scan_frags", "--force-corrupt"])
+
+            log.info("running data_scan scan_links")
+            self.fs.data_scan(["scan_links"])
+
+            self._restart_mds_after_data_scan()
+
+            mds_rank = self.fs.get_rank()["rank"]
+            self.fs.mds_asok(["damage", "clear"])
+            success_validator = lambda j, r: self.json_validator(j, r, "return_code", 0)
+            scrub_json = self.tell_command(
+                mds_rank,
+                "scrub start / recursive repair force",
+                success_validator)
+            self.assertEqual(self.fs.wait_until_scrub_complete(tag=scrub_json["scrub_tag"], sleep=5), True)
+
+            self.fs.mds_asok(["damage", "clear"])
+
+            self._verify_no_remote_link_damage(mds_rank, test_dir_path)
+            self._verify_nlink_counts(".")
+
+            self.mount_a.run_shell(["rm", "-rf", test_dir_path])
+        finally:
+            meta_ioctx.close()
+            data_ioctx.close()
+            cluster.shutdown()
+
+    def test_remote_link_damage_repair_targeted_no_scan_frags(self):
+        log.info("starting test_remote_link_damage_repair_targeted_no_scan_frags")
+        self._run_remote_link_damage_repair_with_offline_data_scan(
+            restore_all_ancestors=True)
+
+    def test_remote_link_damage_repair_targeted_with_scan_frags(self):
+        log.info("starting test_remote_link_damage_repair_targeted_with_scan_frags")
+        self._run_remote_link_damage_repair_with_offline_data_scan(
+            restore_all_ancestors=False)
 
     def _prepare_extra_data_pool(self, set_root_layout=True):
         extra_data_pool_name = self.fs.get_data_pool_name() + '_extra'
