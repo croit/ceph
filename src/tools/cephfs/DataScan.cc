@@ -2028,6 +2028,16 @@ int DataScan::scan_links()
 	newest = q;
       }
     }
+    auto injected_it = injected_inos.find(p.first);
+    if (injected_it != injected_inos.end()) {
+      if (injected_it->second.dirino != newest.dirino ||
+          injected_it->second.name != newest.name) {
+        dout(10) << "Removing ino=" << p.first
+                 << "from injected_inos as they will be removed anyway"
+                 << dendl;
+        injected_inos.erase(injected_it);
+      }
+    }
 
     for (auto& q : p.second) {
       // in the middle of dir fragmentation?
@@ -2134,7 +2144,7 @@ int DataScan::scan_links()
       derr << "Unexpected error reading dentry "
 	<< p.second.dirfrag() << "/" << p.second.name
 	<< ": " << cpp_strerror(r) << dendl;
-      return r;
+      continue;
     }
 
     if (first != CEPH_NOSNAP) {
