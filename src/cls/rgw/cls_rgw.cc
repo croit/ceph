@@ -2415,6 +2415,24 @@ static int rgw_bucket_read_olh_log(cls_method_context_t hctx, bufferlist *in, bu
 #define MAX_OLH_LOG_ENTRIES 1000
   map<uint64_t, vector<rgw_bucket_olh_log_entry> >& log = olh_data_entry.pending_log;
 
+  // Filter before pagination so old readers cannot get stuck on an empty,
+  // truncated page of invisible STALE entries with no marker to advance.
+  if (!op.get_stales) {
+    for (auto iter = log.begin(); iter != log.end();) {
+      auto &entries = iter->second;
+      entries.erase(std::remove_if(entries.begin(), entries.end(),
+                                   [](const auto &e) {
+                                     return e.op == CLS_RGW_OLH_OP_STALE;
+                                   }),
+                    entries.end());
+      if (entries.empty()) {
+        iter = log.erase(iter);
+      } else {
+        ++iter;
+      }
+    }
+  }
+
   if (!log.empty() && log.begin()->first > op.ver_marker &&
       log.size() <= MAX_OLH_LOG_ENTRIES) {
     op_ret.log = log;
