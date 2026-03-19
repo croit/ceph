@@ -1531,7 +1531,7 @@ class TestDataScan(CephFSTestCase):
                 self.fs.data_scan(["scan_frags", "--force-corrupt"])
 
             log.info("running data_scan scan_links")
-            self.fs.data_scan(["scan_links"])
+            self.fs.data_scan(["scan_links", "--thread-count", "4"])
 
             self._restart_mds_after_data_scan()
 

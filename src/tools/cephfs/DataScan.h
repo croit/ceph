@@ -267,6 +267,7 @@ class DataScan : public MDSUtility, public MetadataTool
 
     uint32_t n;
     uint32_t m;
+    uint32_t scan_links_thread_count;
 
     /**
      * Scan data pool for backtraces, and inject inodes to metadata pool
@@ -404,11 +405,11 @@ class DataScan : public MDSUtility, public MetadataTool
 
     DataScan()
         : driver(NULL), fscid(FS_CLUSTER_ID_NONE), data_pool_id(-1), n(0), m(1),
-          force_pool(false), force_corrupt(false), force_init(false),
-          damage_type_filter_set(false), damage_type_all(false),
-          extent_period(1), extent_period_set(false), extent_limit(1),
-          extent_limit_set(false), force_create_head_inode(false),
-          force_restore_all_ancestors(false) {}
+          scan_links_thread_count(1), force_pool(false), force_corrupt(false),
+          force_init(false), damage_type_filter_set(false),
+          damage_type_all(false), extent_period(1), extent_period_set(false),
+          extent_limit(1), extent_limit_set(false),
+          force_create_head_inode(false), force_restore_all_ancestors(false) {}
 
     ~DataScan() override
     {

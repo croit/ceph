@@ -12,20 +12,26 @@
  *
  */
 
-#include "include/compat.h"
-#include "common/errno.h"
 #include "common/ceph_argparse.h"
-#include "common/strtol.h"
 #include "common/ceph_json.h"
+#include "common/errno.h"
+#include "common/strtol.h"
+#include "include/ceph_fs.h"
+#include "include/compat.h"
+#include "include/util.h"
 #include "json_spirit/json_spirit_error_position.h"
 #include "json_spirit/json_spirit_reader.h"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <condition_variable>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <mutex>
+#include <queue>
 #include <sstream>
-#include "include/util.h"
-#include "include/ceph_fs.h"
+#include <thread>
 
 #include "mds/CDentry.h"
 #include "mds/CInode.h"
@@ -46,6 +52,112 @@
 using namespace std;
 
 namespace {
+
+class DataScanThreadPool {
+public:
+  explicit DataScanThreadPool(size_t worker_count) {
+    worker_count = std::max<size_t>(worker_count, 1);
+    workers.reserve(worker_count);
+    max_queue_size = worker_count * 10;
+    for (size_t i = 0; i < worker_count; ++i) {
+      workers.emplace_back([this]() { worker_entry(); });
+    }
+  }
+
+  ~DataScanThreadPool() { shutdown(); }
+
+  bool submit(std::function<int()> task) {
+    std::unique_lock l(lock);
+    queue_has_space.wait(l, [this]() {
+      return (error < 0 || stopping || !accepting ||
+              tasks.size() < max_queue_size);
+    });
+    if (error < 0 || !accepting || stopping) {
+      return false;
+    }
+    tasks.push(std::move(task));
+    has_work.notify_one();
+    return true;
+  }
+
+  void wait_for_drain() {
+    std::unique_lock l(lock);
+    accepting = false;
+    drained.wait(l, [this]() { return tasks.empty() && running_tasks == 0; });
+    queue_has_space.notify_all();
+  }
+
+  void shutdown() {
+    {
+      std::lock_guard l(lock);
+      if (stopping) {
+        return;
+      }
+      accepting = false;
+      stopping = true;
+    }
+    queue_has_space.notify_all();
+    has_work.notify_all();
+    for (auto &worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers.clear();
+  }
+  
+  int get_error() {
+    return error.load(std::memory_order_relaxed);
+  }
+
+private:
+  void worker_entry() {
+    while (true) {
+      std::function<int()> task;
+      bool do_run = true;
+      int r = 0;
+      {
+        std::unique_lock l(lock);
+        has_work.wait(
+            l, [this]() { return stopping || !tasks.empty(); });
+        if (stopping && tasks.empty()) {
+          return;
+        }
+        task = std::move(tasks.front());
+        tasks.pop();
+        queue_has_space.notify_one();
+        ++running_tasks;
+        do_run = (error == 0);
+      }
+      if (do_run) {
+        r = task();
+      }
+
+      {
+        std::lock_guard l(lock);
+        if (r < 0 && error == 0) {
+          error = r;
+        }
+        --running_tasks;
+        if (!accepting && tasks.empty() && running_tasks == 0) {
+          drained.notify_all();
+        }
+      }
+    }
+  }
+
+  std::mutex lock;
+  std::condition_variable has_work;
+  std::condition_variable drained;
+  std::condition_variable queue_has_space;
+  std::queue<std::function<int()>> tasks;
+  std::vector<std::thread> workers;
+  size_t max_queue_size = 1;
+  bool accepting = true;
+  bool stopping = false;
+  size_t running_tasks = 0;
+  std::atomic<int> error = 0;
+};
 
 std::string trim_whitespace(const std::string &value)
 {
@@ -93,13 +205,14 @@ void DataScan::usage() {
          "[--worker_n N --worker_m M] [--damage-file PATH] "
          "[--type 'TYPE|TYPE'] [--inode-file PATH] [<data pool name>]\n"
       << "  cephfs-data-scan pg_files <path> <pg id> [<pg id>...]\n"
-      << "  cephfs-data-scan scan_links\n"
+      << "  cephfs-data-scan scan_links [--thread-count N]\n"
       << "\n"
       << "    --force-corrupt: overrite apparently corrupt structures\n"
       << "    --force-init: write root inodes even if they exist\n"
       << "    --force-pool: use data pool even if it is not in FSMap\n"
       << "    --worker_m: Maximum number of workers\n"
       << "    --worker_n: Worker number, range 0-(worker_m-1)\n"
+      << "    --thread-count: Number of scan_links worker threads\n"
       << "    --force-create-head-inode: force flushing inode 0th object in "
          "targeted scan_extents even when no extents are found\n"
       << "    --force-restore-all-ancestors: force restoring all ancestor "
@@ -145,6 +258,14 @@ bool DataScan::parse_kwarg(
     driver = new LocalFileDriver(val, data_io);
     return true;
   } else if (arg == std::string("--worker_n")) {
+    if (command == "scan_links") {
+      std::cerr << "Option '--worker_n' is invalid with scan_links; "
+                   "use '--thread-count'"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
     std::string err;
     int64_t worker_n = strict_strtoll(val.c_str(), 10, &err);
     if (!err.empty() || worker_n < 0 ||
@@ -156,6 +277,14 @@ bool DataScan::parse_kwarg(
     n = static_cast<uint32_t>(worker_n);
     return true;
   } else if (arg == std::string("--worker_m")) {
+    if (command == "scan_links") {
+      std::cerr << "Option '--worker_m' is invalid with scan_links; "
+                   "use '--thread-count'"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
     std::string err;
     int64_t worker_m = strict_strtoll(val.c_str(), 10, &err);
     if (!err.empty() || worker_m <= 0 ||
@@ -165,6 +294,24 @@ bool DataScan::parse_kwarg(
       return false;
     }
     m = static_cast<uint32_t>(worker_m);
+    return true;
+  } else if (arg == std::string("--thread-count")) {
+    if (command != "scan_links") {
+      std::cerr << "Option '--thread-count' is only valid with scan_links"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    std::string err;
+    int64_t thread_count = strict_strtoll(val.c_str(), 10, &err);
+    if (!err.empty() || thread_count <= 0 ||
+        thread_count > std::numeric_limits<uint32_t>::max()) {
+      std::cerr << "Invalid thread count '" << val << "'" << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+    scan_links_thread_count = static_cast<uint32_t>(thread_count);
     return true;
   } else if (arg == std::string("--filter-tag")) {
     filter_tag = val;
@@ -264,10 +411,8 @@ bool DataScan::parse_kwarg(
   }
 }
 
-int DataScan::parse_damage_type_expr(
-    const std::string &expr,
-    std::vector<std::string> *tokens)
-{
+int DataScan::parse_damage_type_expr(const std::string &expr,
+                                     std::vector<std::string> *tokens) {
   tokens->clear();
   std::string trimmed_expr = trim_whitespace(expr);
   if (trimmed_expr.empty()) {
@@ -1828,14 +1973,79 @@ int DataScan::scan_links()
   enum {
     SCAN_INOS = 1,
     CHECK_LINK,
+    REMOVE_DUP_DENTRIES,
+    FIX_BAD_NLINK,
+    FIX_INJECTED_DNFIRST,
   };
 
-  for (int step = SCAN_INOS; step <= CHECK_LINK; step++) {
-    const librados::NObjectIterator it_end = metadata_io.nobjects_end();
-    for (auto it = metadata_io.nobjects_begin(); it != it_end; ++it) {
-      const std::string oid = it->get_oid();
+  const size_t phase_workers = std::max<uint32_t>(1, scan_links_thread_count);
 
-      dout(10) << "step " << step << ": handling object " << oid << dendl;
+  auto run_phase = [phase_workers](auto &&schedule, bool use_strand) -> int {
+    std::unique_ptr<DataScanThreadPool> concurrent_runner =
+        std::make_unique<DataScanThreadPool>(phase_workers);
+    std::unique_ptr<DataScanThreadPool> strand_runner = nullptr;
+    if (use_strand) {
+      strand_runner = std::make_unique<DataScanThreadPool>(1);
+    }
+
+    int r = 0;
+    int schedule_r = schedule(concurrent_runner, strand_runner);
+    if (schedule_r < 0) {
+      r = schedule_r;
+    }
+
+    concurrent_runner->wait_for_drain();
+    int con_r = concurrent_runner->get_error();
+    if (r == 0 && con_r < 0) {
+      r = con_r;
+    }
+    if (use_strand)  {
+      strand_runner->wait_for_drain();
+      int str_r = strand_runner->get_error();
+      if (r == 0 && str_r < 0) {
+        r = str_r;
+      }
+    }
+    concurrent_runner->shutdown();
+    if (use_strand) {
+      strand_runner->shutdown();
+    }
+    return r;
+  };
+
+  auto scan_dirfrag_slice = [this, &used_inos, &remote_links,
+                             &dup_primaries, &bad_nlink_inos, &injected_inos,
+                             &to_remove, &snaps, &last_snap,
+                             &snaprealm_v2_since]
+                             (int step, size_t worker_id,
+                              size_t worker_count, 
+                              std::unique_ptr <DataScanThreadPool>& strand_runner) -> int {
+    librados::ObjectCursor range_i;
+    librados::ObjectCursor range_end;
+    metadata_io.object_list_slice(metadata_io.object_list_begin(),
+                                  metadata_io.object_list_end(), worker_id,
+                                  worker_count, &range_i, &range_end);
+
+    const bufferlist filter_bl;
+    bool success = true;
+    while (range_i < range_end && success) {
+      std::vector<librados::ObjectItem> result;
+      int r = metadata_io.object_list(range_i, range_end, 1, filter_bl, &result,
+                                      &range_i);
+      if (r < 0) {
+        derr << "Unexpected error listing objects: " << cpp_strerror(r)
+             << dendl;
+        return r;
+      }
+
+      for (const auto &item : result) {
+        if (!success) {
+          break;
+        }
+        const std::string &oid = item.oid;
+        // std::cout << "phase-->" << step << ", oid-->" << oid << std::endl;
+
+        dout(10) << "step " << step << ": handling object " << oid << dendl;
 
       uint64_t dir_ino = 0;
       uint64_t frag_id = 0;
@@ -1859,12 +2069,18 @@ int DataScan::scan_links()
 	derr << "Error getting omap from '" << oid << "': " << cpp_strerror(r) << dendl;
 	return r;
       }
-
+      auto strand_task = [&used_inos, &remote_links, &dup_primaries,
+                          &bad_nlink_inos, &injected_inos,
+                          &to_remove, &snaps, &last_snap,
+                          &snaprealm_v2_since, step = step,
+                          dir_ino = dir_ino, frag_id = frag_id,
+                          items = std::move(items)]() -> int {
       for (auto& p : items) {
 	auto q = p.second.cbegin();
 	string dname;
 	snapid_t last;
 	dentry_key_t::decode_helper(p.first, dname, last);
+  // std::cout << "phase-->" << step << ", dir_ino-->" << dir_ino << ", dname-->" << dname << std::endl;
 
 	if (last != CEPH_NOSNAP) {
 	  if (last > last_snap)
@@ -1985,7 +2201,54 @@ int DataScan::scan_links()
 	  return -EINVAL;
 	}
       }
+      return 0;
+    };
+    success = strand_runner->submit(strand_task);
     }
+  }
+    return 0;
+  };
+
+  // Phase 1: SCAN_INOS
+  // std::cout << "scan_inos-->" << std::endl;
+  dout(0) << "scanning inode dentries" << dendl;
+  int r = run_phase(
+      [phase_workers, &scan_dirfrag_slice](
+          std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+          std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        for (size_t worker = 0; worker < phase_workers && success; ++worker) {
+          success = concurrent_runner->submit([&, worker]() {
+            return scan_dirfrag_slice(SCAN_INOS, worker, phase_workers,
+                                      strand_runner);
+          });
+        }
+        return 0;
+      },
+      true);
+  if (r < 0) {
+    return r;
+  }
+
+  // Phase 2: CHECK_LINK
+  // std::cout << "scan_links-->" << std::endl;
+  dout(0) << "scanning link dentries" << dendl;
+  r = run_phase(
+      [phase_workers, &scan_dirfrag_slice](
+          std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+          std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        for (size_t worker = 0; worker < phase_workers && success; ++worker) {
+          success = concurrent_runner->submit([&, worker]() {
+            return scan_dirfrag_slice(CHECK_LINK, worker, phase_workers,
+                                      strand_runner);
+          });
+        }
+        return 0;
+      },
+      true);
+  if (r < 0) {
+    return r;
   }
 
   map<unsigned, uint64_t> max_ino_map;
@@ -2089,74 +2352,139 @@ int DataScan::scan_links()
     }
   }
 
-  dout(10) << "removing dup dentries from " << to_remove.size() << " objects"
+  dout(0) << "removing dup dentries from " << to_remove.size() << " objects"
 	   << dendl;
+  // std::cout << "remove_dup_dentries-->" << std::endl;
 
-  for (auto& p : to_remove) {
-    object_t frag_oid = InodeStore::get_object_name(p.first.ino, p.first.frag, "");
+  // Phase 3: REMOVE_DUP_DENTRIES
+  r = run_phase(
+      [this, &to_remove](std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+                         std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        // std::cout << "to_remove.size()-->" << to_remove.size() << std::endl;
+        for (auto it = to_remove.begin(); it != to_remove.end() && success;
+             ++it) {
 
-    dout(10) << "removing dup dentries from " << p.first << dendl;
+          auto *p = &(*it);
+          success = concurrent_runner->submit([this, p]() {
+            // std::cout << "to_remove-->" << p->first.ino << ", frag-->"
+            //           << p->first.frag << std::endl;
+            object_t frag_oid =
+                InodeStore::get_object_name(p->first.ino, p->first.frag, "");
 
-    int r = metadata_io.omap_rm_keys(frag_oid.name, p.second);
-    if (r != 0) {
-      derr << "Error removing duplicated dentries from " << p.first << dendl;
-      return r;
-    }
+            dout(10) << "removing dup dentries from " << p->first << dendl;
+
+            int phase_r = metadata_io.omap_rm_keys(frag_oid.name, p->second);
+            if (phase_r != 0) {
+              derr << "Error removing duplicated dentries from " << p->first
+                   << dendl;
+            }
+            return phase_r;
+          });
+        }
+        return 0;
+      },
+      false);
+  if (r < 0) {
+    return r;
   }
   to_remove.clear();
 
-  dout(10) << "processing " << bad_nlink_inos.size() << " bad_nlink_inos"
-	   << dendl;
+  dout(0) << "processing " << bad_nlink_inos.size() << " bad_nlink_inos"
+           << dendl;
 
-  for (auto &p : bad_nlink_inos) {
-    dout(10) << "handling bad_nlink_ino " << p.first << dendl;
+  // Phase 4: FIX_BAD_NLINK
+  // std::cout << "fix_bad_nlink-->" << std::endl;
+  r = run_phase(
+      [this, &bad_nlink_inos,
+       &metadata_driver](std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+                         std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        // std::cout << "bad_nlink_inos.size()-->" << bad_nlink_inos.size() << std::endl;
+        for (auto it = bad_nlink_inos.begin();
+             it != bad_nlink_inos.end() && success; ++it) {
 
-    InodeStore inode;
-    snapid_t first;
-    int r = read_dentry(p.second.dirino, p.second.frag, p.second.name, &inode, &first);
-    if (r < 0) {
-      derr << "Unexpected error reading dentry "
-	   << p.second.dirfrag() << "/" << p.second.name
-	   << ": " << cpp_strerror(r) << dendl;
-      return r;
-    }
+          auto *p = &(*it);
+          success = concurrent_runner->submit([this, &metadata_driver, p]() {
+            // std::cout << "bad_nlink_ino-->" << p->first << std::endl;
+            dout(10) << "handling bad_nlink_ino " << p->first << dendl;
 
-    if (inode.inode->ino != p.first || inode.inode->version != p.second.version)
-      continue;
+            InodeStore inode;
+            snapid_t first;
+            int phase_r = read_dentry(p->second.dirino, p->second.frag,
+                                      p->second.name, &inode, &first);
+            if (phase_r < 0) {
+              derr << "Unexpected error reading dentry " << p->second.dirfrag()
+                   << "/" << p->second.name << ": " << cpp_strerror(phase_r)
+                   << dendl;
+              return phase_r;
+            }
 
-    inode.get_inode()->nlink = p.second.nlink;
-    r = metadata_driver->inject_linkage(p.second.dirino, p.second.name, p.second.frag, inode, first);
-    if (r < 0)
-      return r;
+            if (inode.inode->ino != p->first ||
+                inode.inode->version != p->second.version) {
+              return 0;
+            }
+
+            inode.get_inode()->nlink = p->second.nlink;
+            return metadata_driver->inject_linkage(
+                p->second.dirino, p->second.name, p->second.frag, inode, first);
+          });
+        }
+        return 0;
+      },
+      false);
+  if (r < 0) {
+    return r;
   }
 
-  dout(10) << "processing " << injected_inos.size() << " injected_inos"
+  dout(0) << "processing " << injected_inos.size() << " injected_inos"
 	   << dendl;
 
-  for (auto &p : injected_inos) {
-    dout(10) << "handling injected_ino " << p.first << dendl;
+  // Phase 5: FIX_INJECTED_DNFIRST
+  // std::cout << "fix_injected_dnfirst" << std::endl;
+  r = run_phase(
+      [this, &injected_inos, &metadata_driver,
+       &last_snap](std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+                   std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        // std::cout << "injected_inos.size()-->" << injected_inos.size() << std::endl;
+        for (auto it = injected_inos.begin();
+             it != injected_inos.end() && success; ++it) {
+          auto *p = &(*it);
+          success = concurrent_runner->submit([this, &last_snap,
+                                               &metadata_driver, p]() {
+            // std::cout << "injected_ino-->" << p->first << std::endl;
+            dout(10) << "handling injected_ino " << p->first << dendl;
 
-    InodeStore inode;
-    snapid_t first;
-    dout(20) << " fixing linkage (dnfirst) of " << p.second.dirino << ":" << p.second.name << dendl;
-    int r = read_dentry(p.second.dirino, p.second.frag, p.second.name, &inode, &first);
-    if (r < 0) {
-      derr << "Unexpected error reading dentry "
-	<< p.second.dirfrag() << "/" << p.second.name
-	<< ": " << cpp_strerror(r) << dendl;
-      continue;
-    }
+            InodeStore inode;
+            snapid_t first;
+            dout(20) << " fixing linkage (dnfirst) of " << p->second.dirino
+                     << ":" << p->second.name << dendl;
+            int phase_r = read_dentry(p->second.dirino, p->second.frag,
+                                      p->second.name, &inode, &first);
+            if (phase_r < 0) {
+              derr << "Unexpected error reading dentry " << p->second.dirfrag()
+                   << "/" << p->second.name << ": " << cpp_strerror(phase_r)
+                   << dendl;
+              return 0;
+            }
 
-    if (first != CEPH_NOSNAP) {
-      dout(20) << " ????" << dendl;
-      continue;
-    }
+            if (first != CEPH_NOSNAP) {
+              dout(20) << " ????" << dendl;
+              return 0;
+            }
 
-    first = last_snap + 1;
-    dout(20) << " first is now " << first << dendl;
-    r = metadata_driver->inject_linkage(p.second.dirino, p.second.name, p.second.frag, inode, first);
-    if (r < 0)
-      return r;
+            first = last_snap + 1;
+            dout(20) << " first is now " << first << dendl;
+            return metadata_driver->inject_linkage(
+                p->second.dirino, p->second.name, p->second.frag, inode, first);
+          });
+        }
+        return 0;
+      },
+      false);
+  if (r < 0) {
+    return r;
   }
 
   dout(10) << "updating inotable" << dendl;
