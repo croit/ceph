@@ -7929,7 +7929,10 @@ int RGWRados::apply_olh_log(
   /* update olh object */
   r = rgw_rados_operate(dpp, ref.pool.ioctx(), ref.obj.oid, &op, null_yield);
   if (r < 0) {
-    ldpp_dout(dpp, 0) << "ERROR: could not apply olh update, r=" << r << dendl;
+    if (r != -ECANCELED) {
+      ldpp_dout(dpp, 0) << "ERROR: could not apply olh update, r=" << r
+                        << dendl;
+    }
     return r;
   }
 

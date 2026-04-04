@@ -115,6 +115,16 @@ TEST(rgw_olh, removal_after_relink_is_not_canceled) {
   EXPECT_TRUE(plan.remove);
 }
 
+TEST(rgw_olh, terminal_cleanup_is_retried_after_watermark_persisted) {
+  cls_rgw_obj_key key("obj", "version");
+  Plan plan(20, key, false);
+  ASSERT_TRUE(plan.apply(entry(20, CLS_RGW_OLH_OP_UNLINK_OLH, key)));
+  ASSERT_TRUE(plan.apply(entry(20, CLS_RGW_OLH_OP_REMOVE_INSTANCE, key)));
+  EXPECT_FALSE(plan.link);
+  EXPECT_TRUE(plan.remove);
+  EXPECT_EQ(1u, plan.remove_instances.count(key));
+}
+
 TEST(rgw_olh, empty_log_is_not_truncated) {
   Reader reader;
   Log log;

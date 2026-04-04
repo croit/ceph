@@ -72,10 +72,9 @@ public:
       }
       break;
     case CLS_RGW_OLH_OP_UNLINK_OLH:
-      if (entry.epoch > applied_epoch) {
-        link = false;
-        remove = true;
-      }
+      // OLH_VER may already be persisted while clear_olh still needs retry.
+      link = false;
+      remove = true;
       break;
     case CLS_RGW_OLH_OP_STALE:
       break;

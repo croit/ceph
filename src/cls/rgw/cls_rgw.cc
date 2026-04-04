@@ -1346,6 +1346,8 @@ static int read_olh(cls_method_context_t hctx,cls_rgw_obj_key& obj_key, rgw_buck
 static void update_olh_log(rgw_bucket_olh_entry& olh_data_entry, OLHLogOp op, const string& op_tag,
                            cls_rgw_obj_key& key, bool delete_marker, uint64_t epoch)
 {
+  CLS_LOG(20, "%s: op=%d op_tag=%s key=%s epoch=%" PRIu64, __func__, op,
+          op_tag.c_str(), key.to_string().c_str(), epoch);
   vector<rgw_bucket_olh_log_entry> &log = olh_data_entry.pending_log[epoch];
   rgw_bucket_olh_log_entry log_entry;
   log_entry.epoch = epoch;
@@ -1927,6 +1929,9 @@ static int rgw_bucket_link_olh(cls_method_context_t hctx, bufferlist *in, buffer
     return -EINVAL;
   }
 
+  CLS_LOG(20, "%s: op_tag=%s key=%s olh_epoch=%" PRIu64, __func__,
+          op.op_tag.c_str(), op.key.to_string().c_str(), op.olh_epoch);
+
   int ret = normalize_legacy_list_index_keys(hctx, op.key.name);
   if (ret < 0) {
     return ret;
@@ -1984,6 +1989,46 @@ static int rgw_bucket_link_olh(cls_method_context_t hctx, bufferlist *in, buffer
       unmod.tv_nsec = 0;
     }
     if (mtime >= unmod) {
+      if (!olh_found) {
+        // The data-side OLH may have just been created for a plain/null
+        // object. Initialize it to the existing data, not the skipped op.
+        rgw_bucket_dir_entry &entry = obj.get_dir_entry();
+        cls_rgw_obj_key current_key = entry.key;
+        const bool current = entry.is_current();
+        const bool delete_marker = entry.is_delete_marker();
+        const uint64_t versioned_epoch =
+            entry.versioned_epoch ? entry.versioned_epoch
+                                  : entry.meta.mtime.time_since_epoch().count();
+        if (current_key.instance.empty() &&
+            !(entry.flags & rgw_bucket_dir_entry::FLAG_VER)) {
+          uint64_t converted_epoch = versioned_epoch;
+          ret = convert_plain_entry_to_versioned(hctx, current_key, !current,
+                                                 false, converted_epoch);
+          if (ret < 0) {
+            return ret;
+          }
+          // The conversion wrote a list entry at this epoch. Replace it
+          // with explicit current flags, preserving the original metadata.
+          obj.set_epoch(converted_epoch);
+        }
+        ret = obj.write(versioned_epoch, current);
+        if (ret < 0) {
+          return ret;
+        }
+        olh.update(current_key, delete_marker);
+        olh.set_tag(op.olh_tag);
+        olh.set_epoch(versioned_epoch);
+        olh.set_exists(true);
+        olh.set_pending_removal(false);
+        olh.update_log(CLS_RGW_OLH_OP_LINK_OLH, op.op_tag, current_key,
+                       delete_marker, log_epoch);
+      }
+      olh.update_log(CLS_RGW_OLH_OP_STALE, op.op_tag, op.key, false, log_epoch);
+      ret = olh.write();
+      if (ret < 0) {
+        CLS_LOG(0, "ERROR: failed to update olh ret=%d", ret);
+        return ret;
+      }
       return 0; /* no need to set error, we just return 0 and avoid
                  * writing to the bi log */
     }
@@ -2203,6 +2248,9 @@ static int rgw_bucket_unlink_instance(cls_method_context_t hctx, bufferlist *in,
     return -EINVAL;
   }
 
+  CLS_LOG(20, "%s: op_tag=%s key=%s olh_epoch=%" PRIu64, __func__,
+          op.op_tag.c_str(), op.key.to_string().c_str(), op.olh_epoch);
+
   cls_rgw_obj_key dest_key = op.key;
   if (dest_key.instance == "null") {
     dest_key.instance.clear();
@@ -2315,7 +2363,7 @@ static int rgw_bucket_unlink_instance(cls_method_context_t hctx, bufferlist *in,
       olh.update_log(CLS_RGW_OLH_OP_REMOVE_INSTANCE, op.op_tag, op.key, false,
                      log_epoch);
     } else {
-      olh.update_log(CLS_RGW_OLH_OP_STALE, op.op_tag, op.key, false, log_epoch);
+      olh.update_log(CLS_RGW_OLH_OP_STALE, op.op_tag, op.key, true, log_epoch);
 
       /* this is a delete marker, it's our responsibility to remove its
        * instance entry */
@@ -2336,7 +2384,7 @@ static int rgw_bucket_unlink_instance(cls_method_context_t hctx, bufferlist *in,
     }
 
     if (obj.is_delete_marker()) {
-      olh.update_log(CLS_RGW_OLH_OP_STALE, op.op_tag, op.key, false, log_epoch);
+      olh.update_log(CLS_RGW_OLH_OP_STALE, op.op_tag, op.key, true, log_epoch);
       return olh.write();
     }
 
