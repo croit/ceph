@@ -2146,6 +2146,13 @@ int ceph_ll_setlk(struct ceph_mount_info *cmount,
 
 int ceph_ll_lazyio(struct ceph_mount_info *cmount, Fh *fh, int enable);
 
+int ceph_ll_open_snapdiff(
+    struct ceph_mount_info* cmount,
+    Inode* in1,
+    Inode* in2,
+    struct ceph_snapdiff_info* out,
+    const UserPerm* perms);
+
 /*
  * Delegation support
  *
