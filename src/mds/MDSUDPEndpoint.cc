@@ -15,7 +15,7 @@ void MDSUDPConnection::encode(ceph::buffer::list &bl) const {
 
 void MDSUDPConnection::dump(ceph::Formatter *f) const {
   f->dump_string("ip", ip);
-  f->dump_bool("port", port);
+  f->dump_int("port", port);
 }
 
 void MDSUDPConnection::generate_test_instances(
@@ -253,4 +253,19 @@ int MDSUDPEndpoint::publish_internal(boost::asio::const_buffer &buf,
                    << dendl;
   }
   return 0;
+}
+
+void MDSUDPEndpoint::dump(ceph::Formatter *f) const {
+  f->open_object_section("");
+  f->dump_string("endpoint_name", name);
+  connection.dump(f);
+  f->close_section();
+}
+
+void MDSUDPManager::dump(ceph::Formatter *f) const {
+  f->open_array_section("udp_endpoints");
+  for (const auto& [_, endpoint]: endpoints) {
+    endpoint->dump(f);
+  }
+  f->close_section();
 }

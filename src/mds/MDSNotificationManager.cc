@@ -316,3 +316,16 @@ void MDSNotificationManager::push_notification_snap(int32_t whoami, CInode *in,
   }
 #endif
 }
+
+void MDSNotificationManager::dump(ceph::Formatter *f) const {
+#ifdef WITH_CEPHFS_NOTIFICATION
+  f->open_object_section("");
+  if (kafka_manager) {
+    kafka_manager->dump(f);
+  }
+  if (udp_manager) {
+    udp_manager->dump(f);
+  }
+  f->close_section();
+#endif
+}

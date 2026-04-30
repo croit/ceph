@@ -48,6 +48,7 @@ public:
                    const std::string &endpoint_name, bool write_into_disk);
   int send(const std::shared_ptr<MDSNotificationMessage> &message);
   bool is_active() { return !paused.load(std::memory_order_relaxed); }
+  void dump(ceph::Formatter *f) const;
   CephContext *cct;
 
 private:
@@ -112,6 +113,7 @@ public:
                  const std::shared_ptr<MDSKafkaTopic> &topic);
   int remove_topic(const std::string &topic_name, bool &is_empty);
   static void kafka_producer_deleter(rd_kafka_t *producer_ptr);
+  void dump(ceph::Formatter *f) const;
   friend class MDSKafkaManager;
   friend class MDSKafkaTopic;
 
