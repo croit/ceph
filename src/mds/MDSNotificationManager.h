@@ -50,6 +50,7 @@ public:
   void push_notification_snap(int32_t whoami, CInode *in,
                               const std::string &snapname, uint64_t notify_mask,
                               bool is_dir, const client_t &client);
+  void dump(ceph::Formatter *f) const;
 
 private:
 #ifdef WITH_CEPHFS_NOTIFICATION

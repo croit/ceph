@@ -3024,11 +3024,13 @@ void MDSRankDispatcher::handle_asok_command(
     cmd_getval(cmdmap, "ip", ip);
     cmd_getval(cmdmap, "port", port);
     r = notification_manager->add_udp_endpoint(name, ip, (int)port, true, true);
-  }
-  else if (command == "remove_udp_endpoint") {
+  } else if (command == "remove_udp_endpoint") {
     std::string name;
     cmd_getval(cmdmap, "entity", name);
     r = notification_manager->remove_udp_endpoint(name, true, true);
+  } else if (command == "dump notification_endpoints") {
+    std::lock_guard l(mds_lock);
+    notification_manager->dump(f);
   } else {
     r = -CEPHFS_ENOSYS;
   }

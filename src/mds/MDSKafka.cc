@@ -749,3 +749,23 @@ void MDSKafka::message_callback(rd_kafka_t *rk,
   kafka_ptr->acknowledge_event(*tag);
   delete tag;
 }
+
+void MDSKafka::dump(ceph::Formatter *f) const {
+  f->open_object_section("");
+  f->dump_string("endpoint_name", endpoint_name);
+  connection.dump(f);
+  f->open_array_section("topics");
+  for (auto& [topic_name, _]: topics) {
+    f->dump_string("topic", topic_name);
+  }
+  f->close_section();
+  f->close_section();
+}
+
+void MDSKafkaManager::dump(ceph::Formatter *f) const {
+  f->open_array_section("kafka_endpoints");
+  for (auto &[_, endpoint]: candidate_endpoints) {
+    endpoint->dump(f);
+  }
+  f->close_section();
+}

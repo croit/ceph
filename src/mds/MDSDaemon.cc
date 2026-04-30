@@ -518,7 +518,11 @@ void MDSDaemon::set_up_admin_socket()
     "remove UDP endpoint"
   );
   ceph_assert(r == 0);
-  #endif
+  r = admin_socket->register_command(
+      "dump notification_endpoints", asok_hook,
+      "List of all type of notification endpoints");
+  ceph_assert(r == 0);
+#endif
 }
 
 void MDSDaemon::clean_up_admin_socket()
