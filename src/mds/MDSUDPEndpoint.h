@@ -27,6 +27,7 @@ public:
                    bool write_into_disk);
   int remove_endpoint(const std::string &name, bool write_into_disk);
   bool is_active() { return !paused.load(std::memory_order_relaxed); }
+  void dump(ceph::Formatter *f) const;
 
 private:
   int load_data(std::map<std::string, bufferlist> &mp);
@@ -55,6 +56,7 @@ public:
   static std::shared_ptr<MDSUDPEndpoint>
   create(CephContext *cct, const std::string &name,
          const MDSUDPConnection &connection);
+  void dump(ceph::Formatter *f) const;
   friend class MDSUDPManager;
 
 private:
