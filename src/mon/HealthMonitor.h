@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -26,7 +27,14 @@ class HealthMonitor : public PaxosService
   std::map<int,health_check_map_t> quorum_checks;  // for each quorum member
   health_check_map_t leader_checks;           // leader only
   std::map<std::string,health_mute_t> mutes;
-
+  // location level netsplit pairs to elasped time
+  std::map<std::pair<std::string, std::string>, ceph::coarse_mono_clock::time_point> pending_location_netsplits;
+  // individual level netsplit pairs to elasped time
+  std::map<std::pair<std::string, std::string>, ceph::coarse_mono_clock::time_point> pending_mon_netsplits;
+  // currently active location netsplits with their elapsed time
+  std::map<std::pair<std::string, std::string>, ceph::coarse_mono_clock::time_point> current_location_netsplits;
+  // currently active monitor netsplits with their elapsed time
+  std::map<std::pair<std::string, std::string>, ceph::coarse_mono_clock::time_point> current_mon_netsplits;
   std::map<std::string,health_mute_t> pending_mutes;
 
 public:

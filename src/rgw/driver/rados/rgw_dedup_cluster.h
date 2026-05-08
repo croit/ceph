@@ -1,5 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2;
-// vim: ts=8 sw=2 smarttab
+// vim: ts=8 sw=2 sts=2 expandtab
 /*
  * Ceph - scalable distributed file system
  *
@@ -92,6 +92,10 @@ namespace rgw::dedup {
                             uint64_t notify_id,
                             uint64_t cookie,
                             int status);
+    static int   dedup_control_bl(rgw::sal::RadosStore *store,
+                                  const DoutPrefixProvider *dpp,
+                                  urgent_msg_t urgent_msg,
+                                  bufferlist urgent_msg_bl);
     static int   dedup_control(rgw::sal::RadosStore *store,
                                const DoutPrefixProvider *dpp,
                                urgent_msg_t urgent_msg);

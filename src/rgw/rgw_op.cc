@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include <errno.h>
 #include <optional>
@@ -33,14 +33,13 @@
 #include "common/split.h"
 #include "rgw_tracer.h"
 
-#include "rgw_rados.h"
 #include "rgw_zone.h"
 #include "rgw_op.h"
 #include "rgw_rest.h"
 #include "rgw_acl.h"
 #include "rgw_acl_s3.h"
 #include "rgw_acl_swift.h"
-#include "rgw_user.h"
+#include "driver/rados/rgw_user.h"
 #include "rgw_bucket.h"
 #include "rgw_log.h"
 #include "rgw_multi.h"
@@ -54,14 +53,14 @@
 #include "rgw_compression.h"
 #include "rgw_role.h"
 #include "rgw_tag_s3.h"
-#include "rgw_putobj_processor.h"
 #include "rgw_crypt.h"
 #include "rgw_perf_counters.h"
 #include "rgw_process_env.h"
-#include "rgw_notify.h"
 #include "rgw_notify_event_type.h"
 #include "rgw_sal.h"
+#ifdef WITH_RADOSGW_RADOS
 #include "rgw_sal_rados.h"
+#endif
 #include "rgw_torrent.h"
 #include "rgw_cksum_pipe.h"
 #include "rgw_lua_data_filter.h"
@@ -5753,6 +5752,9 @@ bool RGWCopyObj::parse_copy_location(const std::string_view& url_src,
     params_str = url_src.substr(pos + 1);
   }
 
+  if (name_str.empty()) {
+    return false;
+  }
   if (name_str[0] == '/') // trim leading slash
     name_str.remove_prefix(1);
 

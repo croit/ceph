@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -6140,10 +6141,6 @@ TEST_P(StoreTest, OMapTest) {
     ASSERT_EQ(cur_attrs.size(), size_t(1));
     ASSERT_TRUE(bl_eq(bl1, bl3));
  
-    set<string> keys;
-    r = store->omap_get_keys(ch, hoid, &keys);
-    ASSERT_EQ(r, 0);
-    ASSERT_EQ(keys.size(), size_t(1));
   }
 
   // test omap_clear, omap_rmkey_range

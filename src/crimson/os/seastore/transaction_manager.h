@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #pragma once
 
@@ -76,11 +76,13 @@ public:
     shard_stats_t& shard_stats);
 
   /// Writes initial metadata to disk
-  using mkfs_ertr = base_ertr;
+  using mkfs_ertr = base_ertr::extend<
+    crimson::ct_error::enospc>;
   mkfs_ertr::future<> mkfs();
 
   /// Reads initial metadata from disk
-  using mount_ertr = base_ertr;
+  using mount_ertr = base_ertr::extend<
+    crimson::ct_error::enospc>;
   mount_ertr::future<> mount();
 
   /// Closes transaction_manager

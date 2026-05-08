@@ -172,6 +172,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-mismatched-tags>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unused-private-field>)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-address-of-packed-member>)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-Wno-unknown-warning-option>)
   add_compile_options(
     -Wno-unused-function
     -Wno-unused-local-typedef
@@ -196,6 +197,10 @@ endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
 
 if(WITH_CEPH_DEBUG_MUTEX)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DCEPH_DEBUG_MUTEX>)
+endif()
+
+if(WITH_CPUTRACE)
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DWITH_CPUTRACE>)
 endif()
 
 include(CheckCCompilerFlag)
@@ -527,6 +532,7 @@ set(libcommon_files
   osdc/Striper.cc
   osdc/Objecter.cc
   osdc/error_code.cc
+  osdc/SplitOp.cc
   librbd/Features.cc
   librbd/io/IoOperations.cc
   ${mds_files})
@@ -1133,8 +1139,8 @@ endif(WITH_KVS)
 if(WITH_RADOSGW)
   if(WITH_RADOSGW_SELECT_PARQUET OR WITH_RADOSGW_ARROW_FLIGHT)
     if(WITH_SYSTEM_ARROW)
-      find_package(Arrow 4 REQUIRED QUIET)
-      find_package(Parquet 4 REQUIRED QUIET)
+      find_package(Arrow 9 REQUIRED QUIET)
+      find_package(Parquet 9 REQUIRED QUIET)
     else()
       # find arrow's dependencies
       if (WITH_SYSTEM_UTF8PROC)

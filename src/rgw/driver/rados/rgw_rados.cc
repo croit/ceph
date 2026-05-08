@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #include "include/compat.h"
 #include <errno.h>
@@ -58,6 +58,7 @@
 #include "rgw_worker.h"
 #include "rgw_notify.h"
 #include "rgw_http_errors.h"
+#include "rgw_multipart_meta_filter.h"
 
 #undef fork // fails to compile RGWPeriod::fork() below
 
@@ -5472,6 +5473,7 @@ int RGWRados::restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
                              RGWObjTier& tier_config,
                              std::optional<uint64_t> days,
 			     bool& in_progress,
+			     uint64_t& size,
                              const DoutPrefixProvider *dpp,
                              optional_yield y) {
 
@@ -5693,7 +5695,9 @@ int RGWRados::restore_obj_from_cloud(RGWLCCloudTierCtx& tier_ctx,
     return ret;
   }
 
-  return ret; 
+  // set size to be used to send bucket notification
+  size = accounted_size;
+  return 0;
 }
 
 int RGWRados::check_bucket_empty(const DoutPrefixProvider *dpp, RGWBucketInfo& bucket_info, optional_yield y)
@@ -11206,8 +11210,11 @@ int RGWRados::remove_objs_from_index(const DoutPrefixProvider *dpp,
   std::map<int, std::set<std::string>> sharded_removals;
   for (const auto& entry_key : entry_key_list) {
     const rgw_obj_key obj_key(entry_key);
-    const uint32_t shard =
-      RGWSI_BucketIndex_RADOS::bucket_shard_index(obj_key, num_shards);
+    const uint32_t shard = [&obj_key, num_shards]() -> uint32_t {
+      int32_t temp = RGWSI_BucketIndex_RADOS::bucket_shard_index(obj_key, num_shards);
+      return (-1 == temp) ? 0 : (uint32_t) temp;
+    }();
+
 
     // entry_key already combines namespace and name, so we first have
     // to break that apart before we can then combine with instance
@@ -11598,7 +11605,10 @@ librados::Rados* RGWRados::get_rados_handle()
   return &rados;
 }
 
-int RGWRados::delete_raw_obj_aio(const DoutPrefixProvider *dpp, const rgw_raw_obj& obj, list<librados::AioCompletion *>& handles)
+int RGWRados::delete_tail_obj_aio(const DoutPrefixProvider *dpp,
+                                  const rgw_raw_obj& obj,
+                                  const std::string& tag,
+                                  list<librados::AioCompletion *>& handles)
 {
   rgw_rados_ref ref;
   int ret = get_raw_obj_ref(dpp, obj, &ref);
@@ -11608,8 +11618,7 @@ int RGWRados::delete_raw_obj_aio(const DoutPrefixProvider *dpp, const rgw_raw_ob
   }
 
   ObjectWriteOperation op;
-  list<string> prefixes;
-  cls_rgw_remove_obj(op, prefixes);
+  cls_refcount_put(op, tag, true);
 
   AioCompletion *c = librados::Rados::aio_create_completion(nullptr, nullptr);
   ret = ref.ioctx.aio_operate(ref.obj.oid, c, &op);

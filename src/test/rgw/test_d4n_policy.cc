@@ -70,7 +70,7 @@ class LFUDAPolicyFixture : public ::testing::Test {
       };
 
       conn = std::make_shared<connection>(net::make_strand(io));
-      rgw::cache::Partition partition_info{ .location = "RedisCache", .size = 1000 };
+      rgw::cache::Partition partition_info{ .location = "RedisCache", .reserve_size = 1073741824 };
       cacheDriver = new rgw::cache::RedisDriver{io, partition_info};
       policyDriver = new rgw::d4n::PolicyDriver(conn, cacheDriver, "lfuda", null_yield);
       dir = new rgw::d4n::BlockDirectory{conn};
@@ -212,7 +212,7 @@ TEST_F(LFUDAPolicyFixture, RemoteGetBlockYield)
 	.bucketName = "testBucket",
 	.creationTime = "",
 	.dirty = false,
-	.hostsList = { env->redisHost }
+	.hostsList = { env->cct->_conf->rgw_d4n_local_rgw_address }
       },
       .blockID = 0,
       .version = "version",
@@ -335,8 +335,8 @@ TEST_F(LFUDAPolicyFixture, RedisSyncTest)
     req.push("HGET", "lfuda", "minLocalWeights_sum");
     req.push("HGET", "lfuda", "minLocalWeights_size");
     req.push("HGET", "lfuda", "minLocalWeights_address");
-    req.push("HGET", "127.0.0.1:6379", "avgLocalWeight_sum");
-    req.push("HGET", "127.0.0.1:6379", "avgLocalWeight_size");
+    req.push("HGET", "127.0.0.1:8000", "avgLocalWeight_sum");
+    req.push("HGET", "127.0.0.1:8000", "avgLocalWeight_size");
     req.push("FLUSHALL");
 
     response<std::string, std::string, std::string,
@@ -349,7 +349,7 @@ TEST_F(LFUDAPolicyFixture, RedisSyncTest)
     EXPECT_EQ(std::get<0>(resp).value(), "1");
     EXPECT_EQ(std::get<1>(resp).value(), "0");
     EXPECT_EQ(std::get<2>(resp).value(), "0");
-    EXPECT_EQ(std::get<3>(resp).value(), "127.0.0.1:6379");
+    EXPECT_EQ(std::get<3>(resp).value(), "127.0.0.1:8000");
     EXPECT_EQ(std::get<4>(resp).value(), "0");
     EXPECT_EQ(std::get<4>(resp).value(), "0");
     conn->cancel();

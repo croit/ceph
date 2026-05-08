@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=2 sw=2 expandtab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=2 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -1035,6 +1035,7 @@ int DaosObject::restore_obj_from_cloud(Bucket* bucket,
           uint64_t olh_epoch,
           std::optional<uint64_t> days,
 	  bool& in_progress,
+	  uint64_t& size,
           const DoutPrefixProvider* dpp, 
           optional_yield y)
 {

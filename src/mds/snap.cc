@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*- 
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -194,6 +195,7 @@ void sr_t::dump(Formatter *f) const
   f->dump_unsigned("last_destroyed", last_destroyed);
   f->dump_stream("last_modified") << last_modified;
   f->dump_unsigned("change_attr", change_attr);
+  f->dump_unsigned("is_snapdir_visible", is_snapdir_visible());
   f->dump_unsigned("current_parent_since", current_parent_since);
 
   f->open_array_section("snaps");
@@ -245,5 +247,13 @@ std::list<sr_t> sr_t::generate_test_instances()
   ls.back().last_modified = utime_t(9, 10);
   ls.back().change_attr++;
   return ls;
+}
+
+void sr_t::print(std::ostream& out) const {
+  out << "sr_t(seq=" << seq
+      << " created=" << created
+      << " last_created=" << last_created
+      << " last_destroyed=" << last_destroyed
+      << " flags=" << flags << ")";
 }
 

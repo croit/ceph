@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -692,7 +693,7 @@ void MDSRank::set_mdsmap_multimds_snaps_allowed()
   dout(0) << __func__ << ": sending mon command: " << cmd[0] << dendl;
 
   C_MDS_MonCommand *fin = new C_MDS_MonCommand(this, cmd[0]);
-  monc->start_mon_command(cmd, {}, nullptr, &fin->outs, new C_IO_Wrapper(this, fin));
+  monc->start_mon_command(std::move(cmd), {}, nullptr, &fin->outs, new C_IO_Wrapper(this, fin));
 
   already_sent = true;
 }
@@ -749,7 +750,8 @@ void MDSRankDispatcher::tick()
 	set_mdsmap_multimds_snaps_allowed();
       }
     }
-
+  }
+  if (is_active() || is_standby_replay()) {
     if (whoami == 0) {
       scrubstack->advance_scrub_status();
       scrubstack->purge_old_scrub_counters();
@@ -2873,7 +2875,7 @@ void MDSRankDispatcher::handle_asok_command(
     r = config_client(client_id, !got_value, option, value, *css);
   } else if (command == "scrub start" ||
 	     command == "scrub_start") {
-    if (!is_active()) {
+    if (!is_active() && ! is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -2904,7 +2906,7 @@ void MDSRankDispatcher::handle_asok_command(
 	}));
     return;
   } else if (command == "scrub abort") {
-    if (!is_active()) {
+    if (!is_active() && !is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -2924,7 +2926,7 @@ void MDSRankDispatcher::handle_asok_command(
         }));
     return;
   } else if (command == "scrub pause") {
-    if (!is_active()) {
+    if (!is_active() && !is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -2944,7 +2946,7 @@ void MDSRankDispatcher::handle_asok_command(
         }));
     return;
   } else if (command == "scrub resume") {
-    if (!is_active()) {
+    if (!is_active() && !is_standby_replay()) {
       *css << "MDS is not active";
       r = -EINVAL;
       goto out;
@@ -3988,7 +3990,7 @@ bool MDSRank::evict_client(int64_t session_id,
     }
   };
 
-  auto apply_blocklist = [this, cmd](std::function<void ()> fn){
+  auto apply_blocklist = [this, &cmd](std::function<void ()> fn){
     ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
 
     Context *on_blocklist_done = new LambdaContext([this, fn](int r) {
@@ -4008,7 +4010,7 @@ bool MDSRank::evict_client(int64_t session_id,
     });
 
     dout(4) << "Sending mon blocklist command: " << cmd[0] << dendl;
-    monc->start_mon_command(cmd, {}, nullptr, nullptr, on_blocklist_done);
+    monc->start_mon_command(std::move(cmd), {}, nullptr, nullptr, on_blocklist_done);
   };
 
   if (wait) {

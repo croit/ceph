@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -620,9 +620,9 @@ void rgw::AppMain::shutdown(std::function<void(void)> finalize_async_signals)
   rgw_pauser.reset();
   fe_pauser.reset();
   realm_watcher.reset();
-  pusher.reset();
   reloader.reset();
 #ifdef WITH_RADOSGW_RADOS
+  pusher.reset();
   if (env.driver->get_name() == "rados") {
     if (g_conf().get_val<bool>("rgw_lua_enable"))
       static_cast<rgw::sal::RadosLuaManager*>(env.lua.manager.get())->

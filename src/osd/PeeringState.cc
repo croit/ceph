@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
 
 #include "PeeringState.h"
 #include "PGPeeringEvent.h"
@@ -455,8 +455,6 @@ bool PeeringState::proc_replica_notify(const pg_shard_t &from, const pg_notify_t
   psdout(10) << " got osd." << from << " " << oinfo << dendl;
   ceph_assert(is_primary());
   peer_info[from] = oinfo;
-  stats_last_update[from] = oinfo.last_update;
-
   update_peer_info(from, oinfo);
   might_have_unfound.insert(from);
 
@@ -1039,7 +1037,6 @@ void PeeringState::clear_primary_state()
   peer_bytes.clear();
   peer_missing.clear();
   peer_last_complete_ondisk.clear();
-  stats_last_update.clear();
   peer_activated.clear();
   min_last_complete_ondisk = eversion_t();
   pg_trim_to = eversion_t();
@@ -1549,17 +1546,21 @@ bool PeeringState::needs_backfill() const
 }
 
 /**
-* Returns whether a particular object can be safely read on this replica
+* Returns whether a particular object can be safely read
 */
-bool PeeringState::can_serve_replica_read(const hobject_t &hoid)
+bool PeeringState::can_serve_read(const hobject_t &hoid)
 {
   ceph_assert(!is_primary());
+  std::string_view storage_object = "replica";
+  if (pool.info.is_erasure()) {
+    storage_object = "shard";
+  }
   if (!pg_log.get_log().has_write_since(
       hoid, pg_committed_to)) {
-    psdout(20) << "can be safely read on this replica" << dendl;
+    psdout(20) << "can be safely read on this " << storage_object << dendl;
     return true;
   } else {
-    psdout(20) << "can't read object on this replica" << dendl;
+    psdout(20) << "can't read object on this " << storage_object << dendl;
     return false;
   }
 }
@@ -3362,9 +3363,6 @@ void PeeringState::proc_master_log(
   psdout(10) << "proc_master_log for osd." << from << ": "
 	     << olog << " " << omissing << dendl;
   ceph_assert(!is_peered() && is_primary());
-  stats_last_update[pg_whoami] = info.last_update;
-  psdout(20) << " recording last stats update on " << pg_whoami << ": "
-           << info.last_update << dendl;
 
   if (info.partial_writes_last_complete.contains(from.shard)) {
     apply_pwlc(info.partial_writes_last_complete[from.shard], from, oinfo,
@@ -3472,9 +3470,9 @@ void PeeringState::proc_master_log(
       invalidate_stats = true;
       eversion_t previous_version;
       if (p == pg_log.get_log().log.begin()) {
-	      previous_version = pg_log.get_tail();
+	previous_version = pg_log.get_tail();
       } else {
-	      previous_version = std::prev(p)->version;
+	previous_version = std::prev(p)->version;
       }
       rollbacker.get()->partial_write(&info, previous_version, *p);
       olog.head = p->version;
@@ -3487,42 +3485,8 @@ void PeeringState::proc_master_log(
   // make any adjustments to their missing map; we are taking their
   // log to be authoritative (i.e., their entries are by definitely
   // non-divergent).
-
-  // Find the version we want to roll forwards to
-  // Iterate over all shards and see if any have a last_update equal to where we want to roll to
-  // Copy the stats for this shard into oinfo
-  // Set invalidate_stats to folse again if we do copy these stats
-  // Verify that this reintroduces the bug (Which is intended for stage 2)
-
-  if (invalidate_stats)
-  {
-    for (const auto& [shard, my_info] : peer_info)
-    {
-      if (invalidate_stats && stats_last_update[shard] == olog.head)
-      {
-        oinfo.stats = my_info.stats;
-        invalidate_stats = false;
-        psdout(10) << "keeping stats for " << shard
-                   << " (wanted last update: " << olog.head
-                   << ", stats last update: " << stats_last_update[shard]
-                   << ", shard last update: " << my_info.last_update << ")."
-                   << dendl;
-      } else {
-        psdout(20) << "not using stats for " << shard
-                   << " (wanted last update: " << olog.head
-                   << ", stats last update: " << stats_last_update[shard]
-                   << ", shard last update: " << my_info.last_update << ")."
-                   << dendl;
-      }
-    }
-  }
-
   merge_log(t, oinfo, std::move(olog), from);
   info.stats.stats_invalid |= invalidate_stats;
-  if (info.stats.stats_invalid)
-  {
-    psdout(10) << "invalidating stats for " << pg_whoami << dendl;
-  }
   peer_info[from] = oinfo;
   psdout(10) << " peer osd." << from << " now " << oinfo
 	     << " " << omissing << dendl;
@@ -3543,7 +3507,7 @@ void PeeringState::proc_master_log(
   }
   update_history(oinfo.history);
   ceph_assert(cct->_conf->osd_find_best_info_ignore_history_les ||
-    info.last_epoch_started >= info.history.last_epoch_started);
+	 info.last_epoch_started >= info.history.last_epoch_started);
 
   peer_missing[from].claim(std::move(omissing));
 }

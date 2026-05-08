@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 #pragma once
 
@@ -19,6 +19,7 @@
 #include "rgw_common.h"
 #include "cls/rgw/cls_rgw_types.h"
 #include "rgw_sal.h"
+#include "rgw_notify.h"
 
 #include <atomic>
 #include <tuple>
@@ -150,6 +151,20 @@ public:
 			     std::optional<uint64_t> days,
 			     const DoutPrefixProvider* dpp,
 			     optional_yield y);
+
+  /**
+   * Send notification incase of restore events
+   */
+
+  void send_notification(const DoutPrefixProvider* dpp,
+                              rgw::sal::Driver* driver,
+                              rgw::sal::Object* obj,
+                              rgw::sal::Bucket* bucket,
+                              const std::string& etag,
+                              uint64_t size,
+                              const std::string& version_id,
+                              const rgw::notify::EventTypeList& event_types,
+                              optional_yield y);
 };
 
 } // namespace rgw::restore

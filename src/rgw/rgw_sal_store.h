@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -373,6 +373,7 @@ class StoreObject : public Object {
 			   CephContext* cct,
 		           std::optional<uint64_t> days,
 			   bool& in_progress,
+			   uint64_t& size,
 			   const DoutPrefixProvider* dpp,
 			   optional_yield y) override {
       return -1;

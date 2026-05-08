@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -7835,6 +7836,17 @@ int OSDMonitor::prepare_pool_stripe_width(const unsigned pool_type,
 	break;
       uint32_t data_chunks = erasure_code->get_data_chunk_count();
       uint32_t stripe_unit = g_conf().get_val<Option::size_t>("osd_pool_erasure_code_stripe_unit");
+
+      if (stripe_unit == 0) {
+        if (((erasure_code->get_supported_optimizations() & 
+              ErasureCodeInterface::FLAG_EC_PLUGIN_OPTIMIZED_SUPPORTED) != 0) &&
+            (cct->_conf.get_val<bool>("osd_pool_default_flag_ec_optimizations"))) {
+            stripe_unit = 16 * 1024;
+        } else {
+          stripe_unit = 4 * 1024;
+        }
+      } 
+    
       auto it = profile.find("stripe_unit");
       if (it != profile.end()) {
 	string err_str;
@@ -8345,6 +8357,8 @@ int OSDMonitor::prepare_new_pool(string& name,
     enable_pool_ec_optimizations(*pi, nullptr, true);
   }
 
+  enable_pool_ec_direct_reads(*pi);
+
   pending_inc.new_pool_names[pool] = name;
   return 0;
 }
@@ -8437,6 +8451,29 @@ int OSDMonitor::enable_pool_ec_optimizations(pg_pool_t &p,
     }
   }
   return 0;
+}
+
+void OSDMonitor::enable_pool_ec_direct_reads(pg_pool_t &p) {
+  if (p.is_erasure()) {
+    ErasureCodeInterfaceRef erasure_code;
+    stringstream tmp;
+    int err = get_erasure_code(p.erasure_code_profile, &erasure_code, &tmp);
+
+    // Once this feature is finished, we will replace this with upgrade code.
+    // The upgrade code will enable the split read flag once all OSDs are at
+    // Umbrella. For now, if the plugin does not support direct reads, we just
+    // disable it.  All plugins and techniques should be capable of supporting
+    // direct reads, but we put in place this capability to reduce the test
+    // matrix for less important plugins/techniques.
+    //
+    // To enable direct reads in development, set the osd_pool_default_flags to
+    // 1<<20 = 0x100000 = 1048576
+    if (err != 0 || !p.allows_ecoptimizations() ||
+          (erasure_code->get_supported_optimizations() &
+            ErasureCodeInterface::FLAG_EC_PLUGIN_DIRECT_READS) == 0) {
+      p.flags &= ~pg_pool_t::FLAG_CLIENT_SPLIT_READS;
+    }
+  }
 }
 
 int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
@@ -12572,6 +12609,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	goto reply_no_propose;
       }
     }
+    // Optimized EC does not cope with pg temp with a mismatched size.
+    pending_inc.new_pg_temp[pgid].resize(osdmap.get_pg_size(pgid), CRUSH_ITEM_NONE);
     goto update;
   } else if (prefix == "osd pg-upmap" ||
              prefix == "osd rm-pg-upmap" ||

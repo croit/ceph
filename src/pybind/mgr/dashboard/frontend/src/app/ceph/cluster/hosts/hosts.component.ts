@@ -97,7 +97,7 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   isExecuting = false;
   errorMessage: string;
   enableMaintenanceBtn: boolean;
-  enableDrainBtn: boolean;
+  draining: boolean = false;
   bsModalRef: NgbModalRef;
 
   icons = Icons;
@@ -133,6 +133,9 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   ) {
     super();
     this.permissions = this.authStorageService.getPermissions();
+  }
+
+  ngOnInit() {
     this.expandClusterActions = [
       {
         name: this.actionLabels.EXPAND_CLUSTER,
@@ -169,18 +172,14 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         permission: 'update',
         icon: Icons.exit,
         click: () => this.hostDrain(),
-        disable: (selection: CdTableSelection) =>
-          this.getDisable('drain', selection) || !this.enableDrainBtn,
-        visible: () => !this.showGeneralActionsOnly && this.enableDrainBtn
+        visible: () => !this.showGeneralActionsOnly && !this.draining
       },
       {
         name: this.actionLabels.STOP_DRAIN,
         permission: 'update',
         icon: Icons.exit,
         click: () => this.hostDrain(true),
-        disable: (selection: CdTableSelection) =>
-          this.getDisable('drain', selection) || this.enableDrainBtn,
-        visible: () => !this.showGeneralActionsOnly && !this.enableDrainBtn
+        visible: () => !this.showGeneralActionsOnly && this.draining
       },
       {
         name: this.actionLabels.REMOVE,
@@ -212,9 +211,6 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         visible: () => !this.showGeneralActionsOnly && this.enableMaintenanceBtn
       }
     ];
-  }
-
-  ngOnInit() {
     this.columns = [
       {
         name: $localize`Hostname`,
@@ -226,20 +222,20 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
         name: $localize`Labels`,
         prop: 'labels',
         flexGrow: 1,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
-          class: 'badge-dark'
+          class: 'tag-dark'
         }
       },
       {
         name: $localize`Status`,
         prop: 'status',
         flexGrow: 0.8,
-        cellTransformation: CellTemplate.badge,
+        cellTransformation: CellTemplate.tag,
         customTemplateConfig: {
           map: {
-            maintenance: { class: 'badge-warning' },
-            available: { class: 'badge-success' }
+            maintenance: { class: 'tag-warning' },
+            available: { class: 'tag-success' }
           }
         }
       },
@@ -305,15 +301,14 @@ export class HostsComponent extends ListWithDetails implements OnDestroy, OnInit
   updateSelection(selection: CdTableSelection) {
     this.selection = selection;
     this.enableMaintenanceBtn = false;
-    this.enableDrainBtn = false;
     if (this.selection.hasSelection) {
       if (this.selection.first().status === 'maintenance') {
         this.enableMaintenanceBtn = true;
       }
 
-      if (!this.selection.first().labels.includes('_no_schedule')) {
-        this.enableDrainBtn = true;
-      }
+      this.selection.first().labels.includes('_no_schedule')
+        ? (this.draining = true)
+        : (this.draining = false);
     }
   }
 

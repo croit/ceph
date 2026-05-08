@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -475,7 +476,8 @@ private:
     ScrubMap::object &o) override;
 
   uint64_t be_get_ondisk_size(uint64_t logical_size,
-                              shard_id_t unused) const final {
+                              shard_id_t unused,
+                              bool unused2) const final {
     return logical_size;
   }
 };

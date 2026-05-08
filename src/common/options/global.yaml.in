@@ -3559,7 +3559,7 @@ options:
     decreases the likelihood of false positives at the expense of additional disk
     space and memory consumption when the filter is loaded into RAM.  The current
     default value of 20 was found to provide significant performance gains when getattr
-    calls are made (such as during new object creation in bluestore) without significant
+    calls are made (such as during new object creation in BlueStore) without significant
     memory overhead or cache pollution when combined with rocksdb partitioned index
     filters.  See: https://github.com/facebook/rocksdb/wiki/Partitioned-Index-Filters
     for more information.'
@@ -4154,6 +4154,22 @@ options:
   see_also:
   - bdev_enable_discard
   - bdev_async_discard_max_pending
+- name: bdev_async_discard
+  long_desc: When set this works like an alias for 'bdev_async_discard_threads = 1"
+    mode to avoid implicit async discard mode disablement after upgrade.
+    Ignored if 'dev_asunc_discard_threads' is greater than zero.
+    This parameter is DEPRECATED and provided for backward compatibility for
+    Squid minor releases only.
+    PLEASE SWITCH TO 'bdev_async_discard_threads' USE.
+  type: bool
+  level: advanced
+  default: false
+  with_legacy: false
+  flags:
+  - runtime
+  see_also:
+  - bdev_enable_discard
+  - bdev_async_discard_threads
 - name: bdev_async_discard_max_pending
   desc: maximum number of pending discards
   long_desc: The maximum number of pending async discards that can be queued and not claimed by an
@@ -5238,7 +5254,7 @@ options:
 - name: bluestore_rocksdb_cf
   type: bool
   level: advanced
-  desc: Enable use of RocksDB column families for bluestore metadata
+  desc: Enable use of RocksDB column families for BlueStore metadata
   fmt_desc: Enables sharding of BlueStore's RocksDB.
     When ``true``, ``bluestore_rocksdb_cfs`` is used.
     Only applied when OSD is doing ``--mkfs``.

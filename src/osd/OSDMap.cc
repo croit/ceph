@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -373,7 +374,7 @@ bool OSDMap::subtree_type_is_down(
 {
   if (id >= 0) {
     bool is_down_ret = is_down(id);
-    if (!is_out(id)) {
+    if (!is_out(id) && !(osd_state[id] & CEPH_OSD_NEW)) {
       if (is_down_ret) {
         down_in_osds->insert(id);
       } else {

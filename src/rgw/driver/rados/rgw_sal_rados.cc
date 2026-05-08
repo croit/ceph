@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -64,6 +64,7 @@
 #include "rgw_tracer.h"
 #include "rgw_zone.h"
 #include "rgw_restore.h"
+#include "rgw_multipart_meta_filter.h"
 
 #include "services/svc_bilog_rados.h"
 #include "services/svc_bi_rados.h"
@@ -555,6 +556,10 @@ int RadosBucket::remove_bypass_gc(int concurrent_max, bool
         rgw_raw_obj raw_head_obj;
         store->get_raw_obj(manifest.get_head_placement_rule(), head_obj, &raw_head_obj);
 
+        // tag for cls_refcount
+        const std::string tag = (astate->tail_tag.length() > 0
+                               ? astate->tail_tag.to_str()
+                               : astate->obj_tag.to_str());
         for (; miter != manifest.obj_end(dpp) && max_aio--; ++miter) {
           if (!max_aio) {
             ret = drain_aio(handles);
@@ -571,7 +576,7 @@ int RadosBucket::remove_bypass_gc(int concurrent_max, bool
             continue;
           }
 
-          ret = store->getRados()->delete_raw_obj_aio(dpp, last_obj, handles);
+          ret = store->getRados()->delete_tail_obj_aio(dpp, last_obj, tag, handles);
           if (ret < 0) {
             ldpp_dout(dpp, -1) << "ERROR: delete obj aio failed with " << ret << dendl;
             return ret;
@@ -1136,6 +1141,8 @@ int set_committed_logging_object(RadosStore* store,
   bufferlist bl;
   bl.append(last_committed);
   librados::ObjectWriteOperation op;
+  // if object does not exist, we should not create the attribute
+  op.assert_exists();
   op.setxattr(RGW_ATTR_COMMITTED_LOGGING_OBJ, std::move(bl));
   return rgw_rados_operate(dpp, io_ctx, obj_name_oid, std::move(op), y);
 }
@@ -1169,6 +1176,10 @@ int RadosBucket::get_logging_object_name(std::string& obj_name,
       ldpp_dout(dpp, 20) << "INFO: logging object name does not exist at '" << obj_name_oid << "'" << dendl;
     }
     return ret;
+  }
+  if (bl.length() == 0) {
+    ldpp_dout(dpp, 1) << "ERROR: logging object name at '" << obj_name_oid << "' is empty" << dendl;
+    return -ENODATA;
   }
   obj_name = bl.to_str();
   return 0;
@@ -1303,23 +1314,8 @@ int RadosBucket::commit_logging_object(const std::string& obj_name,
         << ". error: " << ret << dendl;
       return ret;
     }
+    mtime = ceph::real_time::clock::now();
     ldpp_dout(dpp, 20) << "INFO: temporary logging object '" << temp_obj_name << "' does not exist. committing it empty" << dendl;
-    // creating an empty object
-    if (ret = rgw_put_system_obj(dpp, store->svc()->sysobj,
-                   data_pool,
-                   temp_obj_name,
-                   bl_data, // empty bufferlist
-                   true, // exclusive
-                   nullptr,
-                   ceph::real_time::clock::now(),
-                   y); ret < 0) {
-      if (ret == -EEXIST) {
-        ldpp_dout(dpp, 5) << "WARNING: race detected in committing an empty logging object '" << temp_obj_name << dendl;
-      } else {
-        ldpp_dout(dpp, 1) << "ERROR: failed to commit empty logging object '" << temp_obj_name << "'. error: " << ret << dendl;
-      }
-      return ret;
-    }
   }
 
   uint64_t size = bl_data.length();
@@ -2843,19 +2839,30 @@ int RadosObject::set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, A
 			y, log_op, mtime);
 }
 
-int RadosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj)
+int RadosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp)
 {
   RGWRados::Object op_target(store->getRados(), bucket->get_info(), *rados_ctx, get_obj());
   RGWRados::Object::Read read_op(&op_target);
+  rgw_obj target = get_obj();
 
-  return read_attrs(dpp, read_op, y, target_obj);
+  int r = read_attrs(dpp, read_op, y, &target);
+  if (r < 0) {
+    return r;
+  }
+
+  set_instance(target.key.instance);
+
+  return 0;
 }
 
 int RadosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp, uint32_t flags)
 {
   rgw_obj target = get_obj();
   rgw_obj save = get_obj();
-  int r = get_obj_attrs(y, dpp, &target);
+  RGWRados::Object op_target(store->getRados(), bucket->get_info(), *rados_ctx, get_obj());
+  RGWRados::Object::Read read_op(&op_target);
+
+  int r = read_attrs(dpp, read_op, y, &target);
   if (r < 0) {
     return r;
   }
@@ -3064,6 +3071,7 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
                           	  CephContext* cct,
                                   std::optional<uint64_t> days,
 				  bool& in_progress,
+				  uint64_t& size,
                                   const DoutPrefixProvider* dpp, 
                                   optional_yield y)
 {
@@ -3126,6 +3134,7 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
   tier_ctx.storage_class = tier->get_storage_class();
   tier_ctx.restore_storage_class = rtier->get_rt().restore_storage_class;
   tier_ctx.tier_type = rtier->get_rt().tier_type;
+  tier_ctx.location_constraint = rtier->get_rt().t.s3.location_constraint;
 
   ldpp_dout(dpp, 20) << "Restoring object(" << get_key() << ") from the cloud endpoint(" << endpoint << ")" << dendl;
 
@@ -3139,7 +3148,7 @@ int RadosObject::restore_obj_from_cloud(Bucket* bucket,
    * avoid any races */
   ret = store->getRados()->restore_obj_from_cloud(tier_ctx, *rados_ctx,
                                 bucket->get_info(), get_obj(),
-                                tier_config, days, in_progress, dpp, y);
+                                tier_config, days, in_progress, size, dpp, y);
 
   if (ret < 0) { //failed to restore
     ldpp_dout(dpp, 0) << "Restoring object(" << get_key() << ") from the cloud endpoint(" << endpoint << ") failed, ret=" << ret << dendl;
@@ -3199,6 +3208,7 @@ int RadosObject::transition_to_cloud(Bucket* bucket,
   tier_ctx.multipart_min_part_size = rtier->get_rt().t.s3.multipart_min_part_size;
   tier_ctx.multipart_sync_threshold = rtier->get_rt().t.s3.multipart_sync_threshold;
   tier_ctx.storage_class = tier->get_storage_class();
+  tier_ctx.location_constraint = rtier->get_rt().t.s3.location_constraint;
 
   ldpp_dout(dpp, 0) << "Transitioning object(" << o.key << ") to the cloud endpoint(" << endpoint << ")" << dendl;
 
@@ -3349,13 +3359,26 @@ int RadosObject::handle_obj_expiry(const DoutPrefixProvider* dpp, optional_yield
 	    attrs[RGW_ATTR_INTERNAL_MTIME] = std::move(bl);
 	  }
           const req_context rctx{dpp, y, nullptr};
-          return obj_op.write_meta(0, 0, attrs, rctx, head_obj->get_trace(), false);
+          ret = obj_op.write_meta(0, 0, attrs, rctx, head_obj->get_trace(), false);
+
+          // send notification in case the temporary copy of restored obj is expired
+          if (!ret) { //send notification
+            string etag;
+            attr_iter = attrs.find(RGW_ATTR_ETAG);
+            if (attr_iter != attrs.end()) {
+              etag = rgw_bl_str(attr_iter->second);
+            }
+            store->get_rgwrestore()->send_notification(dpp, store, this, bucket, etag, 0,
+                      get_obj().key.instance,
+                      {rgw::notify::ObjectRestoreExpired}, y);
+
+          }
         } catch (const buffer::end_of_buffer&) {
           // ignore empty manifest; it's not cloud-tiered
         } catch (const std::exception& e) {
         }
       }
-      return 0;
+      return ret;
     }
   }
   // object is not restored/temporary; go for regular deletion

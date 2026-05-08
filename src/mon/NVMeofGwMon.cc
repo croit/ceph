@@ -1,5 +1,6 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab
+
 /*
  * Ceph - scalable distributed file system
  *
@@ -577,6 +578,7 @@ bool NVMeofGwMon::prepare_command(MonOpRequestRef op)
         // Simulate  immediate Failover of this GW
         process_gw_down(id, group_key, propose,
            gw_availability_t::GW_UNAVAILABLE);
+        pending_map.check_all_gws_in_deleting_state(id, group_key);
       } else if (rc == -EINVAL) {
 	dout (4) << "Error: GW not found in the database " << id << " "
 		 << pool << " " << group << "  rc " << rc << dendl;

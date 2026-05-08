@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Ceph - scalable distributed file system
@@ -1248,7 +1248,7 @@ class Object {
      * deleted.  @note the attribute APIs may be revisited in the future. */
     virtual int set_obj_attrs(const DoutPrefixProvider* dpp, Attrs* setattrs, Attrs* delattrs, optional_yield y, uint32_t flags) = 0;
     /** Get attributes for this object */
-    virtual int get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp, rgw_obj* target_obj = NULL) = 0;
+    virtual int get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp) = 0;
     /** Modify attributes for this object. */
     virtual int modify_obj_attrs(const char* attr_name, bufferlist& attr_val, optional_yield y, const DoutPrefixProvider* dpp,
                                  uint32_t flags = rgw::sal::FLAG_LOG_OP) = 0;
@@ -1283,6 +1283,7 @@ class Object {
 			   CephContext* cct,
 		           std::optional<uint64_t> days,
    	 		   bool& in_progress,
+			   uint64_t& size,
 			   const DoutPrefixProvider* dpp,
 			   optional_yield y) = 0;
     /** Check to see if two placement rules match */

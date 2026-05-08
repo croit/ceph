@@ -1,5 +1,5 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
-// vim: ts=8 sw=2 smarttab ft=cpp
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// vim: ts=8 sw=2 sts=2 expandtab ft=cpp
 
 /*
  * Copyright (C) 2025 IBM
@@ -157,10 +157,11 @@ void usage()
   cout << "  caps rm                          remove user capabilities\n";
   cout << "  dedup stats                      Display dedup statistics from the last run\n";
   cout << "  dedup estimate                   Runs dedup in estimate mode (no changes will be made)\n";
-  cout << "  dedup restart                    Restart dedup; must include --yes-i-really-mean-it to activate\n";
+  cout << "  dedup exec                       Execute dedup (duplicated tail objects will be deleted); must include --yes-i-really-mean-it to activate\n";
   cout << "  dedup abort                      Abort dedup\n";
   cout << "  dedup pause                      Pause dedup\n";
   cout << "  dedup resume                     Resume paused dedup\n";
+  cout << "  dedup throttle                   Throttle dedup execution\n";
   cout << "  subuser create                   create a new subuser\n" ;
   cout << "  subuser modify                   modify subuser\n";
   cout << "  subuser rm                       remove subuser\n";
@@ -358,6 +359,9 @@ void usage()
   cout << "  notification list                list bucket notifications configuration\n";
   cout << "  notification get                 get a bucket notifications configuration\n";
   cout << "  notification rm                  remove a bucket notifications configuration\n";
+  cout << "  restore status                   shows restoration status of object in a bucket\n";
+  cout << "  restore list                     list restore status of each object in the bucket\n";
+  cout << "                                   can be filtered with help of --restore-status which shows objects with specified status\n";
   cout << "options:\n";
   cout << "   --tenant=<tenant>                 tenant name\n";
   cout << "   --user_ns=<namespace>             namespace of user (oidc in case of users authenticated with oidc provider)\n";
@@ -490,15 +494,21 @@ void usage()
   cout << "   --disable-feature                 disable a zone/zonegroup feature\n";
   cout << "\n";
   cout << "<date> := \"YYYY-MM-DD[ hh:mm:ss]\"\n";
+  cout << "\nDedup throttle options:\n";
+  cout << "   --max-bucket-index-ops        specify max bucket-index requests per second allowed for an RGW during dedup, 0 means unlimited\n";
+  cout << "   --max-metadata-ops            specify max metadata requests per second allowed for an RGW during dedup, 0 means unlimited\n";
+  cout << "   --stat                        display dedup throttle setting\n";
   cout << "\nQuota options:\n";
   cout << "   --max-objects                 specify max objects (negative value to disable)\n";
   cout << "   --max-size                    specify max size (in B/K/M/G/T, negative value to disable)\n";
   cout << "   --quota-scope                 scope of quota (bucket, user, account)\n";
   cout << "\nRate limiting options:\n";
-  cout << "   --max-read-ops                specify max requests per minute for READ ops per RGW (GET and HEAD request methods), 0 means unlimited\n";
-  cout << "   --max-read-bytes              specify max bytes per minute for READ ops per RGW (GET and HEAD request methods), 0 means unlimited\n";
-  cout << "   --max-write-ops               specify max requests per minute for WRITE ops per RGW (Not GET or HEAD request methods), 0 means unlimited\n";
-  cout << "   --max-write-bytes             specify max bytes per minute for WRITE ops per RGW (Not GET or HEAD request methods), 0 means unlimited\n";
+  cout << "   --max-read-ops                specify max requests per accumulation interval for READ ops per RGW (GET and HEAD request methods), 0 means unlimited\n";
+  cout << "   --max-read-bytes              specify max bytes per accumulation interval for READ ops per RGW (GET and HEAD request methods), 0 means unlimited\n";
+  cout << "   --max-write-ops               specify max requests per accumulation interval for WRITE ops per RGW (Not GET or HEAD request methods), 0 means unlimited\n";
+  cout << "   --max-write-bytes             specify max bytes per accumulation interval for WRITE ops per RGW (Not GET or HEAD request methods), 0 means unlimited\n";
+  cout << "   --max-list-ops                specify max requests per accumulation interval for bucket listing requests per RGW, 0 means unlimited\n";
+  cout << "   --max-delete-ops              specify max requests per accumulation interval for DELETE ops per RGW (DELETE request methods), 0 means unlimited\n";
   cout << "   --ratelimit-scope             scope of rate limiting: bucket, user, anonymous\n";
   cout << "                                 anonymous can be configured only with global rate limit\n";
   cout << "\nOrphans search options:\n";
@@ -540,6 +550,7 @@ void usage()
   cout << "\nBucket list objects options:\n";
   cout << "   --max-entries                 max number of entries listed (default 1000)\n";
   cout << "   --marker                      the marker used to specify on which entry the listing begins, default none (i.e., very first entry)\n";
+  cout << "   --show-restore-stats          if the flag is in present it will show restores stats in the bucket stats command\n";
   cout << "\n";
   generic_client_usage();
 }
@@ -756,9 +767,10 @@ enum class OPT {
   DEDUP_STATS,
   DEDUP_ESTIMATE,
   DEDUP_ABORT,
-  DEDUP_RESTART,
+  DEDUP_EXEC,
   DEDUP_PAUSE,
   DEDUP_RESUME,
+  DEDUP_THROTTLE,
   GC_LIST,
   GC_PROCESS,
   LC_LIST,
@@ -920,6 +932,8 @@ enum class OPT {
   ACCOUNT_STATS,
   ACCOUNT_RM,
   ACCOUNT_LIST,
+  RESTORE_STATUS,
+  RESTORE_LIST,
 };
 
 }
@@ -1009,9 +1023,11 @@ static SimpleCmd::Commands all_cmds = {
   { "dedup stats", OPT::DEDUP_STATS },
   { "dedup estimate", OPT::DEDUP_ESTIMATE },
   { "dedup abort", OPT::DEDUP_ABORT },
-  { "dedup restart", OPT::DEDUP_RESTART },
+  { "dedup restart", OPT::DEDUP_EXEC },
+  { "dedup exec", OPT::DEDUP_EXEC },
   { "dedup pause", OPT::DEDUP_PAUSE },
   { "dedup resume", OPT::DEDUP_RESUME },
+  { "dedup throttle", OPT::DEDUP_THROTTLE },
   { "gc list", OPT::GC_LIST },
   { "gc process", OPT::GC_PROCESS },
   { "lc list", OPT::LC_LIST },
@@ -1183,6 +1199,8 @@ static SimpleCmd::Commands all_cmds = {
   { "account stats", OPT::ACCOUNT_STATS },
   { "account rm", OPT::ACCOUNT_RM },
   { "account list", OPT::ACCOUNT_LIST },
+  { "restore status", OPT::RESTORE_STATUS },
+  { "restore list", OPT::RESTORE_LIST },
 };
 
 static SimpleCmd::Aliases cmd_aliases = {
@@ -1413,9 +1431,9 @@ static bool dump_string(const char *field_name, bufferlist& bl, Formatter *f)
 }
 
 bool set_ratelimit_info(RGWRateLimitInfo& ratelimit, OPT opt_cmd, int64_t max_read_ops, int64_t max_write_ops,
-                    int64_t max_read_bytes, int64_t max_write_bytes,
-                    bool have_max_read_ops, bool have_max_write_ops,
-                    bool have_max_read_bytes, bool have_max_write_bytes)
+                    int64_t max_list_ops, int64_t max_delete_ops, int64_t max_read_bytes, int64_t max_write_bytes,
+                    bool have_max_read_ops, bool have_max_write_ops, bool have_max_list_ops,
+                    bool have_max_delete_ops, bool have_max_read_bytes, bool have_max_write_bytes)
 {
   bool ratelimit_configured = true;
   switch (opt_cmd) {
@@ -1436,6 +1454,18 @@ bool set_ratelimit_info(RGWRateLimitInfo& ratelimit, OPT opt_cmd, int64_t max_re
       if (have_max_write_ops) {
         if (max_write_ops >= 0) {
           ratelimit.max_write_ops = max_write_ops;
+          ratelimit_configured = true;
+        }
+      }
+      if (have_max_list_ops) {
+        if (max_list_ops >= 0) {
+          ratelimit.max_list_ops = max_list_ops;
+          ratelimit_configured = true;
+        }
+      }
+      if (have_max_delete_ops) {
+        if (max_delete_ops >= 0) {
+          ratelimit.max_delete_ops = max_delete_ops;
           ratelimit_configured = true;
         }
       }
@@ -1523,10 +1553,10 @@ int set_bucket_quota(rgw::sal::Driver* driver, OPT opt_cmd,
 
 int set_bucket_ratelimit(rgw::sal::Driver* driver, OPT opt_cmd,
                      const string& tenant_name, const string& bucket_name,
-                     int64_t max_read_ops, int64_t max_write_ops,
-                     int64_t max_read_bytes, int64_t max_write_bytes,
-                     bool have_max_read_ops, bool have_max_write_ops,
-                     bool have_max_read_bytes, bool have_max_write_bytes)
+                     int64_t max_read_ops, int64_t max_write_ops, int64_t max_list_ops,
+                     int64_t max_delete_ops, int64_t max_read_bytes, int64_t max_write_bytes,
+                     bool have_max_read_ops, bool have_max_write_ops, bool have_max_list_ops,
+                     bool have_max_delete_ops, bool have_max_read_bytes, bool have_max_write_bytes)
 {
   std::unique_ptr<rgw::sal::Bucket> bucket;
   int r = driver->load_bucket(dpp(), rgw_bucket(tenant_name, bucket_name),
@@ -1547,10 +1577,10 @@ int set_bucket_ratelimit(rgw::sal::Driver* driver, OPT opt_cmd,
       return -EIO;
     }
   }
-  bool ratelimit_configured = set_ratelimit_info(ratelimit_info, opt_cmd, max_read_ops, max_write_ops,
-                         max_read_bytes, max_write_bytes,
-                         have_max_read_ops, have_max_write_ops,
-                         have_max_read_bytes, have_max_write_bytes);
+  bool ratelimit_configured = set_ratelimit_info(ratelimit_info, opt_cmd, max_read_ops, max_write_ops, max_list_ops,
+                         max_delete_ops, max_read_bytes, max_write_bytes,
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
   if (!ratelimit_configured) {
     ldpp_dout(dpp(), 0) << "ERROR: no rate limit values have been specified" << dendl;
     return -EINVAL;
@@ -1568,10 +1598,10 @@ int set_bucket_ratelimit(rgw::sal::Driver* driver, OPT opt_cmd,
 }
 
 int set_user_ratelimit(OPT opt_cmd, std::unique_ptr<rgw::sal::User>& user,
-                     int64_t max_read_ops, int64_t max_write_ops,
-                     int64_t max_read_bytes, int64_t max_write_bytes,
-                     bool have_max_read_ops, bool have_max_write_ops,
-                     bool have_max_read_bytes, bool have_max_write_bytes)
+                     int64_t max_read_ops, int64_t max_write_ops, int64_t max_list_ops,
+                     int64_t max_delete_ops, int64_t max_read_bytes, int64_t max_write_bytes,
+                     bool have_max_read_ops, bool have_max_write_ops, bool have_max_list_ops,
+                     bool have_max_delete_ops, bool have_max_read_bytes, bool have_max_write_bytes)
 {
   RGWRateLimitInfo ratelimit_info;
   user->load_user(dpp(), null_yield);
@@ -1586,10 +1616,10 @@ int set_user_ratelimit(OPT opt_cmd, std::unique_ptr<rgw::sal::User>& user,
       return -EIO;
     }
   }
-  bool ratelimit_configured = set_ratelimit_info(ratelimit_info, opt_cmd, max_read_ops, max_write_ops,
-                         max_read_bytes, max_write_bytes,
-                         have_max_read_ops, have_max_write_ops,
-                         have_max_read_bytes, have_max_write_bytes);
+  bool ratelimit_configured = set_ratelimit_info(ratelimit_info, opt_cmd, max_read_ops, max_write_ops, max_list_ops,
+                         max_delete_ops, max_read_bytes, max_write_bytes,
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
   if (!ratelimit_configured) {
     ldpp_dout(dpp(), 0) << "ERROR: no rate limit values have been specified" << dendl;
     return -EINVAL;
@@ -1620,7 +1650,10 @@ int show_user_ratelimit(std::unique_ptr<rgw::sal::User>& user, Formatter *format
       ldpp_dout(dpp(), 0) << "ERROR: failed to decode rate limit" << dendl;
       return -EIO;
     }
+  } else {
+    return -ENOENT;
   }
+
   formatter->open_object_section("user_ratelimit");
   encode_json("user_ratelimit", ratelimit_info, formatter);
   formatter->close_section();
@@ -3637,6 +3670,7 @@ int main(int argc, const char **argv)
   int skip_zero_entries = false;  // log show
   int purge_keys = false;
   int yes_i_really_mean_it = false;
+  int throttle_stat = false;
   int delete_child_objects = false;
   int fix = false;
   int remove_bad = false;
@@ -3687,14 +3721,22 @@ int main(int argc, const char **argv)
   int64_t max_size = -1;
   int64_t max_read_ops = 0;
   int64_t max_write_ops = 0;
+  int64_t max_list_ops = 0;
+  int64_t max_delete_ops = 0;
   int64_t max_read_bytes = 0;
   int64_t max_write_bytes = 0;
+  uint32_t max_bucket_index_ops = 0;
+  uint32_t max_metadata_ops = 0;
   bool have_max_objects = false;
   bool have_max_size = false;
   bool have_max_write_ops = false;
   bool have_max_read_ops = false;
+  bool have_max_list_ops = false;
+  bool have_max_delete_ops = false;
   bool have_max_write_bytes = false;
   bool have_max_read_bytes = false;
+  bool have_max_bucket_index_ops = false;
+  bool have_max_metadata_ops = false;
   int include_all = false;
   int allow_unordered = false;
 
@@ -3818,6 +3860,8 @@ int main(int argc, const char **argv)
   bool raw_storage_op = false;
 
   std::optional<std::string> rgw_obj_fs; // radoslist field separator
+  std::optional<std::string> restore_status_filter;
+  int show_restore_stats = false;
 
   init_realm_param(cct.get(), realm_id, opt_realm_id, "rgw_realm_id");
   init_realm_param(cct.get(), zonegroup_id, opt_zonegroup_id, "rgw_zonegroup_id");
@@ -3982,6 +4026,20 @@ int main(int argc, const char **argv)
         return EINVAL;
       }
       have_max_read_ops = true;
+    } else if (ceph_argparse_witharg(args, i, &val, "--max-list-ops", (char*)NULL)) {
+      max_list_ops = (int64_t)strict_strtoll(val.c_str(), 10, &err);
+      if (!err.empty()) {
+        cerr << "ERROR: failed to parse max list requests: " << err << std::endl;
+        return EINVAL;
+      }
+      have_max_list_ops = true;
+    } else if (ceph_argparse_witharg(args, i, &val, "--max-delete-ops", (char*)NULL)) {
+      max_delete_ops = (int64_t)strict_strtoll(val.c_str(), 10, &err);
+      if (!err.empty()) {
+        cerr << "ERROR: failed to parse max delete requests: " << err << std::endl;
+        return EINVAL;
+      }
+      have_max_delete_ops = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--max-write-ops", (char*)NULL)) {
       max_write_ops = (int64_t)strict_strtoll(val.c_str(), 10, &err);
       if (!err.empty()) {
@@ -4003,6 +4061,20 @@ int main(int argc, const char **argv)
         return EINVAL;
       }
       have_max_write_bytes = true;
+    } else if (ceph_argparse_witharg(args, i, &val, "--max-bucket-index-ops", (char*)NULL)) {
+      max_bucket_index_ops = (int64_t)strict_strtoll(val.c_str(), 10, &err);
+      if (!err.empty()) {
+	cerr << "ERROR: failed to parse max bucket index ops: " << err << std::endl;
+	return EINVAL;
+      }
+      have_max_bucket_index_ops = true;
+    } else if (ceph_argparse_witharg(args, i, &val, "--max-metadata-ops", (char*)NULL)) {
+      max_metadata_ops = (int64_t)strict_strtoll(val.c_str(), 10, &err);
+      if (!err.empty()) {
+	cerr << "ERROR: failed to parse max metadata ops: " << err << std::endl;
+	return EINVAL;
+      }
+      have_max_metadata_ops = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--date", "--time", (char*)NULL)) {
       date = val;
       if (end_date.empty())
@@ -4096,6 +4168,8 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_binary_flag(args, i, &purge_keys, NULL, "--purge-keys", (char*)NULL)) {
       // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &yes_i_really_mean_it, NULL, "--yes-i-really-mean-it", (char*)NULL)) {
+      // do nothing
+    } else if (ceph_argparse_binary_flag(args, i, &throttle_stat, NULL, "--stat", (char*)NULL)) {
       // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &fix, NULL, "--fix", (char*)NULL)) {
       // do nothing
@@ -4385,6 +4459,10 @@ int main(int argc, const char **argv)
       enable_features.insert(val);
     } else if (ceph_argparse_witharg(args, i, &val, "--disable-feature", (char*)NULL)) {
       disable_features.insert(val);
+    } else if (ceph_argparse_witharg(args, i, &val, "--restore-status", (char*)NULL)) {
+      restore_status_filter = val;
+    } else if (ceph_argparse_binary_flag(args, i, &show_restore_stats, NULL, "--show-restore-stats", (char*)NULL)){
+      // do nothing
     } else if (strncmp(*i, "-", 1) == 0) {
       cerr << "ERROR: invalid flag " << *i << std::endl;
       return EINVAL;
@@ -4514,9 +4592,10 @@ int main(int argc, const char **argv)
 			 OPT::DEDUP_STATS,
 			 OPT::DEDUP_ESTIMATE,
 			 OPT::DEDUP_ABORT,     // TBD - not READ-ONLY
-			 OPT::DEDUP_RESTART,   // TBD - not READ-ONLY
+			 OPT::DEDUP_EXEC,   // TBD - not READ-ONLY
 			 OPT::DEDUP_PAUSE,
 			 OPT::DEDUP_RESUME,
+			 OPT::DEDUP_THROTTLE,
 			 OPT::GC_LIST,
 			 OPT::LC_LIST,
 			 OPT::ORPHANS_LIST_JOBS,
@@ -4567,6 +4646,8 @@ int main(int argc, const char **argv)
        OPT::PUBSUB_TOPIC_STATS  ,
        OPT::PUBSUB_TOPIC_DUMP  ,
 			 OPT::SCRIPT_GET,
+       OPT::RESTORE_STATUS,
+       OPT::RESTORE_LIST,
     };
 
     std::set<OPT> gc_ops_list = {
@@ -4951,24 +5032,24 @@ int main(int argc, const char **argv)
         formatter->open_object_section("period_config");
         if (ratelimit_scope == "bucket") {
           ratelimit_configured = set_ratelimit_info(period_config.bucket_ratelimit, opt_cmd,
-                         max_read_ops, max_write_ops,
+                         max_read_ops, max_write_ops, max_list_ops, max_delete_ops,
                          max_read_bytes, max_write_bytes,
-                         have_max_read_ops, have_max_write_ops,
-                         have_max_read_bytes, have_max_write_bytes);
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
           encode_json("bucket_ratelimit", period_config.bucket_ratelimit, formatter.get());
         } else if (ratelimit_scope == "user") {
           ratelimit_configured = set_ratelimit_info(period_config.user_ratelimit, opt_cmd,
-                         max_read_ops, max_write_ops,
+                         max_read_ops, max_write_ops, max_list_ops, max_delete_ops,
                          max_read_bytes, max_write_bytes,
-                         have_max_read_ops, have_max_write_ops,
-                         have_max_read_bytes, have_max_write_bytes);
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
           encode_json("user_ratelimit", period_config.user_ratelimit, formatter.get());
         } else if (ratelimit_scope == "anonymous") {
           ratelimit_configured = set_ratelimit_info(period_config.anon_ratelimit, opt_cmd,
-                         max_read_ops, max_write_ops,
+                         max_read_ops, max_write_ops, max_list_ops,max_delete_ops,
                          max_read_bytes, max_write_bytes,
-                         have_max_read_ops, have_max_write_ops,
-                         have_max_read_bytes, have_max_write_bytes);
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops,
+                         have_max_delete_ops, have_max_read_bytes, have_max_write_bytes);
           encode_json("anonymous_ratelimit", period_config.anon_ratelimit, formatter.get());
         } else if (ratelimit_scope.empty() && opt_cmd == OPT::GLOBAL_RATELIMIT_GET) {
           // if no scope is given for GET, print both
@@ -6706,7 +6787,8 @@ int main(int argc, const char **argv)
                                         OPT::ROLE_CREATE, OPT::ROLE_DELETE,
                                         OPT::ROLE_POLICY_PUT, OPT::ROLE_POLICY_DELETE,
                                         OPT::ROLE_POLICY_ATTACH, OPT::ROLE_POLICY_DETACH,
-                                        OPT::USER_POLICY_ATTACH, OPT::USER_POLICY_DETACH};
+                                        OPT::USER_POLICY_ATTACH, OPT::USER_POLICY_DETACH,
+                                        OPT::RATELIMIT_SET, OPT::RATELIMIT_ENABLE, OPT::RATELIMIT_DISABLE};
 
   bool print_warning_message = (non_master_ops_list.find(opt_cmd) != non_master_ops_list.end() &&
                                 non_master_cmd);
@@ -7631,6 +7713,7 @@ int main(int argc, const char **argv)
       bucket_op.max_entries = max_entries;
     else
       bucket_op.max_entries = 0; /* for backward compatibility */
+    bucket_op.set_restore_stats(bool(show_restore_stats));
 
     int r = RGWBucketAdminOp::info(driver, bucket_op, stream_flusher, null_yield, dpp());
     if (r < 0) {
@@ -7801,6 +7884,12 @@ int main(int argc, const char **argv)
       return 0;
     }
 
+    // make sure that the logging source attribute is up-to-date
+    if (ret = rgw::bucketlogging::update_bucket_logging_sources(dpp(), target_bucket, bucket->get_key(), true, null_yield); ret < 0) {
+      cerr << "WARNING: failed to update logging sources attribute '" << RGW_ATTR_BUCKET_LOGGING_SOURCES
+        << "' in logging target '" << target_bucket->get_key() << "'. error: " << cpp_strerror(ret) << std::endl;
+    }
+
     std::string obj_name;
     RGWObjVersionTracker objv_tracker;
     ret = target_bucket->get_logging_object_name(obj_name, configuration.target_prefix, null_yield, dpp(), &objv_tracker);
@@ -7813,9 +7902,8 @@ int main(int argc, const char **argv)
     const auto region = driver->get_zone()->get_zonegroup().get_api_name();
     ret = rgw::bucketlogging::rollover_logging_object(configuration, target_bucket, obj_name, dpp(), region, bucket, null_yield, true, &objv_tracker, &old_obj);
     if (ret < 0) {
-      cerr << "ERROR: failed to flush pending logging object '" << obj_name << "' to target bucket '" << configuration.target_bucket << "'. "
-        << " last committed object is '" << old_obj <<
-        "'. error: " << cpp_strerror(-ret) << std::endl;
+      cerr << "ERROR: failed to flush pending logging object '" << obj_name << "' to target bucket '" << configuration.target_bucket
+        << "'. error: " << cpp_strerror(-ret) << std::endl;
       return -ret;
     }
     cout << "flushed pending logging object '" << old_obj
@@ -9167,7 +9255,8 @@ next:
       opt_cmd == OPT::DEDUP_ABORT    ||
       opt_cmd == OPT::DEDUP_PAUSE    ||
       opt_cmd == OPT::DEDUP_RESUME   ||
-      opt_cmd == OPT::DEDUP_RESTART) {
+      opt_cmd == OPT::DEDUP_THROTTLE ||
+      opt_cmd == OPT::DEDUP_EXEC) {
 
     using namespace rgw::dedup;
     rgw::sal::RadosStore *store = dynamic_cast<rgw::sal::RadosStore*>(driver);
@@ -9188,7 +9277,41 @@ next:
       return ret;
     }
 
-    if (opt_cmd == OPT::DEDUP_ABORT || opt_cmd == OPT::DEDUP_PAUSE || opt_cmd == OPT::DEDUP_RESUME) {
+    if (opt_cmd == OPT::DEDUP_THROTTLE) {
+      bufferlist urgent_msg_bl;
+      urgent_msg_t urgent_msg = URGENT_MSG_THROTTLE;
+      ceph::encode(urgent_msg, urgent_msg_bl);
+      throttle_msg_t throttle_msg;
+
+      if (throttle_stat) {
+	encode(throttle_msg, urgent_msg_bl);
+	return cluster::dedup_control_bl(store, dpp(), urgent_msg, urgent_msg_bl);
+      }
+
+      if (unlikely(!have_max_bucket_index_ops && !have_max_metadata_ops)) {
+	std::cerr << "dedup throttle must set either --max-bucket-index-ops or --max-metadata-ops" << std::endl;
+	return EINVAL;
+      }
+
+      if (have_max_bucket_index_ops) {
+	throttle_action_t action = { .op_type = BUCKET_INDEX_OP,
+				     .limit = max_bucket_index_ops};
+	throttle_msg.vec.push_back(action);
+      }
+
+      if (have_max_metadata_ops) {
+	throttle_action_t action = { .op_type = METADATA_ACCESS_OP,
+				     .limit = max_metadata_ops};
+	throttle_msg.vec.push_back(action);
+      }
+
+      encode(throttle_msg, urgent_msg_bl);
+      return cluster::dedup_control_bl(store, dpp(), urgent_msg, urgent_msg_bl);
+    }
+
+    if (opt_cmd == OPT::DEDUP_ABORT  ||
+	opt_cmd == OPT::DEDUP_PAUSE  ||
+	opt_cmd == OPT::DEDUP_RESUME) {
       urgent_msg_t urgent_msg;
       if (opt_cmd == OPT::DEDUP_ABORT) {
 	urgent_msg = URGENT_MSG_ABORT;
@@ -9202,7 +9325,7 @@ next:
       return cluster::dedup_control(store, dpp(), urgent_msg);
     }
 
-    if (opt_cmd == OPT::DEDUP_RESTART || opt_cmd == OPT::DEDUP_ESTIMATE) {
+    if (opt_cmd == OPT::DEDUP_EXEC || opt_cmd == OPT::DEDUP_ESTIMATE) {
       dedup_req_type_t dedup_type = dedup_req_type_t::DEDUP_TYPE_NONE;
       if (opt_cmd == OPT::DEDUP_ESTIMATE) {
 	dedup_type = dedup_req_type_t::DEDUP_TYPE_ESTIMATE;
@@ -9214,7 +9337,7 @@ next:
 	       << std::endl;
 	  return EINVAL;
 	}
-	dedup_type = dedup_req_type_t::DEDUP_TYPE_FULL;
+	dedup_type = dedup_req_type_t::DEDUP_TYPE_EXEC;
 #ifndef FULL_DEDUP_SUPPORT
 	std::cerr << "Only dedup estimate is supported!" << std::endl;
 	return EPERM;
@@ -11272,15 +11395,15 @@ next:
         return EINVAL;
       }
       return set_bucket_ratelimit(driver, opt_cmd, tenant, bucket_name,
-                           max_read_ops, max_write_ops,
+                           max_read_ops, max_write_ops, max_list_ops, max_delete_ops,
                            max_read_bytes, max_write_bytes,
-                           have_max_read_ops, have_max_write_ops,
+                           have_max_read_ops, have_max_write_ops, have_max_list_ops, have_max_delete_ops,
                            have_max_read_bytes, have_max_write_bytes);
     } else if (!rgw::sal::User::empty(user)) {
       if (ratelimit_scope == "user") {
-        return set_user_ratelimit(opt_cmd, user, max_read_ops, max_write_ops,
+        return set_user_ratelimit(opt_cmd, user, max_read_ops, max_write_ops, max_list_ops, max_delete_ops,
                          max_read_bytes, max_write_bytes,
-                         have_max_read_ops, have_max_write_ops,
+                         have_max_read_ops, have_max_write_ops, have_max_list_ops, have_max_delete_ops,
                          have_max_read_bytes, have_max_write_bytes);
       } else {
         cerr << "ERROR: invalid ratelimit scope specification. Please specify either --ratelimit-scope=bucket, or --ratelimit-scope=user" << std::endl;
@@ -11303,7 +11426,11 @@ next:
       return show_bucket_ratelimit(driver, tenant, bucket_name, formatter.get());
     } else if (!rgw::sal::User::empty(user)) {
       if (ratelimit_scope == "user") {
-        return show_user_ratelimit(user, formatter.get());
+        int ret = show_user_ratelimit(user, formatter.get());
+        if (ret < 0) {
+          std::cerr << "ERROR: failed to get a ratelimit for user id: '" << user->get_id() << "', errno: " << cpp_strerror(-ret) << std::endl;
+        }
+        return ret;
       } else {
         cerr << "ERROR: invalid ratelimit scope specification. Please specify either --ratelimit-scope=bucket, or --ratelimit-scope=user" << std::endl;
         return EINVAL;
@@ -12209,7 +12336,124 @@ next:
       }
     }
   }
-
+  if (opt_cmd == OPT::RESTORE_STATUS ||
+      opt_cmd == OPT::RESTORE_LIST) {
+        int ret = init_bucket(tenant, bucket_name, bucket_id, &bucket);
+        if (ret < 0) {
+          cerr << "ERROR: could not init bucket: " << cpp_strerror(-ret) << std::endl;
+          return -ret;
+        }
+        if (opt_cmd == OPT::RESTORE_STATUS) {
+          if (!object.empty()) {
+            std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(object);
+            obj->set_instance(object_version);
+            ret = obj->get_obj_attrs(null_yield, dpp());
+            if (ret < 0) {
+              cerr << "ERROR: failed to stat object, returned error: " << cpp_strerror(-ret) << std::endl;
+              return -ret;
+            }
+            formatter->open_object_section("object restore status");
+            formatter->dump_string("name", object);
+            map<string, bufferlist>::iterator iter;
+            for (iter = obj->get_attrs().begin(); iter != obj->get_attrs().end(); ++iter) {
+              bufferlist& bl = iter->second;
+              if (iter->first == RGW_ATTR_RESTORE_STATUS) {
+                rgw::sal::RGWRestoreStatus rs;
+                try {
+                  decode(rs, bl);
+                } catch (const JSONDecoder::err& e) {
+                  cerr << "failed to decode JSON input: " << e.what() << std::endl;
+                  return EINVAL;
+                }
+                formatter->dump_string("RestoreStatus", rgw::sal::rgw_restore_status_dump(rs));
+              } else if (iter->first == RGW_ATTR_RESTORE_TYPE) {
+                rgw::sal::RGWRestoreType rt;
+                try {
+                  decode(rt, bl);
+                } catch (const JSONDecoder::err& e) {
+                  cerr << "failed to decode JSON input: " << e.what() << std::endl;
+                  return EINVAL;
+                }
+                formatter->dump_string("RestoreType", rgw::sal::rgw_restore_type_dump(rt));
+              } else if (iter->first == RGW_ATTR_RESTORE_EXPIRY_DATE) {
+                decode_dump<ceph::real_time>("RestoreExpiryDate", bl, formatter.get());
+              } else if (iter->first == RGW_ATTR_RESTORE_TIME) {
+                decode_dump<ceph::real_time>("RestoreTime", bl, formatter.get());
+              } else if (iter->first == RGW_ATTR_RESTORE_VERSIONED_EPOCH) {
+                uint64_t versioned_epoch;
+                try {
+                  decode(versioned_epoch, bl);
+                } catch (const JSONDecoder::err& e) {
+                  cerr << "failed to decode JSON input: " << e.what() << std::endl;
+                  return EINVAL;
+                }
+                formatter->dump_unsigned("RestoreVersionedEpoch", versioned_epoch);
+              }
+            }
+            formatter->close_section();
+            formatter->flush(cout);
+          }
+        } else if (opt_cmd == OPT::RESTORE_LIST) {
+          int count = 0;
+          int restore_entries;
+          string prefix;
+          string delim;
+          string marker;
+          string ns;
+          rgw::sal::Bucket::ListParams params;
+          rgw::sal::Bucket::ListResults results;
+          params.prefix = prefix;
+          params.delim = delim;
+          params.marker = rgw_obj_key(marker);
+          params.ns = ns;
+          params.enforce_ns = true;
+          if (max_entries_specified) {
+            restore_entries = max_entries;
+          } else {
+            restore_entries = 1000;
+          }
+          formatter->open_object_section("restore_list");
+          do {
+            ret = bucket->list(dpp(), params, restore_entries - count, results, null_yield);
+            if (ret < 0) {
+              cerr << "ERROR: driver->list_objects(): " << cpp_strerror(-ret) << std::endl;
+              return -ret;
+            }
+            count += results.objs.size();
+            for (vector<rgw_bucket_dir_entry>::iterator iter = results.objs.begin(); iter != results.objs.end(); ++iter) {
+              std::unique_ptr<rgw::sal::Object> obj = bucket->get_object(iter->key.name);
+              if (obj) {
+                obj->set_instance(object_version);
+                ret = obj->get_obj_attrs(null_yield, dpp());
+                if (ret < 0) {
+                  cerr << "ERROR: failed to stat object, returned error: " << cpp_strerror(-ret) << std::endl;
+                  return -ret;
+                }
+                for (map<string, bufferlist>::iterator getattriter = obj->get_attrs().begin(); getattriter != obj->get_attrs().end(); ++getattriter) {
+                  bufferlist& bl = getattriter->second;
+                  if (getattriter->first == RGW_ATTR_RESTORE_STATUS) {
+                    rgw::sal::RGWRestoreStatus rs;
+                    try {
+                      decode(rs, bl);
+                    } catch (const JSONDecoder::err& e) {
+                      cerr << "failed to decode JSON input: " << e.what() << std::endl;
+                      return EINVAL;
+                    }
+                    if (restore_status_filter) {
+                      if (restore_status_filter == rgw::sal::rgw_restore_status_dump(rs)) {
+                        formatter->dump_string(iter->key.name, rgw::sal::rgw_restore_status_dump(rs));
+                      }
+                    } else {
+                        formatter->dump_string(iter->key.name, rgw::sal::rgw_restore_status_dump(rs));
+                    }
+                  }
+                }
+              }
+            }
+          } while (results.is_truncated && count < restore_entries);
+          formatter->close_section();
+          formatter->flush(cout);
+        }
+      }
   return 0;
 }
-
