@@ -336,15 +336,13 @@ bool DataScan::parse_kwarg(
       return false;
     }
 
-    std::vector<std::string> tokens;
+    std::set<std::string> tokens;
     *r = parse_damage_type_expr(val, &tokens);
     if (*r < 0) {
       return false;
     }
     damage_type_expr = val;
     damage_type_tokens = tokens;
-    damage_type_filter_set = true;
-    damage_type_all = false;
     return true;
   } else if (arg == std::string("--inode-file")) {
     if (command != "scan_extents" && command != "scan_inodes") {
@@ -412,7 +410,7 @@ bool DataScan::parse_kwarg(
 }
 
 int DataScan::parse_damage_type_expr(const std::string &expr,
-                                     std::vector<std::string> *tokens) {
+                                     std::set<std::string> *tokens) {
   tokens->clear();
   std::string trimmed_expr = trim_whitespace(expr);
   if (trimmed_expr.empty()) {
@@ -434,7 +432,7 @@ int DataScan::parse_damage_type_expr(const std::string &expr,
       return -EINVAL;
     }
     if (seen.insert(token).second) {
-      tokens->push_back(token);
+      tokens->insert(token);
     }
 
     if (sep == std::string::npos) {
@@ -559,7 +557,7 @@ int DataScan::main(const std::vector<const char*> &args)
                 << std::endl;
       return -EINVAL;
     }
-    if (damage_type_filter_set) {
+    if (damage_type_tokens.size()) {
       std::cerr << "Option '--type' is only valid with scan_extents or "
                    "scan_inodes"
                 << std::endl;
@@ -611,7 +609,7 @@ int DataScan::main(const std::vector<const char*> &args)
   }
 
   if ((command == "scan_extents" || command == "scan_inodes") &&
-      damage_type_filter_set && damage_file_path.empty()) {
+      damage_type_tokens.size() && damage_file_path.empty()) {
     std::cerr << "Option '--type' requires '--damage-file'" << std::endl;
     return -EINVAL;
   }
@@ -642,11 +640,6 @@ int DataScan::main(const std::vector<const char*> &args)
                  "('--worker_n 0 --worker_m 1')"
               << std::endl;
     return -EINVAL;
-  }
-
-  if ((command == "scan_extents" || command == "scan_inodes") &&
-      !damage_file_path.empty() && !damage_type_filter_set) {
-    damage_type_all = true;
   }
 
   // If caller didn't specify a namespace, try to pick
@@ -1018,6 +1011,33 @@ std::string format_extent_oid(inodeno_t ino, uint64_t extent_id) {
   return std::string(buf);
 }
 
+void DataScan::update_accumulate_result(AccumulateResult *accum_res,
+                                        const uint64_t obj_index,
+                                        const uint64_t obj_size,
+                                        const int64_t obj_pool_id,
+                                        const time_t mtime) {
+  ceph_assert(accum_res != nullptr);
+
+  if (obj_index > accum_res->ceiling_obj_index ||
+      (obj_index == accum_res->ceiling_obj_index &&
+       accum_res->ceiling_obj_size == 0)) {
+    accum_res->ceiling_obj_index = obj_index;
+    accum_res->ceiling_obj_size = obj_size;
+  }
+
+  if (obj_size > accum_res->max_obj_size) {
+    accum_res->max_obj_size = obj_size;
+  }
+
+  if (mtime > accum_res->max_mtime) {
+    accum_res->max_mtime = mtime;
+  }
+
+  if (obj_pool_id != -1) {
+    accum_res->obj_pool_id = obj_pool_id;
+  }
+}
+
 int DataScan::scan_extent_for_inode(
     inodeno_t ino, const std::vector<librados::IoCtx *> &data_ios) {
   ceph_assert(!data_ios.empty());
@@ -1026,11 +1046,10 @@ int DataScan::scan_extent_for_inode(
   bool found_extent = false;
   uint64_t window_start = 0;
   while (window_start < extent_limit) {
-    bool window_productive = false;
     bool all_stat_failed = true;
 
     uint64_t window_end = window_start + extent_period;
-    if (window_end < window_start || window_end > extent_limit) {
+    if (window_end > extent_limit) {
       window_end = extent_limit;
     }
     for (uint64_t extent_id = window_start; extent_id < window_end;
@@ -1050,23 +1069,12 @@ int DataScan::scan_extent_for_inode(
         all_stat_failed = false;
         int64_t obj_pool_id =
             data_io.get_id() != ioctx->get_id() ? ioctx->get_id() : -1;
-
-        r = ClsCephFSClient::accumulate_inode_metadata(data_io, ino, extent_id,
-                                                       size, obj_pool_id, mtime,
-                                                       &accum_res, false);
-        if (r < 0) {
-          derr << "Failed to accumulate metadata for inode 0x" << std::hex
-               << static_cast<uint64_t>(ino) << std::dec << " from '" << oid
-               << "': " << cpp_strerror(r) << dendl;
-          return r;
-        }
-
-        window_productive = true;
+        update_accumulate_result(&accum_res, extent_id, size, obj_pool_id, mtime);
         found_extent = true;
       }
     }
 
-    if (!window_productive && all_stat_failed) {
+    if (all_stat_failed) {
       break;
     }
 
@@ -1164,201 +1172,7 @@ int DataScan::scan_extents()
   return 0;
 }
 
-int DataScan::scan_extents_for_damage_file()
-{
-  if (m == 0) {
-    std::cerr << "Invalid worker count " << m << ": must be > 0" << std::endl;
-    return -EINVAL;
-  }
-  if (n >= m) {
-    std::cerr << "Invalid worker number " << n
-              << ": must be in range [0, " << (m - 1) << "]" << std::endl;
-    return -EINVAL;
-  }
-
-  std::ifstream input(damage_file_path);
-  if (!input.is_open()) {
-    int err = errno ? -errno : -ENOENT;
-    std::cerr << "Failed to open damage file '" << damage_file_path << "': "
-              << cpp_strerror(err) << std::endl;
-    return err;
-  }
-
-  std::vector<librados::IoCtx *> data_ios;
-  data_ios.push_back(&data_io);
-  for (auto &extra_data_io : extra_data_ios) {
-    data_ios.push_back(&extra_data_io);
-  }
-
-  uint64_t candidate_index = 0;
-  uint64_t line_no = 0;
-  std::string line;
-  while (std::getline(input, line)) {
-    ++line_no;
-    if (trim_whitespace(line).empty()) {
-      continue;
-    }
-
-    JSONParser parser;
-    if (!parser.parse(line.c_str(), static_cast<int>(line.size()))) {
-      std::cerr << "Invalid JSON on line " << line_no
-                << ": " << describe_json_parse_error(line)
-                << std::endl;
-      return -EINVAL;
-    }
-    if (!parser.is_object()) {
-      std::cerr << "Invalid damage entry on line " << line_no
-                << ": JSON value must be an object" << std::endl;
-      return -EINVAL;
-    }
-
-    std::string damage_type;
-    unsigned long long ino = 0;
-    try {
-      JSONDecoder::decode_json("damage_type", damage_type, &parser, true);
-      JSONDecoder::decode_json("ino", ino, &parser, true);
-    } catch (const JSONDecoder::err &e) {
-      std::cerr << "Invalid damage entry on line " << line_no
-                << ": " << e.what() << std::endl;
-      return -EINVAL;
-    }
-
-    JSONObj *damage_type_obj = parser.find_obj("damage_type");
-    ceph_assert(damage_type_obj != nullptr);
-    if (!damage_type_obj->get_data_val().quoted) {
-      std::cerr << "Invalid damage entry on line " << line_no
-                << ": damage_type must be a string" << std::endl;
-      return -EINVAL;
-    }
-
-    JSONObj *ino_obj = parser.find_obj("ino");
-    ceph_assert(ino_obj != nullptr);
-    if (ino_obj->get_data_val().quoted) {
-      std::cerr << "Invalid damage entry on line " << line_no
-                << ": ino must be a numeric JSON value" << std::endl;
-      return -EINVAL;
-    }
-
-    if (trim_whitespace(damage_type).empty()) {
-      std::cerr << "Invalid damage entry on line " << line_no
-                << ": damage_type must be a non-empty string" << std::endl;
-      return -EINVAL;
-    }
-
-    bool type_matched = damage_type_all;
-    if (!damage_type_all) {
-      type_matched = std::find(damage_type_tokens.begin(),
-                               damage_type_tokens.end(),
-                               damage_type) != damage_type_tokens.end();
-    }
-    if (!type_matched) {
-      continue;
-    }
-
-    if ((candidate_index % m) == n) {
-      dout(10) << "selected damage entry line=" << line_no
-               << " damage_type='" << damage_type << "'"
-               << " ino=0x" << std::hex << ino << std::dec
-               << " candidate_index=" << candidate_index
-               << " worker=" << n << "/" << m << dendl;
-
-      int r = scan_extent_for_inode(static_cast<inodeno_t>(ino), data_ios);
-      if (r < 0) {
-        std::cerr << "Failed targeted extent scan for inode 0x" << std::hex
-                  << ino << std::dec << ": " << cpp_strerror(r) << std::endl;
-        return r;
-      }
-    }
-
-    ++candidate_index;
-  }
-
-  return 0;
-}
-
-int DataScan::scan_extents_for_inode_file()
-{
-  if (m == 0) {
-    std::cerr << "Invalid worker count " << m << ": must be > 0" << std::endl;
-    return -EINVAL;
-  }
-  if (n >= m) {
-    std::cerr << "Invalid worker number " << n
-              << ": must be in range [0, " << (m - 1) << "]" << std::endl;
-    return -EINVAL;
-  }
-
-  std::ifstream input(inode_file_path);
-  if (!input.is_open()) {
-    int err = errno ? -errno : -ENOENT;
-    std::cerr << "Failed to open inode file '" << inode_file_path << "': "
-              << cpp_strerror(err) << std::endl;
-    return err;
-  }
-
-  std::vector<librados::IoCtx *> data_ios;
-  data_ios.push_back(&data_io);
-  for (auto &extra_data_io : extra_data_ios) {
-    data_ios.push_back(&extra_data_io);
-  }
-
-  uint64_t candidate_index = 0;
-  uint64_t line_no = 0;
-  std::string line;
-  while (std::getline(input, line)) {
-    ++line_no;
-
-    std::string trimmed = trim_whitespace(line);
-    if (trimmed.empty()) {
-      continue;
-    }
-
-    auto ino_val = ceph::parse<uint64_t>(trimmed);
-    if (!ino_val) {
-      std::cerr << "Invalid inode entry on line " << line_no
-                << ": expected unsigned integer inode" << std::endl;
-      return -EINVAL;
-    }
-    inodeno_t ino(*ino_val);
-
-    if ((candidate_index % m) == n) {
-      dout(10) << "selected inode entry line=" << line_no
-               << " ino=0x" << std::hex
-               << static_cast<uint64_t>(ino) << std::dec
-               << " candidate_index=" << candidate_index
-               << " worker=" << n << "/" << m << dendl;
-
-      int r = scan_extent_for_inode(ino, data_ios);
-      if (r < 0) {
-        std::cerr << "Failed targeted extent scan for inode 0x" << std::hex
-                  << static_cast<uint64_t>(ino) << std::dec << ": "
-                  << cpp_strerror(r) << std::endl;
-        return r;
-      }
-    }
-
-    ++candidate_index;
-  }
-
-  return 0;
-}
-
-int DataScan::scan_inodes_for_damage_file() {
-  bool roots_present;
-  int r = driver->check_roots(&roots_present);
-  if (r != 0) {
-    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
-         << dendl;
-    return r;
-  }
-
-  if (!roots_present) {
-    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
-                 "one node before running 'scan_inodes'"
-              << std::endl;
-    return -EIO;
-  }
-
+int DataScan::for_entry_in_damage_file(std::function<int(uint64_t)> handler) {
   std::ifstream input(damage_file_path);
   if (!input.is_open()) {
     int err = errno ? -errno : -ENOENT;
@@ -1389,7 +1203,7 @@ int DataScan::scan_inodes_for_damage_file() {
     }
 
     std::string damage_type;
-    unsigned long long ino = 0;
+    uint64_t ino = 0;
     try {
       JSONDecoder::decode_json("damage_type", damage_type, &parser, true);
       JSONDecoder::decode_json("ino", ino, &parser, true);
@@ -1421,26 +1235,23 @@ int DataScan::scan_inodes_for_damage_file() {
       return -EINVAL;
     }
 
-    bool type_matched = damage_type_all;
-    if (!damage_type_all) {
+    bool type_matched = damage_type_tokens.empty();
+    if (!damage_type_tokens.empty()) {
       type_matched =
-          std::find(damage_type_tokens.begin(), damage_type_tokens.end(),
-                    damage_type) != damage_type_tokens.end();
+          damage_type_tokens.find(damage_type) != damage_type_tokens.end();
     }
     if (!type_matched) {
       continue;
     }
 
-    inodeno_t selected_ino = static_cast<inodeno_t>(ino);
     if ((candidate_index % m) == n) {
       dout(10) << "selected damage entry line=" << line_no << " damage_type='"
                << damage_type << "'"
                << " ino=0x" << std::hex << ino << std::dec
                << " candidate_index=" << candidate_index << " worker=" << n
                << "/" << m << dendl;
-      const std::string oid = format_extent_oid(selected_ino, 0);
-      r = scan_inode_from_oid(oid, selected_ino, 0,
-                              force_restore_all_ancestors);
+
+      int r = handler(ino);
       if (r < 0) {
         return r;
       }
@@ -1448,26 +1259,38 @@ int DataScan::scan_inodes_for_damage_file() {
 
     ++candidate_index;
   }
-
   return 0;
 }
 
-int DataScan::scan_inodes_for_inode_file() {
-  bool roots_present;
-  int r = driver->check_roots(&roots_present);
-  if (r != 0) {
-    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
-         << dendl;
-    return r;
+int DataScan::scan_extents_for_damage_file() {
+  if (m == 0) {
+    std::cerr << "Invalid worker count " << m << ": must be > 0" << std::endl;
+    return -EINVAL;
+  }
+  if (n >= m) {
+    std::cerr << "Invalid worker number " << n << ": must be in range [0, "
+              << (m - 1) << "]" << std::endl;
+    return -EINVAL;
   }
 
-  if (!roots_present) {
-    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
-                 "one node before running 'scan_inodes'"
-              << std::endl;
-    return -EIO;
+  std::vector<librados::IoCtx *> data_ios;
+  data_ios.push_back(&data_io);
+  for (auto &extra_data_io : extra_data_ios) {
+    data_ios.push_back(&extra_data_io);
   }
 
+  int r = for_entry_in_damage_file([&](uint64_t ino) -> int {
+    int ret = scan_extent_for_inode(static_cast<inodeno_t>(ino), data_ios);
+    if (ret < 0) {
+      std::cerr << "Failed targeted extent scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  });
+  return r;
+}
+
+int DataScan::for_entry_in_inode_file(std::function<int(uint64_t)> handler) {
   std::ifstream input(inode_file_path);
   if (!input.is_open()) {
     int err = errno ? -errno : -ENOENT;
@@ -1493,16 +1316,15 @@ int DataScan::scan_inodes_for_inode_file() {
                 << ": expected unsigned integer inode" << std::endl;
       return -EINVAL;
     }
+    inodeno_t ino(*ino_val);
 
-    inodeno_t selected_ino(*ino_val);
     if ((candidate_index % m) == n) {
       dout(10) << "selected inode entry line=" << line_no << " ino=0x"
-               << std::hex << static_cast<uint64_t>(selected_ino) << std::dec
+               << std::hex << static_cast<uint64_t>(ino) << std::dec
                << " candidate_index=" << candidate_index << " worker=" << n
                << "/" << m << dendl;
-      const std::string oid = format_extent_oid(selected_ino, 0);
-      r = scan_inode_from_oid(oid, selected_ino, 0,
-                              force_restore_all_ancestors);
+
+      int r = handler(ino);
       if (r < 0) {
         return r;
       }
@@ -1512,6 +1334,94 @@ int DataScan::scan_inodes_for_inode_file() {
   }
 
   return 0;
+}
+
+int DataScan::scan_extents_for_inode_file() {
+  if (m == 0) {
+    std::cerr << "Invalid worker count " << m << ": must be > 0" << std::endl;
+    return -EINVAL;
+  }
+  if (n >= m) {
+    std::cerr << "Invalid worker number " << n << ": must be in range [0, "
+              << (m - 1) << "]" << std::endl;
+    return -EINVAL;
+  }
+
+  std::vector<librados::IoCtx *> data_ios;
+  data_ios.push_back(&data_io);
+  for (auto &extra_data_io : extra_data_ios) {
+    data_ios.push_back(&extra_data_io);
+  }
+
+  int r = for_entry_in_inode_file([&](uint64_t ino) -> int {
+    int ret = scan_extent_for_inode(ino, data_ios);
+    if (ret < 0) {
+      std::cerr << "Failed targeted extent scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  });
+
+  return r;
+}
+
+int DataScan::scan_inodes_for_damage_file() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  r = for_entry_in_damage_file([&](uint64_t ino) -> int {
+    inodeno_t selected_ino = static_cast<inodeno_t>(ino);
+    const std::string oid = format_extent_oid(selected_ino, 0);
+    int ret =
+        scan_inode_from_oid(oid, selected_ino, 0, force_restore_all_ancestors);
+    if (r < 0) {
+      std::cerr << "Failed targeted inode scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(r) << std::endl;
+    }
+    return ret;
+  });
+  return r;
+}
+
+int DataScan::scan_inodes_for_inode_file() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  r = for_entry_in_inode_file([&](uint64_t ino) -> int {
+    const std::string oid = format_extent_oid(ino, 0);
+    int ret = scan_inode_from_oid(oid, ino, 0, force_restore_all_ancestors);
+    if (ret < 0) {
+      std::cerr << "Failed targeted inode scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  });
+
+  return r;
 }
 
 int DataScan::probe_filter(librados::IoCtx &ioctx)

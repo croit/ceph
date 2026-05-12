@@ -249,6 +249,7 @@ class MetadataDriver : public RecoveryDriver, public MetadataTool
     DataScan* dscan;
 };
 
+class AccumulateResult;
 class DataScan : public MDSUtility, public MetadataTool
 {
   protected:
@@ -355,9 +356,7 @@ class DataScan : public MDSUtility, public MetadataTool
     // Parser state for scan_extents damage/inode inputs.
     std::string damage_file_path;
     std::string damage_type_expr;
-    std::vector<std::string> damage_type_tokens;
-    bool damage_type_filter_set;
-    bool damage_type_all;
+    std::set<std::string> damage_type_tokens;
     std::string inode_file_path;
     uint64_t extent_period;
     bool extent_period_set;
@@ -367,7 +366,7 @@ class DataScan : public MDSUtility, public MetadataTool
     bool force_restore_all_ancestors;
 
     int parse_damage_type_expr(const std::string &expr,
-                               std::vector<std::string> *tokens);
+                               std::set<std::string> *tokens);
 
     /**
      * @param r set to error on valid key with invalid value
@@ -398,6 +397,14 @@ class DataScan : public MDSUtility, public MetadataTool
         bool untagged_only,
         std::function<int(std::string, uint64_t, uint64_t)> handler);
 
+    int for_entry_in_damage_file(std::function<int(uint64_t)> handler);
+    int for_entry_in_inode_file(std::function<int(uint64_t)> handler);
+    void update_accumulate_result(AccumulateResult *accum_res,
+                                  const uint64_t obj_index,
+                                  const uint64_t obj_size,
+                                  const int64_t obj_pool_id,
+                                  const time_t mtime);
+
   public:
     static void usage();
     int main(const std::vector<const char *> &args);
@@ -406,8 +413,7 @@ class DataScan : public MDSUtility, public MetadataTool
     DataScan()
         : driver(NULL), fscid(FS_CLUSTER_ID_NONE), data_pool_id(-1), n(0), m(1),
           scan_links_thread_count(1), force_pool(false), force_corrupt(false),
-          force_init(false), damage_type_filter_set(false),
-          damage_type_all(false), extent_period(1), extent_period_set(false),
+          force_init(false), extent_period(1), extent_period_set(false),
           extent_limit(1), extent_limit_set(false),
           force_create_head_inode(false), force_restore_all_ancestors(false) {}
 
