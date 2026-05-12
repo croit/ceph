@@ -5198,7 +5198,6 @@ void CInode::scrub_info_create() const
 {
   dout(25) << __func__ << dendl;
   ceph_assert(!scrub_infop);
-
   // break out of const-land to set up implicit initial state
   CInode *me = const_cast<CInode*>(this);
   const auto& pi = me->get_projected_inode();
@@ -5219,35 +5218,62 @@ void CInode::scrub_maybe_delete_info()
   }
 }
 
-void CInode::scrub_initialize(ScrubHeaderRef& header)
-{
+void CInode::scrub_initialize(ScrubHeaderRef &header,
+                              std::vector<remote_link_info_t> &&remote_links) {
   dout(20) << __func__ << " with scrub_version " << get_version() << dendl;
 
   scrub_info();
   scrub_infop->scrub_in_progress = true;
   scrub_infop->queued_frags.clear();
   scrub_infop->header = header;
+  if (!remote_links.empty()) {
+    scrub_infop->remote_links.swap(remote_links);
+    scrub_infop->forward_scrub = false;
+  }
   header->inc_num_pending();
   // right now we don't handle remote inodes
+}
+
+bool CInode::maybe_update_scrub_in_progress(
+    std::vector<remote_link_info_t> &&remote_links) {
+  bool ret = false;
+  if (scrub_is_in_progress()) {
+    if (!remote_links.empty()) {
+      for (auto& p : remote_links) {
+	scrub_infop->remote_links.emplace_back(std::move(p));
+      }
+      //leaving forward mode as-is
+    } else {
+      scrub_infop->forward_scrub = true; //[re-]request forward mode, it's fine if it's already been requested
+    }
+    ret = true;
+  }
+  return ret;
+}
+
+std::vector<CInode::remote_link_info_t> &&CInode::scrub_move_remote_links() {
+  return std::move(scrub_infop->remote_links);
 }
 
 void CInode::scrub_aborted() {
   dout(20) << __func__ << dendl;
   ceph_assert(scrub_is_in_progress());
-
   scrub_infop->scrub_in_progress = false;
   scrub_infop->header->dec_num_pending();
+  scrub_infop->remote_links.clear();
+  scrub_infop->forward_scrub = true;
   scrub_maybe_delete_info();
 }
 
 void CInode::scrub_finished() {
   dout(20) << __func__ << dendl;
   ceph_assert(scrub_is_in_progress());
-
   scrub_infop->last_scrub_version = get_version();
   scrub_infop->last_scrub_stamp = ceph_clock_now();
   scrub_infop->last_scrub_dirty = true;
   scrub_infop->scrub_in_progress = false;
+  scrub_infop->remote_links.clear();
+  scrub_infop->forward_scrub = true;
   scrub_infop->header->dec_num_pending();
 }
 

@@ -122,6 +122,48 @@ static int accumulate_inode_metadata(cls_method_context_t hctx,
   return 0;
 }
 
+static int set_accumulated_inode_metadata(cls_method_context_t hctx,
+                                          bufferlist *in, bufferlist *out) {
+  ceph_assert(in != NULL);
+  ceph_assert(out != NULL);
+
+  auto q = in->cbegin();
+  SetAccumulatedArgs args;
+  try {
+    args.decode(q);
+  } catch (const ceph::buffer::error &err) {
+    return -EINVAL;
+  }
+
+  int r = 0;
+  ObjCeiling ceiling(args.ceiling_obj_index, args.ceiling_obj_size);
+  r = set_if_greater(hctx, args.obj_xattr_name, ceiling);
+  if (r < 0) {
+    return r;
+  }
+
+  r = set_if_greater(hctx, args.mtime_xattr_name, args.max_mtime);
+  if (r < 0) {
+    return r;
+  }
+
+  r = set_if_greater(hctx, args.obj_size_xattr_name, args.max_obj_size);
+  if (r < 0) {
+    return r;
+  }
+
+  if (args.has_pool_id) {
+    bufferlist pool_id_bl;
+    encode(args.obj_pool_id, pool_id_bl);
+    r = cls_cxx_setxattr(hctx, args.pool_id_xattr_name.c_str(), &pool_id_bl);
+    if (r < 0) {
+      return r;
+    }
+  }
+
+  return 0;
+}
+
 // I want to select objects that have a name ending 00000000
 // and an xattr (scrub_tag) not equal to a specific value.
 // This is so special case that we can't really pretend it's
@@ -129,8 +171,9 @@ static int accumulate_inode_metadata(cls_method_context_t hctx,
 class PGLSCephFSFilter : public PGLSFilter {
 protected:
   std::string scrub_tag;
+
 public:
-  int init(bufferlist::const_iterator& params) override {
+  int init(bufferlist::const_iterator &params) override {
     try {
       InodeTagFilterArgs args;
       args.decode(params);
@@ -202,13 +245,16 @@ CLS_INIT(cephfs)
 
   cls_handle_t h_class;
   cls_method_handle_t h_accumulate_inode_metadata;
+  cls_method_handle_t h_set_accumulated_inode_metadata;
 
   cls_register("cephfs", &h_class);
-  cls_register_cxx_method(h_class, "accumulate_inode_metadata",
-			  CLS_METHOD_WR | CLS_METHOD_RD,
-			  accumulate_inode_metadata, &h_accumulate_inode_metadata);
+  cls_register_cxx_method(
+      h_class, "accumulate_inode_metadata", CLS_METHOD_WR | CLS_METHOD_RD,
+      accumulate_inode_metadata, &h_accumulate_inode_metadata);
+  cls_register_cxx_method(
+      h_class, "set_accumulated_inode_metadata", CLS_METHOD_WR | CLS_METHOD_RD,
+      set_accumulated_inode_metadata, &h_set_accumulated_inode_metadata);
 
   // A PGLS filter
   cls_register_cxx_filter(h_class, "inode_tag", inode_tag_filter);
 }
-

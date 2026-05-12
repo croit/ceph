@@ -18,6 +18,10 @@ class ClsCephFSClient
       const int64_t obj_pool_id,
       const time_t mtime);
 
+  static int flush_inode_accumulate_result(librados::IoCtx &ctx,
+                                            inodeno_t inode_no,
+                                            const AccumulateResult &accum_res);
+
   static int fetch_inode_accumulate_result(
       librados::IoCtx &ctx,
       const std::string &oid,

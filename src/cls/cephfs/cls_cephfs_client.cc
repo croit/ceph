@@ -62,6 +62,24 @@ int ClsCephFSClient::accumulate_inode_metadata(
   return ctx.operate(zeroth_object.name, &op);
 }
 
+int ClsCephFSClient::flush_inode_accumulate_result(
+    librados::IoCtx &ctx, inodeno_t inode_no,
+    const AccumulateResult &accum_res) {
+  object_t zeroth_object = InodeStore::get_object_name(inode_no, frag_t(), "");
+
+  SetAccumulatedArgs args(accum_res.ceiling_obj_index,
+                          accum_res.ceiling_obj_size, accum_res.max_obj_size,
+                          accum_res.max_mtime, accum_res.obj_pool_id != -1,
+                          accum_res.obj_pool_id, XATTR_CEILING, XATTR_MAX_MTIME,
+                          XATTR_MAX_SIZE, XATTR_POOL_ID);
+  librados::ObjectWriteOperation op;
+  bufferlist inbl;
+  args.encode(inbl);
+  op.exec("cephfs", "set_accumulated_inode_metadata", inbl);
+
+  return ctx.operate(zeroth_object.name, &op);
+}
+
 int ClsCephFSClient::delete_inode_accumulate_result(
     librados::IoCtx &ctx,
     const std::string &oid)

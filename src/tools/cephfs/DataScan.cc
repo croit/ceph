@@ -12,12 +12,26 @@
  *
  */
 
-#include "include/compat.h"
-#include "common/errno.h"
 #include "common/ceph_argparse.h"
-#include <fstream>
-#include "include/util.h"
+#include "common/ceph_json.h"
+#include "common/errno.h"
+#include "common/strtol.h"
 #include "include/ceph_fs.h"
+#include "include/compat.h"
+#include "include/util.h"
+#include "json_spirit/json_spirit_error_position.h"
+#include "json_spirit/json_spirit_reader.h"
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <condition_variable>
+#include <fstream>
+#include <functional>
+#include <limits>
+#include <mutex>
+#include <queue>
+#include <sstream>
+#include <thread>
 
 #include "mds/CDentry.h"
 #include "mds/CInode.h"
@@ -37,38 +51,201 @@
 
 using namespace std;
 
-void DataScan::usage()
+namespace {
+
+class DataScanThreadPool {
+public:
+  explicit DataScanThreadPool(size_t worker_count) {
+    worker_count = std::max<size_t>(worker_count, 1);
+    workers.reserve(worker_count);
+    max_queue_size = worker_count * 10;
+    for (size_t i = 0; i < worker_count; ++i) {
+      workers.emplace_back([this]() { worker_entry(); });
+    }
+  }
+
+  ~DataScanThreadPool() { shutdown(); }
+
+  bool submit(std::function<int()> task) {
+    std::unique_lock l(lock);
+    queue_has_space.wait(l, [this]() {
+      return (error < 0 || stopping || !accepting ||
+              tasks.size() < max_queue_size);
+    });
+    if (error < 0 || !accepting || stopping) {
+      return false;
+    }
+    tasks.push(std::move(task));
+    has_work.notify_one();
+    return true;
+  }
+
+  void wait_for_drain() {
+    std::unique_lock l(lock);
+    accepting = false;
+    drained.wait(l, [this]() { return tasks.empty() && running_tasks == 0; });
+    queue_has_space.notify_all();
+  }
+
+  void shutdown() {
+    {
+      std::lock_guard l(lock);
+      if (stopping) {
+        return;
+      }
+      accepting = false;
+      stopping = true;
+    }
+    queue_has_space.notify_all();
+    has_work.notify_all();
+    for (auto &worker : workers) {
+      if (worker.joinable()) {
+        worker.join();
+      }
+    }
+    workers.clear();
+  }
+  
+  int get_error() {
+    return error.load(std::memory_order_relaxed);
+  }
+
+private:
+  void worker_entry() {
+    while (true) {
+      std::function<int()> task;
+      bool do_run = true;
+      int r = 0;
+      {
+        std::unique_lock l(lock);
+        has_work.wait(
+            l, [this]() { return stopping || !tasks.empty(); });
+        if (stopping && tasks.empty()) {
+          return;
+        }
+        task = std::move(tasks.front());
+        tasks.pop();
+        queue_has_space.notify_one();
+        ++running_tasks;
+        do_run = (error == 0);
+      }
+      if (do_run) {
+        r = task();
+      }
+
+      {
+        std::lock_guard l(lock);
+        if (r < 0 && error == 0) {
+          error = r;
+        }
+        --running_tasks;
+        if (!accepting && tasks.empty() && running_tasks == 0) {
+          drained.notify_all();
+        }
+      }
+    }
+  }
+
+  std::mutex lock;
+  std::condition_variable has_work;
+  std::condition_variable drained;
+  std::condition_variable queue_has_space;
+  std::queue<std::function<int()>> tasks;
+  std::vector<std::thread> workers;
+  size_t max_queue_size = 1;
+  bool accepting = true;
+  bool stopping = false;
+  size_t running_tasks = 0;
+  std::atomic<int> error = 0;
+};
+
+std::string trim_whitespace(const std::string &value)
 {
-  std::cout << "Usage: \n"
-    << "  cephfs-data-scan init [--force-init]\n"
-    << "  cephfs-data-scan scan_extents [--force-pool] [--worker_n N --worker_m M] [<data pool name> [<extra data pool name> ...]]\n"
-    << "  cephfs-data-scan scan_inodes [--force-pool] [--force-corrupt] [--worker_n N --worker_m M] [<data pool name>]\n"
-    << "  cephfs-data-scan pg_files <path> <pg id> [<pg id>...]\n"
-    << "  cephfs-data-scan scan_links\n"
-    << "\n"
-    << "    --force-corrupt: overrite apparently corrupt structures\n"
-    << "    --force-init: write root inodes even if they exist\n"
-    << "    --force-pool: use data pool even if it is not in FSMap\n"
-    << "    --worker_m: Maximum number of workers\n"
-    << "    --worker_n: Worker number, range 0-(worker_m-1)\n"
-    << "\n"
-    << "  cephfs-data-scan scan_frags [--force-corrupt]\n"
-    << "  cephfs-data-scan cleanup [<data pool name>]\n"
-    << std::endl;
+  static constexpr char whitespace[] = " \t\n\r\f\v";
+  size_t start = value.find_first_not_of(whitespace);
+  if (start == std::string::npos) {
+    return std::string();
+  }
+  size_t end = value.find_last_not_of(whitespace);
+  return value.substr(start, end - start + 1);
+}
+
+std::string describe_json_parse_error(const std::string &json_line)
+{
+  json_spirit::Value parsed;
+  try {
+    json_spirit::read_or_throw(json_line, parsed);
+  } catch (const json_spirit::Error_position &e) {
+    std::ostringstream oss;
+    oss << e.reason_ << " at column " << e.column_;
+    return oss.str();
+  } catch (const std::string &e) {
+    return e;
+  } catch (const std::exception &e) {
+    return e.what();
+  }
+
+  return "invalid JSON syntax";
+}
+
+}
+
+void DataScan::usage() {
+  std::cout
+      << "Usage: \n"
+      << "  cephfs-data-scan init [--force-init]\n"
+      << "  cephfs-data-scan scan_extents [--force-pool] "
+         "[--force-create-head-inode] [--worker_n N "
+         "--worker_m M] [--damage-file PATH] [--type 'TYPE|TYPE'] "
+         "[--inode-file PATH] [--extent-period N] [--extent-limit N] "
+         "[<data pool name> [<extra data pool "
+         "name> ...]]\n"
+      << "  cephfs-data-scan scan_inodes [--force-pool] [--force-corrupt] "
+         "[--force-restore-all-ancestors] "
+         "[--worker_n N --worker_m M] [--damage-file PATH] "
+         "[--type 'TYPE|TYPE'] [--inode-file PATH] [<data pool name>]\n"
+      << "  cephfs-data-scan pg_files <path> <pg id> [<pg id>...]\n"
+      << "  cephfs-data-scan scan_links [--thread-count N]\n"
+      << "\n"
+      << "    --force-corrupt: overrite apparently corrupt structures\n"
+      << "    --force-init: write root inodes even if they exist\n"
+      << "    --force-pool: use data pool even if it is not in FSMap\n"
+      << "    --worker_m: Maximum number of workers\n"
+      << "    --worker_n: Worker number, range 0-(worker_m-1)\n"
+      << "    --thread-count: Number of scan_links worker threads\n"
+      << "    --force-create-head-inode: force flushing inode 0th object in "
+         "targeted scan_extents even when no extents are found\n"
+      << "    --force-restore-all-ancestors: force restoring all ancestor "
+         "dirfrags during targeted scan_inodes\n"
+      << "      with targeted scan_inodes (--damage-file/--inode-file), "
+         "requires single worker (--worker_n 0 --worker_m 1)\n"
+      << "\n"
+      << "  cephfs-data-scan scan_frags [--force-corrupt]\n"
+      << "  cephfs-data-scan cleanup [<data pool name>]\n"
+      << std::endl;
 
   generic_client_usage();
 }
 
 bool DataScan::parse_kwarg(
+    const std::string &command,
     const std::vector<const char*> &args,
     std::vector<const char *>::const_iterator &i,
     int *r)
 {
+  const std::string arg(*i);
+
   if (i + 1 == args.end()) {
+    if (arg == std::string("--damage-file") || arg == std::string("--type") ||
+        arg == std::string("--inode-file") ||
+        arg == std::string("--extent-period") ||
+        arg == std::string("--extent-limit")) {
+      std::cerr << "Missing value for '" << arg << "'" << std::endl;
+      *r = -EINVAL;
+    }
     return false;
   }
 
-  const std::string arg(*i);
   const std::string val(*(i + 1));
 
   if (arg == std::string("--output-dir")) {
@@ -81,26 +258,139 @@ bool DataScan::parse_kwarg(
     driver = new LocalFileDriver(val, data_io);
     return true;
   } else if (arg == std::string("--worker_n")) {
+    if (command == "scan_links") {
+      std::cerr << "Option '--worker_n' is invalid with scan_links; "
+                   "use '--thread-count'"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
     std::string err;
-    n = strict_strtoll(val.c_str(), 10, &err);
-    if (!err.empty()) {
+    int64_t worker_n = strict_strtoll(val.c_str(), 10, &err);
+    if (!err.empty() || worker_n < 0 ||
+        worker_n > std::numeric_limits<uint32_t>::max()) {
       std::cerr << "Invalid worker number '" << val << "'" << std::endl;
       *r = -EINVAL;
       return false;
     }
+    n = static_cast<uint32_t>(worker_n);
     return true;
   } else if (arg == std::string("--worker_m")) {
+    if (command == "scan_links") {
+      std::cerr << "Option '--worker_m' is invalid with scan_links; "
+                   "use '--thread-count'"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
     std::string err;
-    m = strict_strtoll(val.c_str(), 10, &err);
-    if (!err.empty()) {
+    int64_t worker_m = strict_strtoll(val.c_str(), 10, &err);
+    if (!err.empty() || worker_m <= 0 ||
+        worker_m > std::numeric_limits<uint32_t>::max()) {
       std::cerr << "Invalid worker count '" << val << "'" << std::endl;
       *r = -EINVAL;
       return false;
     }
+    m = static_cast<uint32_t>(worker_m);
+    return true;
+  } else if (arg == std::string("--thread-count")) {
+    if (command != "scan_links") {
+      std::cerr << "Option '--thread-count' is only valid with scan_links"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    std::string err;
+    int64_t thread_count = strict_strtoll(val.c_str(), 10, &err);
+    if (!err.empty() || thread_count <= 0 ||
+        thread_count > std::numeric_limits<uint32_t>::max()) {
+      std::cerr << "Invalid thread count '" << val << "'" << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+    scan_links_thread_count = static_cast<uint32_t>(thread_count);
     return true;
   } else if (arg == std::string("--filter-tag")) {
     filter_tag = val;
     dout(10) << "Applying tag filter: '" << filter_tag << "'" << dendl;
+    return true;
+  } else if (arg == std::string("--damage-file")) {
+    if (command != "scan_extents" && command != "scan_inodes") {
+      std::cerr << "Option '--damage-file' is only valid with scan_extents "
+                   "or scan_inodes"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+    damage_file_path = val;
+    return true;
+  } else if (arg == std::string("--type")) {
+    if (command != "scan_extents" && command != "scan_inodes") {
+      std::cerr << "Option '--type' is only valid with scan_extents or "
+                   "scan_inodes"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    std::set<std::string> tokens;
+    *r = parse_damage_type_expr(val, &tokens);
+    if (*r < 0) {
+      return false;
+    }
+    damage_type_expr = val;
+    damage_type_tokens = tokens;
+    return true;
+  } else if (arg == std::string("--inode-file")) {
+    if (command != "scan_extents" && command != "scan_inodes") {
+      std::cerr << "Option '--inode-file' is only valid with scan_extents "
+                   "or scan_inodes"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+    inode_file_path = val;
+    return true;
+  } else if (arg == std::string("--extent-period")) {
+    if (command != "scan_extents") {
+      std::cerr << "Option '--extent-period' is only valid with scan_extents"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    auto parsed_period = ceph::parse<uint64_t>(val);
+    if (!parsed_period || *parsed_period == 0) {
+      std::cerr << "Invalid extent period '" << val << "': must be >= 1"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    extent_period = *parsed_period;
+    extent_period_set = true;
+    return true;
+  } else if (arg == std::string("--extent-limit")) {
+    if (command != "scan_extents") {
+      std::cerr << "Option '--extent-limit' is only valid with scan_extents"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    auto parsed_limit = ceph::parse<uint64_t>(val);
+    if (!parsed_limit || *parsed_limit == 0) {
+      std::cerr << "Invalid extent limit '" << val << "': must be >= 1"
+                << std::endl;
+      *r = -EINVAL;
+      return false;
+    }
+
+    extent_limit = *parsed_limit;
+    extent_limit_set = true;
     return true;
   } else if (arg == std::string("--filesystem")) {
     std::shared_ptr<const Filesystem> fs;
@@ -119,6 +409,41 @@ bool DataScan::parse_kwarg(
   }
 }
 
+int DataScan::parse_damage_type_expr(const std::string &expr,
+                                     std::set<std::string> *tokens) {
+  tokens->clear();
+  std::string trimmed_expr = trim_whitespace(expr);
+  if (trimmed_expr.empty()) {
+    std::cerr << "Invalid --type expression: empty value" << std::endl;
+    return -EINVAL;
+  }
+
+  std::set<std::string> seen;
+  size_t start = 0;
+  while (start <= expr.size()) {
+    size_t sep = expr.find('|', start);
+    std::string raw = sep == std::string::npos
+      ? expr.substr(start)
+      : expr.substr(start, sep - start);
+    std::string token = trim_whitespace(raw);
+    if (token.empty()) {
+      std::cerr << "Invalid --type expression '" << expr
+                << "': empty token around '|'" << std::endl;
+      return -EINVAL;
+    }
+    if (seen.insert(token).second) {
+      tokens->insert(token);
+    }
+
+    if (sep == std::string::npos) {
+      break;
+    }
+    start = sep + 1;
+  }
+
+  return 0;
+}
+
 bool DataScan::parse_arg(
     const std::vector<const char*> &args,
     std::vector<const char *>::const_iterator &i)
@@ -132,6 +457,12 @@ bool DataScan::parse_arg(
     return true;
   } else if (arg == "--force-init") {
     force_init = true;
+    return true;
+  } else if (arg == "--force-create-head-inode") {
+    force_create_head_inode = true;
+    return true;
+  } else if (arg == "--force-restore-all-ancestors") {
+    force_restore_all_ancestors = true;
     return true;
   } else {
     return false;
@@ -166,7 +497,7 @@ int DataScan::main(const std::vector<const char*> &args)
   // Consume any known --key val or --flag arguments
   for (std::vector<const char *>::const_iterator i = args.begin() + 1;
        i != args.end(); ++i) {
-    if (parse_kwarg(args, i, &r)) {
+    if (parse_kwarg(command, args, i, &r)) {
       // Skip the kwarg value field
       ++i;
       continue;
@@ -219,6 +550,98 @@ int DataScan::main(const std::vector<const char*> &args)
     return -EINVAL;
   }
 
+  if (command != "scan_extents" && command != "scan_inodes") {
+    if (!damage_file_path.empty()) {
+      std::cerr << "Option '--damage-file' is only valid with scan_extents "
+                   "or scan_inodes"
+                << std::endl;
+      return -EINVAL;
+    }
+    if (damage_type_tokens.size()) {
+      std::cerr << "Option '--type' is only valid with scan_extents or "
+                   "scan_inodes"
+                << std::endl;
+      return -EINVAL;
+    }
+    if (!inode_file_path.empty()) {
+      std::cerr << "Option '--inode-file' is only valid with scan_extents "
+                   "or scan_inodes"
+                << std::endl;
+      return -EINVAL;
+    }
+  }
+
+  if (command != "scan_extents") {
+    if (extent_period_set) {
+      std::cerr << "Option '--extent-period' is only valid with scan_extents"
+                << std::endl;
+      return -EINVAL;
+    }
+    if (extent_limit_set) {
+      std::cerr << "Option '--extent-limit' is only valid with scan_extents"
+                << std::endl;
+      return -EINVAL;
+    }
+    if (force_create_head_inode) {
+      std::cerr << "Option '--force-create-head-inode' is only valid with "
+                   "scan_extents"
+                << std::endl;
+      return -EINVAL;
+    }
+  }
+
+  if (command != "scan_inodes") {
+    if (force_restore_all_ancestors) {
+      std::cerr << "Option '--force-restore-all-ancestors' is only valid with "
+                   "scan_inodes"
+                << std::endl;
+      return -EINVAL;
+    }
+  }
+
+  if (command == "scan_extents" && (extent_period_set || extent_limit_set) &&
+      damage_file_path.empty() && inode_file_path.empty()) {
+    std::cerr << "Options '--extent-period'/'--extent-limit' require "
+                 "'--damage-file' or "
+                 "'--inode-file'"
+              << std::endl;
+    return -EINVAL;
+  }
+
+  if ((command == "scan_extents" || command == "scan_inodes") &&
+      damage_type_tokens.size() && damage_file_path.empty()) {
+    std::cerr << "Option '--type' requires '--damage-file'" << std::endl;
+    return -EINVAL;
+  }
+
+  if (command == "scan_extents" && force_create_head_inode &&
+      damage_file_path.empty() && inode_file_path.empty()) {
+    std::cerr << "Option '--force-create-head-inode' requires '--damage-file' "
+                 "or '--inode-file'"
+              << std::endl;
+    return -EINVAL;
+  }
+
+  if (command == "scan_inodes" && force_restore_all_ancestors &&
+      damage_file_path.empty() && inode_file_path.empty()) {
+    std::cerr << "Option '--force-restore-all-ancestors' requires "
+                 "'--damage-file' or '--inode-file'"
+              << std::endl;
+    return -EINVAL;
+  }
+
+  const bool targeted_scan_inodes =
+      command == "scan_inodes" &&
+      (!damage_file_path.empty() || !inode_file_path.empty());
+  if (targeted_scan_inodes && force_restore_all_ancestors &&
+      (m != 1 || n != 0)) {
+    std::cerr << "Targeted 'scan_inodes' with "
+                 "'--force-restore-all-ancestors' requires single worker "
+                 "('--worker_n 0 --worker_m 1')"
+              << std::endl;
+    return -EINVAL;
+  }
+
   // If caller didn't specify a namespace, try to pick
   // one if only one exists
   if (fscid == FS_CLUSTER_ID_NONE) {
@@ -234,7 +657,7 @@ int DataScan::main(const std::vector<const char*> &args)
 
   // Default to output to metadata pool
   if (driver == NULL) {
-    driver = new MetadataDriver();
+    driver = new MetadataDriver(this);
     driver->set_force_corrupt(force_corrupt);
     driver->set_force_init(force_init);
     dout(4) << "Using metadata pool output" << dendl;
@@ -354,7 +777,8 @@ int DataScan::main(const std::vector<const char*> &args)
   }
 
   // Initialize metadata_io from MDSMap for scan_frags
-  if (command == "scan_frags" || command == "scan_links") {
+  if (command == "scan_frags" || command == "scan_links" ||
+      command == "scan_inodes") {
     const auto fs = fsmap->get_filesystem(fscid);
     if (fs == nullptr) {
       std::cerr << "Filesystem id " << fscid << " does not exist" << std::endl;
@@ -366,7 +790,7 @@ int DataScan::main(const std::vector<const char*> &args)
     int r = rados.pool_reverse_lookup(metadata_pool_id, &metadata_pool_name);
     if (r < 0) {
       std::cerr << "Pool " << metadata_pool_id
-        << " identified in MDS map not found in RADOS!" << std::endl;
+                << " identified in MDS map not found in RADOS!" << std::endl;
       return r;
     }
 
@@ -380,8 +804,20 @@ int DataScan::main(const std::vector<const char*> &args)
 
   // Finally, dispatch command
   if (command == "scan_inodes") {
+    if (!damage_file_path.empty()) {
+      return scan_inodes_for_damage_file();
+    }
+    if (!inode_file_path.empty()) {
+      return scan_inodes_for_inode_file();
+    }
     return scan_inodes();
   } else if (command == "scan_extents") {
+    if (!damage_file_path.empty()) {
+      return scan_extents_for_damage_file();
+    }
+    if (!inode_file_path.empty()) {
+      return scan_extents_for_inode_file();
+    }
     return scan_extents();
   } else if (command == "scan_frags") {
     return scan_frags();
@@ -568,6 +1004,111 @@ int parse_oid(const std::string &oid, uint64_t *inode_no, uint64_t *obj_id)
   return 0;
 }
 
+std::string format_extent_oid(inodeno_t ino, uint64_t extent_id) {
+  char buf[60];
+  snprintf(buf, sizeof(buf), "%llx.%08llx", (long long unsigned)ino,
+           (long long unsigned)extent_id);
+  return std::string(buf);
+}
+
+void DataScan::update_accumulate_result(AccumulateResult *accum_res,
+                                        const uint64_t obj_index,
+                                        const uint64_t obj_size,
+                                        const int64_t obj_pool_id,
+                                        const time_t mtime) {
+  ceph_assert(accum_res != nullptr);
+
+  if (obj_index > accum_res->ceiling_obj_index ||
+      (obj_index == accum_res->ceiling_obj_index &&
+       accum_res->ceiling_obj_size == 0)) {
+    accum_res->ceiling_obj_index = obj_index;
+    accum_res->ceiling_obj_size = obj_size;
+  }
+
+  if (obj_size > accum_res->max_obj_size) {
+    accum_res->max_obj_size = obj_size;
+  }
+
+  if (mtime > accum_res->max_mtime) {
+    accum_res->max_mtime = mtime;
+  }
+
+  if (obj_pool_id != -1) {
+    accum_res->obj_pool_id = obj_pool_id;
+  }
+}
+
+int DataScan::scan_extent_for_inode(
+    inodeno_t ino, const std::vector<librados::IoCtx *> &data_ios) {
+  ceph_assert(!data_ios.empty());
+
+  AccumulateResult accum_res;
+  bool found_extent = false;
+  uint64_t window_start = 0;
+  while (window_start < extent_limit) {
+    bool all_stat_failed = true;
+
+    uint64_t window_end = window_start + extent_period;
+    if (window_end > extent_limit) {
+      window_end = extent_limit;
+    }
+    for (uint64_t extent_id = window_start; extent_id < window_end;
+         ++extent_id) {
+      const std::string oid = format_extent_oid(ino, extent_id);
+
+      for (auto ioctx : data_ios) {
+        uint64_t size = 0;
+        time_t mtime = 0;
+        int r = ioctx->stat(oid, &size, &mtime);
+        if (r != 0) {
+          dout(20) << "Cannot stat '" << oid << "' in pool id "
+                   << ioctx->get_id() << ": " << cpp_strerror(r) << dendl;
+          continue;
+        }
+
+        all_stat_failed = false;
+        int64_t obj_pool_id =
+            data_io.get_id() != ioctx->get_id() ? ioctx->get_id() : -1;
+        update_accumulate_result(&accum_res, extent_id, size, obj_pool_id, mtime);
+        found_extent = true;
+      }
+    }
+
+    if (all_stat_failed) {
+      break;
+    }
+
+    window_start = window_end;
+  }
+
+  if (!found_extent) {
+    dout(10) << "No extents found for inode 0x" << std::hex
+             << static_cast<uint64_t>(ino) << std::dec << dendl;
+    if (!force_create_head_inode) {
+      dout(10) << "Skipping flush for inode 0x" << std::hex
+               << static_cast<uint64_t>(ino) << std::dec
+               << " because no extents were found and "
+                  "--force-create-head-inode is not set"
+               << dendl;
+      return 0;
+    }
+    dout(10) << "Forcing flush for inode 0x" << std::hex
+             << static_cast<uint64_t>(ino) << std::dec
+             << " despite no extents found because "
+                "--force-create-head-inode is set"
+             << dendl;
+  }
+
+  int r =
+      ClsCephFSClient::flush_inode_accumulate_result(data_io, ino, accum_res);
+  if (r < 0) {
+    derr << "Failed to flush accumulated metadata for inode 0x" << std::hex
+         << static_cast<uint64_t>(ino) << std::dec << ": " << cpp_strerror(r)
+         << dendl;
+  }
+
+  return r;
+}
 
 int DataScan::scan_extents()
 {
@@ -629,6 +1170,258 @@ int DataScan::scan_extents()
   }
 
   return 0;
+}
+
+int DataScan::for_entry_in_damage_file(std::function<int(uint64_t)> handler) {
+  std::ifstream input(damage_file_path);
+  if (!input.is_open()) {
+    int err = errno ? -errno : -ENOENT;
+    std::cerr << "Failed to open damage file '" << damage_file_path
+              << "': " << cpp_strerror(err) << std::endl;
+    return err;
+  }
+
+  uint64_t candidate_index = 0;
+  uint64_t line_no = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    ++line_no;
+    if (trim_whitespace(line).empty()) {
+      continue;
+    }
+
+    JSONParser parser;
+    if (!parser.parse(line.c_str(), static_cast<int>(line.size()))) {
+      std::cerr << "Invalid JSON on line " << line_no << ": "
+                << describe_json_parse_error(line) << std::endl;
+      return -EINVAL;
+    }
+    if (!parser.is_object()) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": JSON value must be an object" << std::endl;
+      return -EINVAL;
+    }
+
+    std::string damage_type;
+    uint64_t ino = 0;
+    try {
+      JSONDecoder::decode_json("damage_type", damage_type, &parser, true);
+      JSONDecoder::decode_json("ino", ino, &parser, true);
+    } catch (const JSONDecoder::err &e) {
+      std::cerr << "Invalid damage entry on line " << line_no << ": "
+                << e.what() << std::endl;
+      return -EINVAL;
+    }
+
+    JSONObj *damage_type_obj = parser.find_obj("damage_type");
+    ceph_assert(damage_type_obj != nullptr);
+    if (!damage_type_obj->get_data_val().quoted) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": damage_type must be a string" << std::endl;
+      return -EINVAL;
+    }
+
+    JSONObj *ino_obj = parser.find_obj("ino");
+    ceph_assert(ino_obj != nullptr);
+    if (ino_obj->get_data_val().quoted) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": ino must be a numeric JSON value" << std::endl;
+      return -EINVAL;
+    }
+
+    if (trim_whitespace(damage_type).empty()) {
+      std::cerr << "Invalid damage entry on line " << line_no
+                << ": damage_type must be a non-empty string" << std::endl;
+      return -EINVAL;
+    }
+
+    bool type_matched = damage_type_tokens.empty();
+    if (!damage_type_tokens.empty()) {
+      type_matched =
+          damage_type_tokens.find(damage_type) != damage_type_tokens.end();
+    }
+    if (!type_matched) {
+      continue;
+    }
+
+    if ((candidate_index % m) == n) {
+      dout(10) << "selected damage entry line=" << line_no << " damage_type='"
+               << damage_type << "'"
+               << " ino=0x" << std::hex << ino << std::dec
+               << " candidate_index=" << candidate_index << " worker=" << n
+               << "/" << m << dendl;
+
+      int r = handler(ino);
+      if (r < 0) {
+        return r;
+      }
+    }
+
+    ++candidate_index;
+  }
+  return 0;
+}
+
+int DataScan::scan_extents_for_damage_file() {
+  if (m == 0) {
+    std::cerr << "Invalid worker count " << m << ": must be > 0" << std::endl;
+    return -EINVAL;
+  }
+  if (n >= m) {
+    std::cerr << "Invalid worker number " << n << ": must be in range [0, "
+              << (m - 1) << "]" << std::endl;
+    return -EINVAL;
+  }
+
+  std::vector<librados::IoCtx *> data_ios;
+  data_ios.push_back(&data_io);
+  for (auto &extra_data_io : extra_data_ios) {
+    data_ios.push_back(&extra_data_io);
+  }
+
+  int r = for_entry_in_damage_file([&](uint64_t ino) -> int {
+    int ret = scan_extent_for_inode(static_cast<inodeno_t>(ino), data_ios);
+    if (ret < 0) {
+      std::cerr << "Failed targeted extent scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  });
+  return r;
+}
+
+int DataScan::for_entry_in_inode_file(std::function<int(uint64_t)> handler) {
+  std::ifstream input(inode_file_path);
+  if (!input.is_open()) {
+    int err = errno ? -errno : -ENOENT;
+    std::cerr << "Failed to open inode file '" << inode_file_path
+              << "': " << cpp_strerror(err) << std::endl;
+    return err;
+  }
+
+  uint64_t candidate_index = 0;
+  uint64_t line_no = 0;
+  std::string line;
+  while (std::getline(input, line)) {
+    ++line_no;
+
+    std::string trimmed = trim_whitespace(line);
+    if (trimmed.empty()) {
+      continue;
+    }
+
+    auto ino_val = ceph::parse<uint64_t>(trimmed);
+    if (!ino_val) {
+      std::cerr << "Invalid inode entry on line " << line_no
+                << ": expected unsigned integer inode" << std::endl;
+      return -EINVAL;
+    }
+    inodeno_t ino(*ino_val);
+
+    if ((candidate_index % m) == n) {
+      dout(10) << "selected inode entry line=" << line_no << " ino=0x"
+               << std::hex << static_cast<uint64_t>(ino) << std::dec
+               << " candidate_index=" << candidate_index << " worker=" << n
+               << "/" << m << dendl;
+
+      int r = handler(ino);
+      if (r < 0) {
+        return r;
+      }
+    }
+
+    ++candidate_index;
+  }
+
+  return 0;
+}
+
+int DataScan::scan_extents_for_inode_file() {
+  if (m == 0) {
+    std::cerr << "Invalid worker count " << m << ": must be > 0" << std::endl;
+    return -EINVAL;
+  }
+  if (n >= m) {
+    std::cerr << "Invalid worker number " << n << ": must be in range [0, "
+              << (m - 1) << "]" << std::endl;
+    return -EINVAL;
+  }
+
+  std::vector<librados::IoCtx *> data_ios;
+  data_ios.push_back(&data_io);
+  for (auto &extra_data_io : extra_data_ios) {
+    data_ios.push_back(&extra_data_io);
+  }
+
+  int r = for_entry_in_inode_file([&](uint64_t ino) -> int {
+    int ret = scan_extent_for_inode(ino, data_ios);
+    if (ret < 0) {
+      std::cerr << "Failed targeted extent scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  });
+
+  return r;
+}
+
+int DataScan::scan_inodes_for_damage_file() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  r = for_entry_in_damage_file([&](uint64_t ino) -> int {
+    inodeno_t selected_ino = static_cast<inodeno_t>(ino);
+    const std::string oid = format_extent_oid(selected_ino, 0);
+    int ret =
+        scan_inode_from_oid(oid, selected_ino, 0, force_restore_all_ancestors);
+    if (r < 0) {
+      std::cerr << "Failed targeted inode scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(r) << std::endl;
+    }
+    return ret;
+  });
+  return r;
+}
+
+int DataScan::scan_inodes_for_inode_file() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  r = for_entry_in_inode_file([&](uint64_t ino) -> int {
+    const std::string oid = format_extent_oid(ino, 0);
+    int ret = scan_inode_from_oid(oid, ino, 0, force_restore_all_ancestors);
+    if (ret < 0) {
+      std::cerr << "Failed targeted inode scan for inode 0x" << std::hex << ino
+                << std::dec << ": " << cpp_strerror(ret) << std::endl;
+    }
+    return ret;
+  });
+
+  return r;
 }
 
 int DataScan::probe_filter(librados::IoCtx &ioctx)
@@ -739,27 +1532,10 @@ int DataScan::forall_objects(
   return r;
 }
 
-int DataScan::scan_inodes()
-{
-  bool roots_present;
-  int r = driver->check_roots(&roots_present);
-  if (r != 0) {
-    derr << "Unexpected error checking roots: '"
-      << cpp_strerror(r) << "'" << dendl;
-    return r;
-  }
+int DataScan::scan_inode_from_oid(const std::string &oid, uint64_t obj_name_ino,
+                                  uint64_t obj_name_offset,
+                                  bool force_restore_ancestors) {
 
-  if (!roots_present) {
-    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
-      "one node before running 'scan_inodes'" << std::endl;
-    return -EIO;
-  }
-
-  return forall_objects(data_io, true, [this](
-        std::string const &oid,
-        uint64_t obj_name_ino,
-        uint64_t obj_name_offset) -> int
-  {
     int r = 0;
 
     dout(10) << "handling object "
@@ -987,7 +1763,8 @@ int DataScan::scan_inodes()
         }
       } else {
         /* Happy case: we will inject a named dentry for this inode */
-        r = driver->inject_with_backtrace(backtrace, dentry);
+        r = driver->inject_with_backtrace(backtrace, dentry,
+                                          force_restore_ancestors);
         if (r < 0) {
           dout(4) << "Error injecting 0x" << std::hex << backtrace.ino
             << std::dec << " with backtrace: " << cpp_strerror(r) << dendl;
@@ -1012,7 +1789,30 @@ int DataScan::scan_inodes()
     }
 
     return r;
-  });
+}
+
+int DataScan::scan_inodes() {
+  bool roots_present;
+  int r = driver->check_roots(&roots_present);
+  if (r != 0) {
+    derr << "Unexpected error checking roots: '" << cpp_strerror(r) << "'"
+         << dendl;
+    return r;
+  }
+
+  if (!roots_present) {
+    std::cerr << "Some or all system inodes are absent.  Run 'init' from "
+                 "one node before running 'scan_inodes'"
+              << std::endl;
+    return -EIO;
+  }
+
+  return forall_objects(data_io, true,
+                        [this](std::string const &oid, uint64_t obj_name_ino,
+                               uint64_t obj_name_offset) -> int {
+                          return scan_inode_from_oid(oid, obj_name_ino,
+                                                     obj_name_offset);
+                        });
 }
 
 int DataScan::cleanup()
@@ -1083,14 +1883,79 @@ int DataScan::scan_links()
   enum {
     SCAN_INOS = 1,
     CHECK_LINK,
+    REMOVE_DUP_DENTRIES,
+    FIX_BAD_NLINK,
+    FIX_INJECTED_DNFIRST,
   };
 
-  for (int step = SCAN_INOS; step <= CHECK_LINK; step++) {
-    const librados::NObjectIterator it_end = metadata_io.nobjects_end();
-    for (auto it = metadata_io.nobjects_begin(); it != it_end; ++it) {
-      const std::string oid = it->get_oid();
+  const size_t phase_workers = std::max<uint32_t>(1, scan_links_thread_count);
 
-      dout(10) << "step " << step << ": handling object " << oid << dendl;
+  auto run_phase = [phase_workers](auto &&schedule, bool use_strand) -> int {
+    std::unique_ptr<DataScanThreadPool> concurrent_runner =
+        std::make_unique<DataScanThreadPool>(phase_workers);
+    std::unique_ptr<DataScanThreadPool> strand_runner = nullptr;
+    if (use_strand) {
+      strand_runner = std::make_unique<DataScanThreadPool>(1);
+    }
+
+    int r = 0;
+    int schedule_r = schedule(concurrent_runner, strand_runner);
+    if (schedule_r < 0) {
+      r = schedule_r;
+    }
+
+    concurrent_runner->wait_for_drain();
+    int con_r = concurrent_runner->get_error();
+    if (r == 0 && con_r < 0) {
+      r = con_r;
+    }
+    if (use_strand)  {
+      strand_runner->wait_for_drain();
+      int str_r = strand_runner->get_error();
+      if (r == 0 && str_r < 0) {
+        r = str_r;
+      }
+    }
+    concurrent_runner->shutdown();
+    if (use_strand) {
+      strand_runner->shutdown();
+    }
+    return r;
+  };
+
+  auto scan_dirfrag_slice = [this, &used_inos, &remote_links,
+                             &dup_primaries, &bad_nlink_inos, &injected_inos,
+                             &to_remove, &snaps, &last_snap,
+                             &snaprealm_v2_since]
+                             (int step, size_t worker_id,
+                              size_t worker_count, 
+                              std::unique_ptr <DataScanThreadPool>& strand_runner) -> int {
+    librados::ObjectCursor range_i;
+    librados::ObjectCursor range_end;
+    metadata_io.object_list_slice(metadata_io.object_list_begin(),
+                                  metadata_io.object_list_end(), worker_id,
+                                  worker_count, &range_i, &range_end);
+
+    const bufferlist filter_bl;
+    bool success = true;
+    while (range_i < range_end && success) {
+      std::vector<librados::ObjectItem> result;
+      int r = metadata_io.object_list(range_i, range_end, 1, filter_bl, &result,
+                                      &range_i);
+      if (r < 0) {
+        derr << "Unexpected error listing objects: " << cpp_strerror(r)
+             << dendl;
+        return r;
+      }
+
+      for (const auto &item : result) {
+        if (!success) {
+          break;
+        }
+        const std::string &oid = item.oid;
+        // std::cout << "phase-->" << step << ", oid-->" << oid << std::endl;
+
+        dout(10) << "step " << step << ": handling object " << oid << dendl;
 
       uint64_t dir_ino = 0;
       uint64_t frag_id = 0;
@@ -1114,12 +1979,18 @@ int DataScan::scan_links()
 	derr << "Error getting omap from '" << oid << "': " << cpp_strerror(r) << dendl;
 	return r;
       }
-
+      auto strand_task = [&used_inos, &remote_links, &dup_primaries,
+                          &bad_nlink_inos, &injected_inos,
+                          &to_remove, &snaps, &last_snap,
+                          &snaprealm_v2_since, step = step,
+                          dir_ino = dir_ino, frag_id = frag_id,
+                          items = std::move(items)]() -> int {
       for (auto& p : items) {
 	auto q = p.second.cbegin();
 	string dname;
 	snapid_t last;
 	dentry_key_t::decode_helper(p.first, dname, last);
+  // std::cout << "phase-->" << step << ", dir_ino-->" << dir_ino << ", dname-->" << dname << std::endl;
 
 	if (last != CEPH_NOSNAP) {
 	  if (last > last_snap)
@@ -1240,7 +2111,54 @@ int DataScan::scan_links()
 	  return -EINVAL;
 	}
       }
+      return 0;
+    };
+    success = strand_runner->submit(strand_task);
     }
+  }
+    return 0;
+  };
+
+  // Phase 1: SCAN_INOS
+  // std::cout << "scan_inos-->" << std::endl;
+  dout(0) << "scanning inode dentries" << dendl;
+  int r = run_phase(
+      [phase_workers, &scan_dirfrag_slice](
+          std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+          std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        for (size_t worker = 0; worker < phase_workers && success; ++worker) {
+          success = concurrent_runner->submit([&, worker]() {
+            return scan_dirfrag_slice(SCAN_INOS, worker, phase_workers,
+                                      strand_runner);
+          });
+        }
+        return 0;
+      },
+      true);
+  if (r < 0) {
+    return r;
+  }
+
+  // Phase 2: CHECK_LINK
+  // std::cout << "scan_links-->" << std::endl;
+  dout(0) << "scanning link dentries" << dendl;
+  r = run_phase(
+      [phase_workers, &scan_dirfrag_slice](
+          std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+          std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        for (size_t worker = 0; worker < phase_workers && success; ++worker) {
+          success = concurrent_runner->submit([&, worker]() {
+            return scan_dirfrag_slice(CHECK_LINK, worker, phase_workers,
+                                      strand_runner);
+          });
+        }
+        return 0;
+      },
+      true);
+  if (r < 0) {
+    return r;
   }
 
   map<unsigned, uint64_t> max_ino_map;
@@ -1281,6 +2199,16 @@ int DataScan::scan_links()
 		 !MDS_INO_IS_STRAY(q.dirino) &&
 		 MDS_INO_IS_STRAY(newest.dirino)) {
 	newest = q;
+      }
+    }
+    auto injected_it = injected_inos.find(p.first);
+    if (injected_it != injected_inos.end()) {
+      if (injected_it->second.dirino != newest.dirino ||
+          injected_it->second.name != newest.name) {
+        dout(10) << "Removing ino=" << p.first
+                 << "from injected_inos as they will be removed anyway"
+                 << dendl;
+        injected_inos.erase(injected_it);
       }
     }
 
@@ -1334,74 +2262,139 @@ int DataScan::scan_links()
     }
   }
 
-  dout(10) << "removing dup dentries from " << to_remove.size() << " objects"
+  dout(0) << "removing dup dentries from " << to_remove.size() << " objects"
 	   << dendl;
+  // std::cout << "remove_dup_dentries-->" << std::endl;
 
-  for (auto& p : to_remove) {
-    object_t frag_oid = InodeStore::get_object_name(p.first.ino, p.first.frag, "");
+  // Phase 3: REMOVE_DUP_DENTRIES
+  r = run_phase(
+      [this, &to_remove](std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+                         std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        // std::cout << "to_remove.size()-->" << to_remove.size() << std::endl;
+        for (auto it = to_remove.begin(); it != to_remove.end() && success;
+             ++it) {
 
-    dout(10) << "removing dup dentries from " << p.first << dendl;
+          auto *p = &(*it);
+          success = concurrent_runner->submit([this, p]() {
+            // std::cout << "to_remove-->" << p->first.ino << ", frag-->"
+            //           << p->first.frag << std::endl;
+            object_t frag_oid =
+                InodeStore::get_object_name(p->first.ino, p->first.frag, "");
 
-    int r = metadata_io.omap_rm_keys(frag_oid.name, p.second);
-    if (r != 0) {
-      derr << "Error removing duplicated dentries from " << p.first << dendl;
-      return r;
-    }
+            dout(10) << "removing dup dentries from " << p->first << dendl;
+
+            int phase_r = metadata_io.omap_rm_keys(frag_oid.name, p->second);
+            if (phase_r != 0) {
+              derr << "Error removing duplicated dentries from " << p->first
+                   << dendl;
+            }
+            return phase_r;
+          });
+        }
+        return 0;
+      },
+      false);
+  if (r < 0) {
+    return r;
   }
   to_remove.clear();
 
-  dout(10) << "processing " << bad_nlink_inos.size() << " bad_nlink_inos"
-	   << dendl;
+  dout(0) << "processing " << bad_nlink_inos.size() << " bad_nlink_inos"
+           << dendl;
 
-  for (auto &p : bad_nlink_inos) {
-    dout(10) << "handling bad_nlink_ino " << p.first << dendl;
+  // Phase 4: FIX_BAD_NLINK
+  // std::cout << "fix_bad_nlink-->" << std::endl;
+  r = run_phase(
+      [this, &bad_nlink_inos,
+       &metadata_driver](std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+                         std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        // std::cout << "bad_nlink_inos.size()-->" << bad_nlink_inos.size() << std::endl;
+        for (auto it = bad_nlink_inos.begin();
+             it != bad_nlink_inos.end() && success; ++it) {
 
-    InodeStore inode;
-    snapid_t first;
-    int r = read_dentry(p.second.dirino, p.second.frag, p.second.name, &inode, &first);
-    if (r < 0) {
-      derr << "Unexpected error reading dentry "
-	   << p.second.dirfrag() << "/" << p.second.name
-	   << ": " << cpp_strerror(r) << dendl;
-      return r;
-    }
+          auto *p = &(*it);
+          success = concurrent_runner->submit([this, &metadata_driver, p]() {
+            // std::cout << "bad_nlink_ino-->" << p->first << std::endl;
+            dout(10) << "handling bad_nlink_ino " << p->first << dendl;
 
-    if (inode.inode->ino != p.first || inode.inode->version != p.second.version)
-      continue;
+            InodeStore inode;
+            snapid_t first;
+            int phase_r = read_dentry(p->second.dirino, p->second.frag,
+                                      p->second.name, &inode, &first);
+            if (phase_r < 0) {
+              derr << "Unexpected error reading dentry " << p->second.dirfrag()
+                   << "/" << p->second.name << ": " << cpp_strerror(phase_r)
+                   << dendl;
+              return phase_r;
+            }
 
-    inode.get_inode()->nlink = p.second.nlink;
-    r = metadata_driver->inject_linkage(p.second.dirino, p.second.name, p.second.frag, inode, first);
-    if (r < 0)
-      return r;
+            if (inode.inode->ino != p->first ||
+                inode.inode->version != p->second.version) {
+              return 0;
+            }
+
+            inode.get_inode()->nlink = p->second.nlink;
+            return metadata_driver->inject_linkage(
+                p->second.dirino, p->second.name, p->second.frag, inode, first);
+          });
+        }
+        return 0;
+      },
+      false);
+  if (r < 0) {
+    return r;
   }
 
-  dout(10) << "processing " << injected_inos.size() << " injected_inos"
+  dout(0) << "processing " << injected_inos.size() << " injected_inos"
 	   << dendl;
 
-  for (auto &p : injected_inos) {
-    dout(10) << "handling injected_ino " << p.first << dendl;
+  // Phase 5: FIX_INJECTED_DNFIRST
+  // std::cout << "fix_injected_dnfirst" << std::endl;
+  r = run_phase(
+      [this, &injected_inos, &metadata_driver,
+       &last_snap](std::unique_ptr<DataScanThreadPool> &concurrent_runner,
+                   std::unique_ptr<DataScanThreadPool> &strand_runner) {
+        bool success = true;
+        // std::cout << "injected_inos.size()-->" << injected_inos.size() << std::endl;
+        for (auto it = injected_inos.begin();
+             it != injected_inos.end() && success; ++it) {
+          auto *p = &(*it);
+          success = concurrent_runner->submit([this, &last_snap,
+                                               &metadata_driver, p]() {
+            // std::cout << "injected_ino-->" << p->first << std::endl;
+            dout(10) << "handling injected_ino " << p->first << dendl;
 
-    InodeStore inode;
-    snapid_t first;
-    dout(20) << " fixing linkage (dnfirst) of " << p.second.dirino << ":" << p.second.name << dendl;
-    int r = read_dentry(p.second.dirino, p.second.frag, p.second.name, &inode, &first);
-    if (r < 0) {
-      derr << "Unexpected error reading dentry "
-	<< p.second.dirfrag() << "/" << p.second.name
-	<< ": " << cpp_strerror(r) << dendl;
-      return r;
-    }
+            InodeStore inode;
+            snapid_t first;
+            dout(20) << " fixing linkage (dnfirst) of " << p->second.dirino
+                     << ":" << p->second.name << dendl;
+            int phase_r = read_dentry(p->second.dirino, p->second.frag,
+                                      p->second.name, &inode, &first);
+            if (phase_r < 0) {
+              derr << "Unexpected error reading dentry " << p->second.dirfrag()
+                   << "/" << p->second.name << ": " << cpp_strerror(phase_r)
+                   << dendl;
+              return 0;
+            }
 
-    if (first != CEPH_NOSNAP) {
-      dout(20) << " ????" << dendl;
-      continue;
-    }
+            if (first != CEPH_NOSNAP) {
+              dout(20) << " ????" << dendl;
+              return 0;
+            }
 
-    first = last_snap + 1;
-    dout(20) << " first is now " << first << dendl;
-    r = metadata_driver->inject_linkage(p.second.dirino, p.second.name, p.second.frag, inode, first);
-    if (r < 0)
-      return r;
+            first = last_snap + 1;
+            dout(20) << " first is now " << first << dendl;
+            return metadata_driver->inject_linkage(
+                p->second.dirino, p->second.name, p->second.frag, inode, first);
+          });
+        }
+        return 0;
+      },
+      false);
+  if (r < 0) {
+    return r;
   }
 
   dout(10) << "updating inotable" << dendl;
@@ -1462,11 +2455,23 @@ int DataScan::scan_frags()
     return -EIO;
   }
 
-  return forall_objects(metadata_io, true, [this](
-        std::string const &oid,
-        uint64_t obj_name_ino,
-        uint64_t obj_name_offset) -> int
-  {
+  return forall_objects(metadata_io, true,
+                        [this](std::string const &oid, uint64_t obj_name_ino,
+                               uint64_t obj_name_offset) -> int {
+                          return scan_frag_from_oid(oid, obj_name_ino,
+                                                    obj_name_offset);
+                        });
+}
+
+int DataScan::scan_frag_from_oid(const std::string &oid, uint64_t obj_name_ino,
+                                 uint64_t obj_name_offset,
+                                 bool force_restore_ancestors,
+                                 std::unordered_set<uint64_t> &&inode_set) {
+  if (force_restore_ancestors &&
+      inode_set.find(obj_name_ino) != inode_set.end()) {
+    derr << "Found cycle while restoring ancestors" << dendl;
+    return -EINVAL;
+  }
     int r = 0;
     r = parse_oid(oid, &obj_name_ino, &obj_name_offset);
     if (r != 0) {
@@ -1578,7 +2583,8 @@ int DataScan::scan_frags()
         }
       } else {
         /* Happy case: we will inject a named dentry for this inode */
-        r = driver->inject_with_backtrace(backtrace, dentry);
+        r = driver->inject_with_backtrace(
+            backtrace, dentry, force_restore_ancestors, std::move(inode_set));
         if (r < 0) {
           dout(4) << "Error injecting 0x" << std::hex << backtrace.ino
             << std::dec << " with backtrace: " << cpp_strerror(r) << dendl;
@@ -1603,7 +2609,6 @@ int DataScan::scan_frags()
     }
 
     return r;
-  });
 }
 
 int MetadataTool::read_fnode(
@@ -1891,11 +2896,9 @@ int MetadataDriver::get_frag_of(
   }
 }
 
-
 int MetadataDriver::inject_with_backtrace(
-    const inode_backtrace_t &backtrace, const InodeStore &dentry)
-    
-{
+    const inode_backtrace_t &backtrace, const InodeStore &dentry,
+    bool force_inject_ancestors, std::unordered_set<uint64_t> &&inode_set) {
 
   // On dirfrags
   // ===========
@@ -1949,6 +2952,10 @@ int MetadataDriver::inject_with_backtrace(
   dout(10) << "  inode: 0x" << std::hex << ino << std::dec << dendl;
   for (std::vector<inode_backpointer_t>::const_iterator i = backtrace.ancestors.begin();
       i != backtrace.ancestors.end(); ++i) {
+    if (force_inject_ancestors && !inode_set.insert(ino).second) {
+      derr << "Found cycle while restoring ancestors" << dendl;
+      return -EINVAL;
+    }
     const inode_backpointer_t &backptr = *i;
     dout(10) << "  backptr: 0x" << std::hex << backptr.dirino << std::dec
       << "/" << backptr.dname << dendl;
@@ -2059,7 +3066,13 @@ int MetadataDriver::inject_with_backtrace(
       // injecting data.  If there are in fact missing ancestors, this
       // should be fixed up using a separate tool scanning the metadata
       // pool.
-      break;
+      if (force_inject_ancestors) {
+        return dscan->scan_frag_from_oid(
+            InodeStore::get_object_name(parent_ino, frag_t(), "").name,
+            parent_ino, 0, force_inject_ancestors, std::move(inode_set));
+      } else {
+        break;
+      }
     } else {
       // Proceed up the backtrace, creating parents
       ino = parent_ino;
@@ -2249,11 +3262,9 @@ int LocalFileDriver::inject_data(
   return 0;
 }
 
-
 int LocalFileDriver::inject_with_backtrace(
-    const inode_backtrace_t &bt,
-    const InodeStore &dentry)
-{
+    const inode_backtrace_t &bt, const InodeStore &dentry,
+    bool force_inject_ancestors, std::unordered_set<uint64_t> &&inode_set) {
   std::string path_builder = path;
 
   // Iterate through backtrace creating directory parents
@@ -2401,4 +3412,3 @@ void MetadataTool::build_dir_dentry(
   inode->uid = g_conf()->mds_root_ino_uid;
   inode->gid = g_conf()->mds_root_ino_gid;
 }
-

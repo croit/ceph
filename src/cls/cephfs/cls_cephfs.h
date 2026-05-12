@@ -108,6 +108,71 @@ public:
   }
 };
 
+class SetAccumulatedArgs {
+public:
+  uint64_t ceiling_obj_index;
+  uint64_t ceiling_obj_size;
+  uint64_t max_obj_size;
+  int64_t max_mtime;
+  bool has_pool_id;
+  int64_t obj_pool_id;
+  std::string obj_xattr_name;
+  std::string mtime_xattr_name;
+  std::string obj_size_xattr_name;
+  std::string pool_id_xattr_name;
+
+  SetAccumulatedArgs(uint64_t ceiling_obj_index_, uint64_t ceiling_obj_size_,
+                    uint64_t max_obj_size_, int64_t max_mtime_,
+                    bool has_pool_id_, int64_t obj_pool_id_,
+                    const std::string &obj_xattr_name_,
+                    const std::string &mtime_xattr_name_,
+                    const std::string &obj_size_xattr_name_,
+                    const std::string &pool_id_xattr_name_)
+      : ceiling_obj_index(ceiling_obj_index_),
+        ceiling_obj_size(ceiling_obj_size_), max_obj_size(max_obj_size_),
+        max_mtime(max_mtime_), has_pool_id(has_pool_id_),
+        obj_pool_id(obj_pool_id_), obj_xattr_name(obj_xattr_name_),
+        mtime_xattr_name(mtime_xattr_name_),
+        obj_size_xattr_name(obj_size_xattr_name_),
+        pool_id_xattr_name(pool_id_xattr_name_) {}
+
+  SetAccumulatedArgs()
+      : ceiling_obj_index(0), ceiling_obj_size(0), max_obj_size(0),
+        max_mtime(0), has_pool_id(false), obj_pool_id(-1) {}
+
+  void encode(ceph::buffer::list &bl) const
+  {
+    ENCODE_START(1, 1, bl);
+    encode(ceiling_obj_index, bl);
+    encode(ceiling_obj_size, bl);
+    encode(max_obj_size, bl);
+    encode(max_mtime, bl);
+    encode(has_pool_id, bl);
+    encode(obj_pool_id, bl);
+    encode(obj_xattr_name, bl);
+    encode(mtime_xattr_name, bl);
+    encode(obj_size_xattr_name, bl);
+    encode(pool_id_xattr_name, bl);
+    ENCODE_FINISH(bl);
+  }
+
+  void decode(ceph::buffer::list::const_iterator &bl)
+  {
+    DECODE_START(1, bl);
+    decode(ceiling_obj_index, bl);
+    decode(ceiling_obj_size, bl);
+    decode(max_obj_size, bl);
+    decode(max_mtime, bl);
+    decode(has_pool_id, bl);
+    decode(obj_pool_id, bl);
+    decode(obj_xattr_name, bl);
+    decode(mtime_xattr_name, bl);
+    decode(obj_size_xattr_name, bl);
+    decode(pool_id_xattr_name, bl);
+    DECODE_FINISH(bl);
+  }
+};
+
 class InodeTagFilterArgs
 {
   public:
@@ -147,4 +212,3 @@ public:
       obj_pool_id(-1), max_mtime(0)
   {}
 };
-

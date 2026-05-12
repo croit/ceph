@@ -64,6 +64,18 @@ public:
   }
   unsigned get_num_pending() const { return num_pending; }
 
+  void inc_scrubbed_inode_count() { ++scrubbed_inode_count; }
+
+  uint64_t get_scrubbed_inode_count() const { return scrubbed_inode_count; }
+
+  void inc_scrubbed_remote_link_count(uint64_t val = 1) {
+    scrubbed_remote_link_count += val;
+  }
+
+  uint64_t get_scrubbed_remote_link_count() const {
+    return scrubbed_remote_link_count;
+  }
+
 protected:
   const std::string tag;
   bool is_tag_internal;
@@ -76,6 +88,8 @@ protected:
   bool repaired = false;  // May be set during scrub if repairs happened
   unsigned epoch_last_forwarded = 0;
   unsigned num_pending = 0;
+  uint64_t scrubbed_inode_count = 0;
+  uint64_t scrubbed_remote_link_count = 0;
 };
 
 typedef std::shared_ptr<ScrubHeader> ScrubHeaderRef;
