@@ -11,6 +11,80 @@ from ..exception import MirrorException
 
 log = logging.getLogger(__name__)
 
+class GlobalDirectoryBalancer:
+    def __init__(self):
+        self.lock = Lock()
+        self.dir_owners = {}  # type: Dict[str, str]
+        self.daemon_dir_counts = {}  # type: Dict[str, int]
+
+    @staticmethod
+    def dir_key(fs_name, dir_path):
+        return f'{fs_name}:{dir_path}'
+
+    def _inc(self, daemon_id):
+        self.daemon_dir_counts[daemon_id] = self.daemon_dir_counts.get(daemon_id, 0) + 1
+
+    def _dec(self, daemon_id):
+        if not daemon_id:
+            return
+        count = self.daemon_dir_counts.get(daemon_id, 0)
+        if count <= 1:
+            self.daemon_dir_counts.pop(daemon_id, None)
+        else:
+            self.daemon_dir_counts[daemon_id] = count - 1
+
+    def register_mapping(self, fs_name, dir_path, daemon_id):
+        if not daemon_id:
+            return
+        with self.lock:
+            self.register_mapping_locked(fs_name, dir_path, daemon_id)
+
+    def register_mapping_locked(self, fs_name, dir_path, daemon_id):
+        key = GlobalDirectoryBalancer.dir_key(fs_name, dir_path)
+        old_daemon_id = self.dir_owners.get(key)
+        if old_daemon_id == daemon_id:
+            return
+        self._dec(old_daemon_id)
+        self.dir_owners[key] = daemon_id
+        self._inc(daemon_id)
+
+    def unregister_mapping(self, fs_name, dir_path):
+        with self.lock:
+            self.unregister_mapping_locked(fs_name, dir_path)
+
+    def unregister_mapping_locked(self, fs_name, dir_path):
+        key = GlobalDirectoryBalancer.dir_key(fs_name, dir_path)
+        old_daemon_id = self.dir_owners.pop(key, None)
+        self._dec(old_daemon_id)
+
+    def choose_instance(self, instance_to_daemon, instance_to_dir_count):
+        with self.lock:
+            return self.choose_instance_locked(instance_to_daemon, instance_to_dir_count)
+
+    def choose_instance_locked(self, instance_to_daemon, instance_to_dir_count):
+        min_instance_id = None
+        min_global_count = None
+        min_local_count = None
+        for instance_id in sorted(instance_to_daemon.keys()):
+            daemon_id = instance_to_daemon[instance_id]
+            global_count = self.daemon_dir_counts.get(daemon_id, 0)
+            local_count = instance_to_dir_count.get(instance_id, 0)
+            if min_instance_id is None or \
+               global_count < min_global_count or \
+               (global_count == min_global_count and local_count < min_local_count):
+                min_instance_id = instance_id
+                min_global_count = global_count
+                min_local_count = local_count
+        return min_instance_id
+
+    def remove_filesystem(self, fs_name):
+        with self.lock:
+            prefix = f'{fs_name}:'
+            for key in list(self.dir_owners.keys()):
+                if key.startswith(prefix):
+                    old_daemon_id = self.dir_owners.pop(key)
+                    self._dec(old_daemon_id)
+
 class DirectoryState:
     def __init__(self, instance_id=None, mapped_time=None):
         self.instance_id = instance_id
@@ -31,11 +105,15 @@ class Policy:
     # to other mirror daemon instances.
     DIR_SHUFFLE_THROTTLE_INTERVAL = 300
 
-    def __init__(self):
+    def __init__(self, fs_name=None, global_dir_balancer=None):
         self.dir_states = {}
         self.instance_to_dir_map = {}
+        self.instance_to_daemon = {}
         self.dead_instances = []
         self.lock = Lock()
+        self.fs_name = fs_name
+        self.global_dir_balancer = global_dir_balancer
+
 
     @staticmethod
     def is_instance_action(action_type):
@@ -83,6 +161,9 @@ class Policy:
                     self.instance_to_dir_map[instance_id].append(dir_path)
                 self.dir_states[dir_path] = DirectoryState(instance_id, dir_map['last_shuffled'])
                 dir_state = self.dir_states[dir_path]
+                if self.global_dir_balancer:
+                    daemon_id = self.instance_to_daemon.get(instance_id, instance_id)
+                    self.global_dir_balancer.register_mapping(self.fs_name, dir_path, daemon_id)
                 state = State.INITIALIZING if instance_id else State.ASSOCIATING
                 purging = dir_map.get('purging', 0)
                 if purging:
@@ -108,34 +189,50 @@ class Policy:
     def map(self, dir_path, dir_state):
         log.debug(f'mapping {dir_path}')
         min_instance_id = None
-        current_instance_id = dir_state.instance_id
-        if current_instance_id and not self.is_dead_instance(current_instance_id):
+        assert self.global_dir_balancer is not None
+        with self.global_dir_balancer.lock:
+            current_instance_id = dir_state.instance_id
+            if current_instance_id and not self.is_dead_instance(current_instance_id):
+                return True
+            if self.is_dead_instance(current_instance_id):
+                self.unmap_locked(dir_path, dir_state)
+            instance_to_daemon = {}
+            instance_to_dir_count = {}
+            for instance_id in self.instance_to_dir_map.keys():
+                if self.is_dead_instance(instance_id):
+                    continue
+                instance_to_daemon[instance_id] = self.instance_to_daemon.get(instance_id, instance_id)
+                instance_to_dir_count[instance_id] = len(self.instance_to_dir_map[instance_id])
+            min_instance_id = self.global_dir_balancer.choose_instance_locked(instance_to_daemon,
+                                                                               instance_to_dir_count)
+            if not min_instance_id:
+                log.debug(f'instance unavailable for {dir_path}')
+                return False
+            log.debug(f'dir_path {dir_path} maps to instance {min_instance_id}')
+            dir_state.instance_id = min_instance_id
+            dir_state.mapped_time = time.time()
+            self.instance_to_dir_map[min_instance_id].append(dir_path)
+            daemon_id = self.instance_to_daemon.get(min_instance_id, min_instance_id)
+            self.global_dir_balancer.register_mapping_locked(self.fs_name, dir_path, daemon_id)
             return True
-        if self.is_dead_instance(current_instance_id):
-            self.unmap(dir_path, dir_state)
-        for instance_id, dir_paths in self.instance_to_dir_map.items():
-            if self.is_dead_instance(instance_id):
-                continue
-            if not min_instance_id or len(dir_paths) < len(self.instance_to_dir_map[min_instance_id]):
-                min_instance_id = instance_id
-        if not min_instance_id:
-            log.debug(f'instance unavailable for {dir_path}')
-            return False
-        log.debug(f'dir_path {dir_path} maps to instance {min_instance_id}')
-        dir_state.instance_id = min_instance_id
-        dir_state.mapped_time = time.time()
-        self.instance_to_dir_map[min_instance_id].append(dir_path)
-        return True
 
-    def unmap(self, dir_path, dir_state):
+    def unmap_locked(self, dir_path, dir_state):
         instance_id = dir_state.instance_id
         log.debug(f'unmapping {dir_path} from instance {instance_id}')
         self.instance_to_dir_map[instance_id].remove(dir_path)
+        if self.global_dir_balancer:
+            self.global_dir_balancer.unregister_mapping_locked(self.fs_name, dir_path)
         dir_state.instance_id = None
         dir_state.mapped_time = None
         if self.is_dead_instance(instance_id) and not self.instance_to_dir_map[instance_id]:
             self.instance_to_dir_map.pop(instance_id)
+            self.instance_to_daemon.pop(instance_id, None)
             self.dead_instances.remove(instance_id)
+
+    def unmap(self, dir_path, dir_state):
+        assert self.global_dir_balancer is not None
+        with self.global_dir_balancer.lock:
+            self.unmap_locked(dir_path, dir_state)
 
     def shuffle(self, dirs_per_instance, include_stalled_dirs):
         log.debug(f'directories per instance: {dirs_per_instance}')
@@ -265,27 +362,40 @@ class Policy:
             log.debug(f'dir_state: {dir_state}')
             return r
 
-    def add_instances_initial(self, instance_ids):
+    def add_instances_initial(self, instances):
         """Take care of figuring out instances which no longer exist
         and remove them. This is to be done only once on startup to
         identify instances which were previously removed but directories
         are still mapped (on-disk) to them.
         """
-        for instance_id in instance_ids:
+        for instance_id, daemon_id in instances.items():
             if not instance_id in self.instance_to_dir_map:
                 self.instance_to_dir_map[instance_id] = []
+            self._update_instance_daemon(instance_id, daemon_id)
         dead_instances = []
         for instance_id, _ in self.instance_to_dir_map.items():
-            if not instance_id in instance_ids:
+            if not instance_id in instances:
                 dead_instances.append(instance_id)
         if dead_instances:
             self._remove_instances(dead_instances)
 
-    def add_instances(self, instance_ids, initial_update=False):
-        log.debug(f'adding instances: {instance_ids} initial_update {initial_update}')
+    def _update_instance_daemon(self, instance_id, daemon_id):
+        old_daemon_id = self.instance_to_daemon.get(instance_id)
+        if old_daemon_id == daemon_id:
+            return
+        self.instance_to_daemon[instance_id] = daemon_id
+        if not old_daemon_id:
+            return
+        if self.global_dir_balancer:
+            for dir_path in self.instance_to_dir_map.get(instance_id, []):
+                self.global_dir_balancer.unregister_mapping(self.fs_name, dir_path)
+                self.global_dir_balancer.register_mapping(self.fs_name, dir_path, daemon_id)
+
+    def add_instances(self, instances, initial_update=False):
+        log.debug(f'adding instances: {instances} initial_update {initial_update}')
         with self.lock:
             if initial_update:
-                self.add_instances_initial(instance_ids)
+                self.add_instances_initial(instances)
             else:
                 nr_instances = len(self.instance_to_dir_map)
                 nr_dead_instances = len(self.dead_instances)
@@ -293,9 +403,10 @@ class Policy:
                     # adjust dead instances
                     nr_instances -= nr_dead_instances
                 include_stalled_dirs = nr_instances == 0
-                for instance_id in instance_ids:
+                for instance_id, daemon_id in instances.items():
                     if not instance_id in self.instance_to_dir_map:
                         self.instance_to_dir_map[instance_id] = []
+                    self._update_instance_daemon(instance_id, daemon_id)
                 dirs_per_instance = int(len(self.dir_states) /
                                         (len(self.instance_to_dir_map) - nr_dead_instances))
                 if dirs_per_instance == 0:
@@ -326,6 +437,7 @@ class Policy:
                 continue
             if not self.instance_to_dir_map[instance_id]:
                 self.instance_to_dir_map.pop(instance_id)
+                self.instance_to_daemon.pop(instance_id, None)
                 continue
             self.dead_instances.append(instance_id)
             dir_paths = self.instance_to_dir_map[instance_id]
@@ -376,5 +488,9 @@ class Policy:
                 'mapping': {}
             } # type: Dict
             for instance_id, dir_paths in self.instance_to_dir_map.items():
-                res['mapping'][instance_id] = f'{len(dir_paths)} directories'
+                daemon_id = self.instance_to_daemon.get(instance_id, instance_id)
+                res['mapping'][instance_id] = {
+                    'daemon_id': daemon_id,
+                    'directory_count': len(dir_paths)
+                }
             return res

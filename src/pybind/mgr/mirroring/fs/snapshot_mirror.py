@@ -24,7 +24,7 @@ from .exception import MirrorException
 from .dir_map.create import create_mirror_object
 from .dir_map.load import load_dir_map, load_instances
 from .dir_map.update import UpdateDirMapRequest, UpdateInstanceRequest
-from .dir_map.policy import Policy
+from .dir_map.policy import Policy, GlobalDirectoryBalancer
 from .dir_map.state_transition import ActionType
 
 log = logging.getLogger(__name__)
@@ -39,11 +39,11 @@ class FSPolicy:
         def handle_instances(self, added, removed):
             self.fspolicy.update_instances(added, removed)
 
-    def __init__(self, mgr, ioctx):
+    def __init__(self, mgr, ioctx, filesystem, global_dir_balancer):
         self.mgr = mgr
         self.ioctx = ioctx
         self.pending = []
-        self.policy = Policy()
+        self.policy = Policy(filesystem, global_dir_balancer)
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.dir_paths = []
@@ -66,7 +66,10 @@ class FSPolicy:
             self.policy.init(dir_mapping)
             # we'll schedule action for all directories, so don't bother capturing
             # directory names here.
-            self.policy.add_instances(list(instances.keys()), initial_update=True)
+            instance_daemons = {}
+            for instance_id, data in instances.items():
+                instance_daemons[instance_id] = data.get('daemon_id', instance_id)
+            self.policy.add_instances(instance_daemons, initial_update=True)
             self.instance_watcher = InstanceWatcher(self.ioctx, instances,
                                                     self.instance_listener)
             self.schedule_action(list(dir_mapping.keys()))
@@ -104,10 +107,13 @@ class FSPolicy:
                     log.debug(f'handle_update_instances: policy shutting down')
                     return
                 schedules = []
+                instance_daemons = {}
+                for instance_id, data in instances_added.items():
+                    instance_daemons[instance_id] = data.get('daemon_id', instance_id)
                 if instances_removed:
                     schedules.extend(self.policy.remove_instances(instances_removed))
-                if instances_added:
-                    schedules.extend(self.policy.add_instances(instances_added))
+                if instance_daemons:
+                    schedules.extend(self.policy.add_instances(instance_daemons))
                 self.schedule_action(schedules)
             finally:
                 self.op_tracker.finish_async_op()
@@ -132,13 +138,16 @@ class FSPolicy:
         with self.lock:
             instances_added = {}
             instances_removed = []
-            for instance_id, addr in added.items():
-                instances_added[instance_id] = {'version': 1, 'addr': addr}
+            for instance_id, data in added.items():
+                daemon_id = data.get('daemon_id', instance_id)
+                instances_added[instance_id] = {'version': 1,
+                                                'addr': data['addr'],
+                                                'daemon_id': daemon_id}
             instances_removed = list(removed.keys())
             request_id = str(uuid.uuid4())
             def async_callback(r):
                 self.finisher.queue(self.handle_update_instances,
-                                    [list(instances_added.keys()), instances_removed, request_id, r])
+                                    [instances_added.copy(), instances_removed, request_id, r])
             # blacklisted instances can be removed at this point. remapping directories
             # mapped to blacklisted instances on module startup is handled in policy
             # add_instances().
@@ -284,6 +293,7 @@ class FSSnapshotMirror:
         self.mgr = mgr
         self.rados = mgr.rados
         self.pool_policy = {}
+        self.global_dir_balancer = GlobalDirectoryBalancer()
         self.fs_map = self.mgr.get('fs_map')
         self.lock = threading.Lock()
         self.refresh_pool_policy()
@@ -489,7 +499,7 @@ class FSSnapshotMirror:
             dir_mapping = load_dir_map(ioctx)
             instances = load_instances(ioctx)
             # init policy
-            fspolicy = FSPolicy(self.mgr, ioctx)
+            fspolicy = FSPolicy(self.mgr, ioctx, filesystem, self.global_dir_balancer)
             log.debug(f'init policy for filesystem {filesystem}: pool-id {metadata_pool_id}')
             fspolicy.init(dir_mapping, instances)
             self.pool_policy[filesystem] = fspolicy
@@ -505,6 +515,7 @@ class FSSnapshotMirror:
                 log.info(f'shutdown pool policy for {filesystem}')
                 fspolicy = self.pool_policy.pop(filesystem)
                 fspolicy.shutdown()
+                self.global_dir_balancer.remove_filesystem(filesystem)
         for filesystem in filesystems:
             if not filesystem in self.pool_policy:
                 log.info(f'init pool policy for {filesystem}')

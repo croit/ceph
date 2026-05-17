@@ -79,6 +79,7 @@ void MirrorWatcher::handle_notify(uint64_t notify_id, uint64_t handle,
   JSONFormatter f;
   f.open_object_section("info");
   encode_json("addr", m_fs_mirror->get_instance_addr(), &f);
+  encode_json("daemon_id", m_fs_mirror->get_daemon_id(), &f);
   f.close_section();
 
   bufferlist outbl;

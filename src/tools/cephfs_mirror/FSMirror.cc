@@ -170,6 +170,10 @@ FSMirror::~FSMirror() {
   }
 }
 
+std::string FSMirror::get_daemon_id() {
+  return m_service_daemon->get_instance_id();
+}
+
 int FSMirror::init_replayer(PeerReplayer *peer_replayer) {
   ceph_assert(ceph_mutex_is_locked(m_lock));
   return peer_replayer->init();
