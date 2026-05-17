@@ -49,7 +49,9 @@ class InstanceWatcher:
         self.listener = listener
         self.instances = {}
         for instance_id, data in instances.items():
+            daemon_id = data.get('daemon_id', instance_id)
             self.instances[instance_id] = {'addr': data['addr'],
+                                           'daemon_id': daemon_id,
                                            'seen': time.time()}
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
@@ -86,10 +88,20 @@ class InstanceWatcher:
                     # sender data is quoted
                     notifier_data = json.loads(ack[2].decode('utf-8'))
                     log.debug(f'InstanceWatcher.handle_notify: {instance_id}: {notifier_data}')
+                    daemon_id = notifier_data.get('daemon_id', instance_id)
+                    addr = notifier_data['addr']
                     if not instance_id in self.instances:
                         self.instances[instance_id] = {}
-                        added[instance_id] = notifier_data['addr']
-                    self.instances[instance_id]['addr'] = notifier_data['addr']
+                        added[instance_id] = {'addr': addr,
+                                              'daemon_id': daemon_id}
+                    else:
+                        current_daemon_id = self.instances[instance_id].get('daemon_id', instance_id)
+                        current_addr = self.instances[instance_id].get('addr')
+                        if current_daemon_id != daemon_id or current_addr != addr:
+                            added[instance_id] = {'addr': addr,
+                                                  'daemon_id': daemon_id}
+                    self.instances[instance_id]['addr'] = addr
+                    self.instances[instance_id]['daemon_id'] = daemon_id
                     self.instances[instance_id]['seen'] = time.time()
                 # gather non responders
                 now = time.time()

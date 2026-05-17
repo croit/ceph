@@ -75,12 +75,12 @@ int ServiceDaemon::init() {
   if (id.find(CEPHFS_MIRROR_AUTH_ID_PREFIX) == 0) {
     id = id.substr(CEPHFS_MIRROR_AUTH_ID_PREFIX.size());
   }
-  std::string instance_id = stringify(m_rados->get_instance_id());
+  m_instance_id = stringify(m_rados->get_instance_id());
 
   std::map<std::string, std::string> service_metadata = {{"id", id},
-                                                         {"instance_id", instance_id}};
-  int r = m_rados->service_daemon_register("cephfs-mirror", instance_id,
-                                           service_metadata);
+                                                         {"instance_id", m_instance_id}};
+  int r = m_rados->service_daemon_register("cephfs-mirror", m_instance_id,
+                                            service_metadata);
   if (r < 0) {
     return r;
   }
