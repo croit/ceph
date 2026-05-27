@@ -6302,6 +6302,7 @@ out:
 
 int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
 {
+  std::string str_path;
   ldout(cct, 20) << __func__ << " " << *in << "; " << perms << dendl;
   unsigned want = 0;
 
@@ -6336,6 +6337,12 @@ int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
     goto out;
 
   r = inode_permission(in, perms, want);
+  if (r == -ENOENT || r == ENOENT) {
+    in->make_path_string(str_path);
+    ldout(cct, 0) << __func__ << "-->inode_permission, "
+                  << "r=" << r << ", str_path=" << str_path << ", "
+                  << cpp_strerror(r) << dendl;
+  }
 out:
   ldout(cct, 3) << __func__ << " " << in << " = " << r <<  dendl;
   return r;
@@ -8108,6 +8115,7 @@ int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool f
     return 0;
 
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_GETATTR);
+  std::string str_path;
   filepath path;
   in->make_nosnap_relative_path(path);
   req->set_filepath(path);
@@ -8115,6 +8123,13 @@ int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool f
   req->head.args.getattr.mask = mask;
   
   int res = make_request(req, perms);
+  if (res == -ENOENT || res == ENOENT) {
+    in->make_path_string(str_path);
+    ldout(cct, 0) << __func__ << "-->"
+                  << "r=" << res << ", path=" << path
+                  << ", str_path=" << str_path << ", " << cpp_strerror(res)
+                  << dendl;
+  }
   ldout(cct, 10) << __func__ << " result=" << res << dendl;
   return res;
 }
@@ -10612,6 +10627,7 @@ void Client::_put_fh(Fh *f)
 int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
 		  const UserPerm& perms)
 {
+  std::string str_path;
   if (in->snapid != CEPH_NOSNAP &&
       (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND))) {
     return -EROFS;
@@ -10641,6 +10657,11 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
       ldout(cct, 20) << __func__ << " absolute path: " << path << dendl;
       result = mds_check_access(path, perms, mask);
       if (result) {
+        if (result == -ENOENT || result == ENOENT) {
+          ldout(cct, 0) << __func__ << "-->1, "
+                        << "r=" << result << ", path=" << path << ", "
+                        << cpp_strerror(result) << dendl;
+        }
         return result;
       }
       // update wanted?
@@ -10664,6 +10685,13 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
     req->head.args.open.old_size = in->size;   // for O_TRUNC
     req->set_inode(in);
     result = make_request(req, perms);
+    if (result == -ENOENT || result == ENOENT) {
+      in->make_path_string(str_path);
+      ldout(cct, 0) << __func__ << "-->2, "
+                    << "r=" << result << ", path=" << path
+                    << ", str_path=" << str_path << ", " << cpp_strerror(result)
+                    << dendl;
+    }
 
     /*
      * NFS expects that delegations will be broken on a conflicting open,
@@ -10688,6 +10716,13 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
 	ldout(cct, 8) << "Unable to get caps after open of inode " << *in <<
 			  " . Denying open: " <<
 			  cpp_strerror(result) << dendl;
+        if (result == -ENOENT || result == ENOENT) {
+          in->make_path_string(str_path);
+          ldout(cct, 0) << __func__ << "-->3, "
+                        << "r=" << result << ", path=" << path
+                        << ", str_path=" << str_path << ", "
+                        << cpp_strerror(result) << dendl;
+        }
       } else {
 	put_cap_ref(in.get(), need);
       }
