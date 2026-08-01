@@ -2567,3 +2567,12 @@ extern "C" int ceph_get_perf_counters(struct ceph_mount_info *cmount, char **per
   do_out_buffer(outbl, perf_dump, NULL);
   return outbl.length();
 }
+
+extern "C" int ceph_client_status(struct ceph_mount_info *cmount, char** buf) {
+  if (!cmount->is_mounted()) {
+    /* we set errno to signal errors. */
+    return -ENOTCONN;
+  }
+  cmount->get_client()->dump_status(buf);
+  return 0;
+}

@@ -246,7 +246,11 @@ int Client::CommandHook::call(
       m_client->_kick_stale_sessions();
     else if (command == "status")
       m_client->dump_status(f);
-    else
+    else if (command == "sync_fs") {
+      m_client->_sync_fs();
+    } else if (command == "trim_cache") {
+      m_client->trim_cache();
+    } else
       ceph_abort_msg("bad command registered");
   }
   f->close_section();
@@ -593,6 +597,22 @@ void Client::dump_cache(Formatter *f)
     f->close_section();
 }
 
+void Client::dump_status(char** buf) {
+  std::scoped_lock l{client_lock};
+  JSONFormatter f;
+  f.open_object_section("result");
+  dump_status(&f);
+  f.close_section();
+  std::stringstream ss;
+  f.flush(ss);
+  std::string data = ss.str();
+  *buf = static_cast<char*>(std::malloc(data.size() + 1));
+  if (*buf == nullptr) {
+    return;
+  }
+  std::memcpy(*buf, data.c_str(), data.size() + 1);
+}
+
 void Client::dump_status(Formatter *f)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -617,6 +637,8 @@ void Client::dump_status(Formatter *f)
     f->dump_stream("inst_str") << inst.name << " " << inst.addr.get_legacy_str();
     f->dump_string("addr_str", inst.addr.get_legacy_str());
     f->dump_int("inode_count", inode_map.size());
+    f->dump_unsigned("inode_ref_openned", inode_ref_openned);
+    f->dump_unsigned("inode_ref_closed", inode_ref_closed);
     f->dump_int("mds_epoch", mdsmap->get_epoch());
     f->dump_int("osd_epoch", osd_epoch);
     f->dump_int("osd_epoch_barrier", cap_epoch_barrier);
@@ -710,6 +732,18 @@ void Client::_finish_init()
   ret = admin_socket->register_command("status",
 				       &m_command_hook,
 				       "show overall client status");
+  if (ret < 0) {
+    lderr(cct) << "error registering admin socket command: "
+	       << cpp_strerror(-ret) << dendl;
+  }
+  ret =
+      admin_socket->register_command("sync_fs", &m_command_hook, "sync the fs");
+  if (ret < 0) {
+    lderr(cct) << "error registering admin socket command: "
+               << cpp_strerror(-ret) << dendl;
+  }
+  ret = admin_socket->register_command("trim_cache", &m_command_hook,
+                                       "trim cache");
   if (ret < 0) {
     lderr(cct) << "error registering admin socket command: "
 	       << cpp_strerror(-ret) << dendl;
@@ -13557,6 +13591,7 @@ void Client::_ll_get(Inode *in)
 {
   if (in->ll_ref == 0) {
     in->iget();
+    inode_ref_openned++;
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
       in->get_first_parent()->get(); // pin dentry
@@ -13574,6 +13609,7 @@ int Client::_ll_put(Inode *in, uint64_t num)
   in->ll_put(num);
   ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num << " -> " << in->ll_ref << dendl;
   if (in->ll_ref == 0) {
+    inode_ref_closed++;
     in->move_to_unpinned();
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
