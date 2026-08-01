@@ -598,3 +598,11 @@ options:
   services:
   - mds_client
   min: 1
+- name: client_enable_readdir_cache
+  type: bool
+  level: advanced
+  desc: client readdir cache is enabled if set to true
+  long_desc: client readdir cache is enabled if set to true
+  default: true
+  services:
+  - mds_client

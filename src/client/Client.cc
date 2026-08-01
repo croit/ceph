@@ -428,6 +428,11 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
   caps_release_delay = cct->_conf.get_val<std::chrono::seconds>(
     "client_caps_release_delay");
 
+  enable_readdir_cache =
+        cct->_conf.get_val<bool>("client_enable_readdir_cache");
+  ldout(cct, 0) << __func__ << ": enable_readdir_cache=" << enable_readdir_cache
+                << dendl;
+
   if (cct->_conf->client_acl_type == "posix_acl")
     acl_type = POSIX_ACL;
 
@@ -9662,7 +9667,7 @@ int Client::readdir_r_cb(dir_result_t* d,
     want,
     flags,
     getref,
-    false);
+    !enable_readdir_cache);
 }
 
 //
@@ -17627,6 +17632,7 @@ std::vector<std::string> Client::get_tracked_keys() const noexcept
     "client_caps_release_delay",
     "client_deleg_break_on_open",
     "client_deleg_timeout",
+    "client_enable_readdir_cache",
     "client_mount_timeout",
     "client_oc_max_dirty",
     "client_oc_max_dirty_age",
@@ -17687,6 +17693,12 @@ void Client::handle_conf_change(const ConfigProxy& conf,
   if (changed.count("client_mount_timeout")) {
     mount_timeout = cct->_conf.get_val<std::chrono::seconds>(
       "client_mount_timeout");
+  }
+  if (changed.count("client_enable_readdir_cache")) {
+    enable_readdir_cache =
+        cct->_conf.get_val<bool>("client_enable_readdir_cache");
+    ldout(cct, 0) << __func__
+                  << ": enable_readdir_cache=" << enable_readdir_cache << dendl;
   }
 }
 

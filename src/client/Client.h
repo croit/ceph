@@ -1974,6 +1974,7 @@ private:
 
   ceph::coarse_mono_time last_auto_reconnect;
   std::chrono::seconds caps_release_delay, mount_timeout;
+  bool enable_readdir_cache = true;
   // trace generation
   std::ofstream traceout;
 
