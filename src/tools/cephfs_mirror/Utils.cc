@@ -134,7 +134,8 @@ int mount(RadosRef cluster, const Filesystem &filesystem, bool cross_check_fscid
     derr << ": mount error: " << cpp_strerror(r) << dendl;
     return r;
   }
-
+  ceph_set_session_timeout(cmi, 0);
+  
   r = ceph_mount(cmi, NULL);
   if (r < 0) {
     derr << ": mount error: " << cpp_strerror(r) << dendl;

@@ -15,6 +15,7 @@
 #include "FSMirror.h"
 #include "ServiceDaemon.h"
 #include "Types.h"
+#include "FileMirrorPool.h"
 
 class Messenger;
 class MonClient;
@@ -105,6 +106,7 @@ private:
   std::unique_ptr<ServiceDaemon> m_service_daemon;
 
   PerfCounters *m_perf_counters;
+  FileMirrorPool file_mirror_pool;
 
   int init_mon_client();
 

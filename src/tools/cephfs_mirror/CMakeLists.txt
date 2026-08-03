@@ -9,7 +9,8 @@ set(cephfs_mirror_internal
   Types.cc
   Utils.cc
   Watcher.cc
-  watcher/RewatchRequest.cc)
+  watcher/RewatchRequest.cc
+  FileMirrorPool.cc)
 
 add_executable(cephfs-mirror
   main.cc)

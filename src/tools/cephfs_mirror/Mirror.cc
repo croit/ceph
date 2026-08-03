@@ -202,14 +202,12 @@ struct Mirror::C_RestartMirroring : Context {
   }
 };
 
-Mirror::Mirror(CephContext *cct, const std::vector<const char*> &args,
-                MonClient *monc, Messenger *msgr)
-  : m_cct(cct),
-    m_args(args),
-    m_monc(monc),
-    m_msgr(msgr),
-    m_listener(this),
-    m_local(new librados::Rados()) {
+Mirror::Mirror(CephContext *cct, const std::vector<const char *> &args,
+               MonClient *monc, Messenger *msgr)
+    : m_cct(cct), m_args(args), m_monc(monc), m_msgr(msgr), m_listener(this),
+      m_local(new librados::Rados()),
+      file_mirror_pool(g_ceph_context->_conf.get_val<uint64_t>(
+          "cephfs_mirror_file_sync_thread")) {
   auto thread_pool = &(cct->lookup_or_create_singleton_object<ThreadPoolSingleton>(
                          "cephfs::mirror::thread_pool", false, cct));
   auto safe_timer = &(cct->lookup_or_create_singleton_object<SafeTimerSingleton>(
@@ -234,6 +232,9 @@ Mirror::~Mirror() {
   {
     std::scoped_lock locker(m_lock);
     m_thread_pool->stop();
+    dout(0) << ": deactivating file_mirror_pool" << dendl;
+    file_mirror_pool.deactivate();
+    dout(0) << ": file_mirror_pool is deactivated" << dendl;
   }
 }
 
@@ -265,6 +266,9 @@ int Mirror::init(std::string &reason) {
   dout(20) << dendl;
 
   std::scoped_lock locker(m_lock);
+
+  file_mirror_pool.activate();
+  dout(0) << ": file_mirror_pool is activated" << dendl;
 
   int r = m_local->init_with_context(m_cct);
   if (r < 0) {
@@ -428,8 +432,9 @@ void Mirror::enable_mirroring(const Filesystem &filesystem, uint64_t local_pool_
   dout(10) << ": starting FSMirror: filesystem=" << filesystem << dendl;
 
   mirror_action.action_in_progress = true;
-  mirror_action.fs_mirror = std::make_unique<FSMirror>(m_cct, filesystem, local_pool_id,
-                                                       m_service_daemon.get(), m_args, m_work_queue);
+  mirror_action.fs_mirror = std::make_unique<FSMirror>(
+      m_cct, filesystem, local_pool_id, m_service_daemon.get(), m_args,
+      m_work_queue, file_mirror_pool);
   mirror_action.fs_mirror->init(new C_AsyncCallback<ContextWQ>(m_work_queue, on_finish));
 }
 
