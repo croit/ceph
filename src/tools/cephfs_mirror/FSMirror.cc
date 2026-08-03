@@ -1,6 +1,7 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
+#include "common/ceph_json.h"
 #include "common/admin_socket.h"
 #include "common/ceph_argparse.h"
 #include "common/ceph_context.h"
@@ -66,6 +67,20 @@ private:
   FSMirror *fs_mirror;
 };
 
+class ClientStatusCommand : public MirrorAdminSocketCommand {
+public:
+  explicit ClientStatusCommand(FSMirror *fs_mirror) : fs_mirror(fs_mirror) {}
+
+  int call(Formatter *f) override {
+    fs_mirror->client_status(f);
+    return 0;
+  }
+
+private:
+  FSMirror *fs_mirror;
+};
+
+
 } // anonymous namespace
 
 class MirrorAdminSocketHook : public AdminSocketHook {
@@ -81,6 +96,12 @@ public:
       cmd, this, "get filesystem mirror status");
     if (r == 0) {
       commands[cmd] = new StatusCommand(fs_mirror);
+    }
+    cmd = "client status " + stringify(filesystem.fs_name) + "@" + stringify(filesystem.fscid);
+    r = admin_socket->register_command(cmd, this,
+                                       "provide the source client's status");
+    if (r == 0) {
+      commands[cmd] = new ClientStatusCommand(fs_mirror);
     }
   }
 
@@ -105,18 +126,15 @@ private:
   Commands commands;
 };
 
-FSMirror::FSMirror(CephContext *cct, const Filesystem &filesystem, uint64_t pool_id,
-                   ServiceDaemon *service_daemon, std::vector<const char*> args,
-                   ContextWQ *work_queue)
-  : m_cct(cct),
-    m_filesystem(filesystem),
-    m_pool_id(pool_id),
-    m_service_daemon(service_daemon),
-    m_args(args),
-    m_work_queue(work_queue),
-    m_snap_listener(this),
-    m_ts_listener(this),
-    m_asok_hook(new MirrorAdminSocketHook(cct, filesystem, this)) {
+FSMirror::FSMirror(CephContext *cct, const Filesystem &filesystem,
+                   uint64_t pool_id, ServiceDaemon *service_daemon,
+                   std::vector<const char *> args, ContextWQ *work_queue,
+                   FileMirrorPool &file_mirror_pool)
+    : m_cct(cct), m_filesystem(filesystem), m_pool_id(pool_id),
+      m_service_daemon(service_daemon), m_args(args), m_work_queue(work_queue),
+      m_snap_listener(this), m_ts_listener(this),
+      m_asok_hook(new MirrorAdminSocketHook(cct, filesystem, this)),
+      file_mirror_pool(file_mirror_pool) {
   m_service_daemon->add_or_update_fs_attribute(m_filesystem.fscid, SERVICE_DAEMON_DIR_COUNT_KEY,
                                                (uint64_t)0);
 
@@ -421,7 +439,8 @@ void FSMirror::add_peer(const Peer &peer) {
   }
 
   auto replayer = std::make_unique<PeerReplayer>(
-    m_cct, this, m_cluster, m_filesystem, peer, m_directories, m_mount, m_service_daemon);
+      m_cct, this, m_cluster, m_filesystem, peer, m_directories, m_mount,
+      m_service_daemon, file_mirror_pool);
   int r = init_replayer(replayer.get());
   if (r < 0) {
     m_service_daemon->add_or_update_peer_attribute(m_filesystem.fscid, peer,
@@ -430,7 +449,7 @@ void FSMirror::add_peer(const Peer &peer) {
     return;
   }
   m_peer_replayers.emplace(peer, std::move(replayer));
-  ceph_assert(m_peer_replayers.size() == 1); // support only a single peer
+  // ceph_assert(m_peer_replayers.size() == 1); // support only a single peer
   if (m_perf_counters) {
     m_perf_counters->inc(l_cephfs_mirror_fs_mirror_peers);
   }
@@ -458,6 +477,22 @@ void FSMirror::remove_peer(const Peer &peer) {
     m_perf_counters->dec(l_cephfs_mirror_fs_mirror_peers);
   }
 }
+
+void FSMirror::client_status(Formatter *f) {
+  char *buf = nullptr;
+  if (m_mount) {
+    int r = ceph_client_status(m_mount, &buf);
+    if (r == 0 && buf) {
+      JSONParser parser;
+      parser.parse(buf, std::strlen(buf));
+      free(buf);
+      JSONFormattable jf;
+      jf.decode_json(&parser);
+      jf.encode_json("", f);
+    }
+  }
+}
+
 
 void FSMirror::mirror_status(Formatter *f) {
   std::scoped_lock locker(m_lock);

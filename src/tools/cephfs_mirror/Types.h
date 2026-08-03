@@ -82,6 +82,40 @@ typedef std::shared_ptr<librados::IoCtx> IoCtxRef;
 
 // not a shared_ptr since the type is incomplete
 typedef ceph_mount_info *MountRef;
+typedef UserPerm *UserPermRef;
+struct InodeDeleter {
+  MountRef cmount = nullptr;
+  void operator()(Inode *inode) const {
+    if (cmount && inode) {
+      ceph_ll_forget(cmount, inode, 1);
+    }
+  }
+};
+
+struct DirResultDeleter {
+  MountRef cmount = nullptr;
+  void operator()(struct ceph_dir_result *dirp) const {
+    if (cmount && dirp) {
+      ceph_ll_releasedir(cmount, dirp);
+    }
+  }
+};
+
+struct FhDeleter {
+  MountRef cmount = nullptr;
+  void operator()(struct Fh* fh) const {
+    if (cmount && fh) {
+      ceph_ll_close(cmount, fh);
+    }
+  }
+};
+typedef std::unique_ptr<Inode, InodeDeleter> InodeUniquePtr;
+typedef std::shared_ptr<Inode> InodeSharedPtr;
+typedef Inode *InodeRawPtr;
+typedef struct ceph_dir_result* DirRawPtr;
+typedef struct Fh* FhRawPtr;
+typedef std::unique_ptr<ceph_dir_result, DirResultDeleter> DirUniquePtr;
+typedef std::unique_ptr<struct Fh, FhDeleter> FhUniquePtr;
 
 using clock = ceph::coarse_mono_clock;
 using monotime = ceph::coarse_mono_time;

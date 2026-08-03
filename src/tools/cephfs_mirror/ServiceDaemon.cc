@@ -1,12 +1,15 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
-
 #include "ServiceDaemon.h"
+#include "PeerReplayer.h"
 #include "common/debug.h"
 #include "common/errno.h"
 #include "common/Timer.h"
 #include "include/Context.h"
 #include "include/stringify.h"
+
+#include <string>
+using namespace std::string_literals;
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_cephfs_mirror
@@ -43,8 +46,12 @@ struct AttributeDumpVisitor : public boost::static_visitor<void> {
 ServiceDaemon::ServiceDaemon(CephContext *cct, RadosRef rados)
   : m_cct(cct),
     m_rados(rados),
-    m_timer(new SafeTimer(cct, m_timer_lock, true)) {
-  m_timer->init();
+    m_timer(new SafeTimer(cct, m_timer_lock, false)) {
+  g_conf().add_observer(this);
+  char hostname[HOST_NAME_MAX];
+  if (gethostname(hostname, sizeof(hostname)) == 0) {
+    host_name = std::string(hostname);
+  }
 }
 
 ServiceDaemon::~ServiceDaemon() {
@@ -77,6 +84,10 @@ int ServiceDaemon::init() {
   if (r < 0) {
     return r;
   }
+  m_timer->init();
+  status_update_period = g_ceph_context->_conf.get_val<uint64_t>(
+      "cephfs_mirror_mirror_status_update_period");
+  start_update_job();
   return 0;
 }
 
@@ -87,7 +98,6 @@ void ServiceDaemon::add_filesystem(fs_cluster_id_t fscid, std::string_view fs_na
     std::scoped_lock locker(m_lock);
     m_filesystems.emplace(fscid, Filesystem(fs_name));
   }
-  schedule_update_status();
 }
 
 void ServiceDaemon::remove_filesystem(fs_cluster_id_t fscid) {
@@ -97,7 +107,6 @@ void ServiceDaemon::remove_filesystem(fs_cluster_id_t fscid) {
     std::scoped_lock locker(m_lock);
     m_filesystems.erase(fscid);
   }
-  schedule_update_status();
 }
 
 void ServiceDaemon::add_peer(fs_cluster_id_t fscid, const Peer &peer) {
@@ -109,9 +118,8 @@ void ServiceDaemon::add_peer(fs_cluster_id_t fscid, const Peer &peer) {
     if (fs_it == m_filesystems.end()) {
       return;
     }
-    fs_it->second.peer_attributes.emplace(peer, Attributes{});
+    fs_it->second.peer_info.emplace(peer, PeerInfo());
   }
-  schedule_update_status();
 }
 
 void ServiceDaemon::remove_peer(fs_cluster_id_t fscid, const Peer &peer) {
@@ -123,9 +131,8 @@ void ServiceDaemon::remove_peer(fs_cluster_id_t fscid, const Peer &peer) {
     if (fs_it == m_filesystems.end()) {
       return;
     }
-    fs_it->second.peer_attributes.erase(peer);
+    fs_it->second.peer_info.erase(peer);
   }
-  schedule_update_status();
 }
 
 void ServiceDaemon::add_or_update_fs_attribute(fs_cluster_id_t fscid, std::string_view key,
@@ -141,7 +148,6 @@ void ServiceDaemon::add_or_update_fs_attribute(fs_cluster_id_t fscid, std::strin
 
     fs_it->second.fs_attributes[std::string(key)] = value;
   }
-  schedule_update_status();
 }
 
 void ServiceDaemon::add_or_update_peer_attribute(fs_cluster_id_t fscid, const Peer &peer,
@@ -155,33 +161,64 @@ void ServiceDaemon::add_or_update_peer_attribute(fs_cluster_id_t fscid, const Pe
       return;
     }
 
-    auto peer_it = fs_it->second.peer_attributes.find(peer);
-    if (peer_it == fs_it->second.peer_attributes.end()) {
+    auto peer_it = fs_it->second.peer_info.find(peer);
+    if (peer_it == fs_it->second.peer_info.end()) {
       return;
     }
 
-    peer_it->second[std::string(key)] = value;
+    peer_it->second.first[std::string(key)] = value;
   }
-  schedule_update_status();
 }
 
-void ServiceDaemon::schedule_update_status() {
+void ServiceDaemon::update_peer_info(fs_cluster_id_t fscid, const Peer &peer,
+                                       const SnapSyncStatMap &status_map) {
+  dout(10) << ": fscid=" << fscid << dendl;
+  {
+    std::scoped_lock locker(m_lock);
+    auto fs_it = m_filesystems.find(fscid);
+    if (fs_it == m_filesystems.end()) {
+      return;
+    }
+    auto peer_it = fs_it->second.peer_info.find(peer);
+    if (peer_it == fs_it->second.peer_info.end()) {
+      return;
+    }
+    peer_it->second.second = status_map;
+  }
+}
+
+void ServiceDaemon::handle_conf_change(const ConfigProxy &conf,
+                                      const std::set<std::string> &changed) {
+  std::scoped_lock lock(config_lock);
+  if (changed.count("cephfs_mirror_mirror_status_update_period")) {
+    status_update_period = g_ceph_context->_conf.get_val<uint64_t>(
+        "cephfs_mirror_mirror_status_update_period");
+    {
+      std::scoped_lock timer_lock(m_timer_lock);
+      m_timer->cancel_all_events();
+    }
+    start_update_job();
+  }
+}
+
+std::vector<std::string> ServiceDaemon::get_tracked_keys() const noexcept {
+  return {
+    "cephfs_mirror_mirror_status_update_period"s
+  };
+}
+
+void ServiceDaemon::start_update_job() {
   dout(10) << dendl;
 
   std::scoped_lock timer_lock(m_timer_lock);
-  if (m_timer_ctx != nullptr) {
-    return;
-  }
-
-  m_timer_ctx = new LambdaContext([this] {
-                                    m_timer_ctx = nullptr;
-                                    update_status();
-                                  });
-  m_timer->add_event_after(1, m_timer_ctx);
+  update_status();
+  m_timer_ctx = new LambdaContext([this] { start_update_job(); });
+  m_timer->add_event_after(status_update_period, m_timer_ctx);
 }
 
 void ServiceDaemon::update_status() {
   dout(20) << ": " << m_filesystems.size() << " filesystem(s)" << dendl;
+  // dout(0) << ": updating status-->" << dendl;
 
   ceph::JSONFormatter f;
   {
@@ -195,14 +232,22 @@ void ServiceDaemon::update_status() {
             boost::apply_visitor(visitor, attr_value);
       }
       f.open_object_section("peers");
-      for (auto &[peer, attributes] : filesystem.peer_attributes) {
+      for (auto &[peer, info] : filesystem.peer_info) {
         f.open_object_section(peer.uuid);
         f.dump_object("remote", peer.remote);
         f.open_object_section("stats");
-        for (auto &[attr_name, attr_value] : attributes) {
+        for (auto &[attr_name, attr_value] : info.first) {
             AttributeDumpVisitor visitor(&f, attr_name);
             boost::apply_visitor(visitor, attr_value);
         }
+        f.dump_string("hostname", host_name);
+        f.open_object_section("status");
+        for (auto &[dir, status] : info.second) {
+          f.open_object_section(dir);
+          status->dump_stats(&f);
+          f.close_section(); // dir_root
+        }
+        f.close_section();
         f.close_section(); // stats
         f.close_section(); // peer.uuid
       }

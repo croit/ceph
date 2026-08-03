@@ -103,3 +103,243 @@ options:
   - cephfs-mirror
   min: 0
   max: 11
+- name: cephfs_mirror_file_sync_thread
+  type: uint
+  level: advanced
+  desc: number of threads running for file transfers per peer
+  long_desc: number of threads running for file transfers per peer.
+    Each thread is responsible for transfering file.
+  default: 3
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_dir_scanning_thread
+  type: uint
+  level: advanced
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
+    Each thread is responsible for several libcephfs operations.
+  default: 3
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_remote_diff_base_upon_start
+  type: bool
+  level: advanced
+  desc: take remote cluster as diff base for syncing upon restart
+  long_desc: take remote cluster as diff base for syncing upon restart
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_sync_latest_snapshot
+  type: bool
+  level: advanced
+  desc: take lates snapshot for syncing
+  long_desc: take lates snapshot for syncing
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_thread_pool_queue_size
+  type: uint
+  level: advanced
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
+    Each thread is responsible for several libcephfs operations.
+  default: 5000
+  services:
+  - cephfs-mirror
+  min: 3
+- name: cephfs_mirror_max_element_in_cache_per_thread
+  type: uint
+  level: advanced
+  desc: number of threads running for concurrently scanning directory
+  long_desc: number of threads running associated for each sync.
+    Each thread is responsible for several libcephfs operations.
+  default: 1000000
+  services:
+  - cephfs-mirror
+  min: 0
+- name: cephfs_mirror_start_syncing
+  type: bool
+  level: advanced
+  desc: if this false, mirror daemon will wait after start
+  long_desc: daemon after started, immediately start sycning. To 
+    prevent that this flag is useful. Such that user can start all
+    the mirror daemon and then make it true to start sycning.
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_mirror_status_update_period
+  type: uint
+  level: advanced
+  desc: time period after mirror will update it's status peridically
+  long_desc: Peridically cephfs-mirror daemon will update it's status
+      after this period to the manager
+  default: 3
+  services:
+  - cephfs-mirror
+  min: 0
+- name: cephfs_mirror_use_snapdiff_api
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will use snapdiff api for snapshot diff
+  long_desc: if this true, mirror daemon will use snapdiff api for snapshot diff
+      calculation otherwise it will use legacy way of snapshot diff calculation
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_lock_directory_before_sync
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will lock the remote directory
+  long_desc: if this true, mirror daemon will lock the remote directory
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_remote_timeout
+  type: uint
+  level: advanced
+  desc: time period after lazy connection remote mds will evict
+  long_desc: time period after lazy connection remote mds will evict
+  default: 0
+  services:
+  - cephfs-mirror
+  min: 0
+- name: cephfs_mirror_local_timeout
+  type: uint
+  level: advanced
+  desc: time period after lazy connection local mds will evict
+  long_desc: time period after lazy connection local mds will evict
+  default: 0
+  services:
+  - cephfs-mirror
+  min: 0
+- name: cephfs_mirror_max_consecutive_failures_before_remote_sync
+  type: uint
+  level: advanced
+  desc: consecutive failed directory synchronization attempts before marking a directory is
+    using remote as diff base
+  long_desc: consecutive failed directory synchronization attempts before marking a directory is
+    using remote as diff base
+  default: 2
+  services:
+  - cephfs-mirror
+  min: 0
+- name: cephfs_mirror_skip_error
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will skip the error and keep syncing
+  long_desc: if this true, mirror daemon will skip the error and keep syncing
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_use_low_level_api
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will use low level apis
+  long_desc: if this true, mirror daemon will use low level apis
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_use_at_statx_dont_sync
+  type: bool
+  level: advanced
+  desc: if this true, mirror daemon will use AT_STATX_DONT_SYNC
+  long_desc: if this true, mirror daemon will use AT_STATX_DONT_SYNC
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_stat_flush_counter_gap
+  type: uint
+  level: advanced
+  desc: for each thread local stat will be flushed into global stat
+    after counter gap is this
+  long_desc: for each thread local stat will be flushed into global stat
+    after counter gap is this
+  default: 100
+  services:
+  - cephfs-mirror
+  min: 0
+- name: cephfs_mirror_turn_off_assert
+  type: bool
+  level: advanced
+  desc: if this true, asserts in PeerReplayer will be turned off
+  long_desc: if this true, asserts in PeerReplayer will be turned off
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_snap_prefix
+  type: str
+  level: advanced
+  desc: this allows snapshots having specific prefix
+  long_desc: this allows snapshots having specific prefix
+  default: 
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_sync_from_remote
+  type: bool
+  level: advanced
+  desc: if this true, diff base will be remote
+  long_desc: if this true, diff base will be remote
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_enable_local_batching
+  type: bool
+  level: advanced
+  desc: if this true, directory scanning thread will do local batching
+  long_desc: if this true, directory scanning thread will do local batching
+  default: true
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_local_batch_size
+  type: uint
+  level: advanced
+  desc: local batch size in single thread
+  long_desc: local batch size in single thread
+  default: 10000
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_file_queue_size
+  type: uint
+  level: advanced
+  desc: number of file transfer request in a queue
+  long_desc: number of file transfer request in a queue
+  default: 100000
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_reset_inode_before_submission
+  type: bool
+  level: advanced
+  desc: if this true, file inode will be reset before submission
+  long_desc: if this true, file inode will be reset before submission
+  default: false
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_round_robin_cost_window
+  type: uint
+  level: advanced
+  desc: this is cost window
+  long_desc: this is cost window 
+  default: 4_M
+  services:
+  - cephfs-mirror
+  min: 1
+- name: cephfs_mirror_round_robin_io_cost
+  type: uint
+  level: advanced
+  desc: this is cost window
+  long_desc: this is cost window 
+  default: 0
+  services:
+  - cephfs-mirror
+- name: cephfs_mirror_apply_drr_balance
+  type: bool
+  level: advanced
+  desc: if this true, drr balance will be applied
+  long_desc: if this true, drr balance will be applied
+  default: false
+  services:
+  - cephfs-mirror

@@ -9,14 +9,18 @@
 #include "mds/FSMap.h"
 #include "Types.h"
 
+
 namespace cephfs {
 namespace mirror {
 
-class ServiceDaemon {
+struct SnapSyncStat;
+
+class ServiceDaemon : public md_config_obs_t{
 public:
   ServiceDaemon(CephContext *cct, RadosRef rados);
   ~ServiceDaemon();
-
+  using SnapSyncStatMap = std::map<std::string, std::shared_ptr<SnapSyncStat>>;
+  using PeerInfo = std::pair<Attributes, SnapSyncStatMap>;
   int init();
 
   void add_filesystem(fs_cluster_id_t fscid, std::string_view fs_name);
@@ -29,12 +33,20 @@ public:
                                   AttributeValue value);
   void add_or_update_peer_attribute(fs_cluster_id_t fscid, const Peer &peer,
                                     std::string_view key, AttributeValue value);
+  void update_peer_info(fs_cluster_id_t fscid, const Peer &peer,
+                           const SnapSyncStatMap &status_map);
+  std::string get_instance_id() const {
+    return m_instance_id;
+  }
+  std::vector<std::string> get_tracked_keys() const noexcept override;
+  void handle_conf_change(const ConfigProxy &conf,
+                          const std::set<std::string> &changed) override;
 
 private:
   struct Filesystem {
     std::string fs_name;
     Attributes fs_attributes;
-    std::map<Peer, Attributes> peer_attributes;
+    std::map<Peer, PeerInfo> peer_info;
 
     Filesystem(std::string_view fs_name)
       : fs_name(fs_name) {
@@ -51,8 +63,12 @@ private:
   ceph::mutex m_lock = ceph::make_mutex("cephfs::mirror::service_daemon");
   Context *m_timer_ctx = nullptr;
   std::map<fs_cluster_id_t, Filesystem> m_filesystems;
+  int status_update_period = 2;
+  std::string host_name = "none";
+  std::string m_instance_id;
+  std::mutex config_lock;
 
-  void schedule_update_status();
+  void start_update_job();
   void update_status();
 };
 
