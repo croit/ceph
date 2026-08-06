@@ -183,6 +183,8 @@ class DamageTable
 
     void erase(damage_entry_id_t damage_id);
 
+    void clear();
+
   protected:
     // I need to know my MDS rank so that I can check if
     // metadata items are part of my mydir.

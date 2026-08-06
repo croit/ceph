@@ -381,3 +381,11 @@ void DamageTable::erase(damage_entry_id_t damage_id)
   by_id.erase(by_id_entry);
 }
 
+void DamageTable::clear() {
+  dirfrags.clear();
+  dentries.clear();
+  remotes.clear();
+  uninline_failures.clear();
+  by_id.clear();
+}
+
