@@ -574,7 +574,7 @@ void ScrubStack::_validate_inode_done(CInode *in, int r,
 				      const CInode::validated_data &result)
 {
   LogChannelRef clog = mdcache->mds->clog;
-  const ScrubHeaderRefConst header = in->scrub_info()->header;
+  ScrubHeaderRef header = in->scrub_info()->header;
 
   std::string path;
   if (!result.passed_validation) {
@@ -623,6 +623,7 @@ void ScrubStack::_validate_inode_done(CInode *in, int r,
   }
 
   in->scrub_finished();
+  header->inc_scrubbed_inode_count();
 }
 
 void ScrubStack::complete_control_contexts(int r) {
@@ -761,6 +762,8 @@ void ScrubStack::scrub_status(Formatter *f) {
       f->dump_stream("path") << "#" << header->get_origin();
 
     f->dump_string("tag", header->get_tag());
+    f->dump_unsigned("scrubbed_inode_count",
+                  header->get_scrubbed_inode_count());
 
     CachedStackStringStream optcss;
     if (header->get_recursive()) {
