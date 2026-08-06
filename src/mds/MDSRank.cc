@@ -3096,6 +3096,9 @@ void MDSRankDispatcher::handle_asok_command(
       goto out;
     }
     damage_table.erase(id);
+  } else if (command == "damage clear") {
+    std::lock_guard l(mds_lock);
+    damage_table.clear();
   } else if (command == "quiesce db") {
     command_quiesce_db(cmdmap, on_finish);
     return;
