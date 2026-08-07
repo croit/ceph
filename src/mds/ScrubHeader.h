@@ -65,6 +65,10 @@ public:
   }
   unsigned get_num_pending() const { return num_pending; }
 
+  void inc_scrubbed_inode_count() { ++scrubbed_inode_count; }
+
+  uint64_t get_scrubbed_inode_count() const { return scrubbed_inode_count; }
+
   void record_uninline_status(_inodeno_t ino, int e, std::string_view path) {
     if (uninline_failed_info.find(e) == uninline_failed_info.end()) {
       uninline_failed_info[e] = std::vector<_inodeno_t>();
@@ -119,6 +123,7 @@ protected:
   bool repaired = false;  // May be set during scrub if repairs happened
   unsigned epoch_last_forwarded = 0;
   unsigned num_pending = 0;
+  uint64_t scrubbed_inode_count = 0;
   // errno -> [ino1, ino2, ino3, ...]
   std::unordered_map<int, std::vector<_inodeno_t>> uninline_failed_info;
   std::unordered_map<_inodeno_t, std::string> paths;

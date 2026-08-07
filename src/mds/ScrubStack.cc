@@ -113,7 +113,7 @@ int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
     scrub_stack.push_front(&obj->item_scrub);
   else
     scrub_stack.push_back(&obj->item_scrub);
-  return 0;
+  return 1;
 }
 
 void ScrubStack::purge_scrub_counters(std::string_view tag)
@@ -414,7 +414,7 @@ void ScrubStack::scrub_dir_inode(CInode *in, bool *added_children, bool *done)
       dir->add_waiter(CDir::WAIT_UNFREEZE, gather.new_sub());
     } else if (dir->get_version() == 0) {
       dout(20) << __func__ << " barebones " << *dir  << dendl;
-      dir->fetch_keys({}, gather.new_sub());
+      dir->fetch_keys({}, gather.new_sub(), true);
     } else {
       _enqueue(dir, header, true);
       queued.insert_raw(dir->get_frag());
@@ -490,7 +490,6 @@ void ScrubStack::scrub_dir_inode_final(CInode *in)
 void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
 {
   ceph_assert(dir != NULL);
-
   dout(10) << __func__ << " " << *dir << dendl;
 
   if (!dir->is_complete()) {
@@ -528,8 +527,9 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
 	continue;
       }
       if (dnl->is_primary()) {
-  *added_children = true;
-	_enqueue(dnl->get_inode(), header, true);
+        if (_enqueue(dnl->get_inode(), header, true) == 1) {
+          *added_children = true;
+        }
       } else if (dnl->is_remote()) {
 	// TODO: check remote linkage
       }
@@ -551,7 +551,6 @@ void ScrubStack::scrub_dirfrag(CDir *dir, bool *added_children, bool *done)
   *done = true;
   dout(10) << __func__ << " done" << dendl;
 }
-
 void ScrubStack::scrub_file_inode(CInode *in)
 {
   C_InodeValidated *fin = new C_InodeValidated(mdcache->mds, this, in);
@@ -564,7 +563,7 @@ void ScrubStack::_validate_inode_done(CInode *in, int r,
 				      const CInode::validated_data &result)
 {
   LogChannelRef clog = mdcache->mds->clog;
-  const ScrubHeaderRefConst header = in->scrub_info()->header;
+  ScrubHeaderRef header = in->scrub_info()->header;
 
   std::string path;
   if (!result.passed_validation) {
@@ -613,6 +612,7 @@ void ScrubStack::_validate_inode_done(CInode *in, int r,
   }
 
   in->scrub_finished();
+  header->inc_scrubbed_inode_count();
 }
 
 void ScrubStack::complete_control_contexts(int r) {
@@ -751,6 +751,8 @@ void ScrubStack::scrub_status(Formatter *f) {
       f->dump_stream("path") << "#" << header->get_origin();
 
     f->dump_string("tag", header->get_tag());
+    f->dump_unsigned("scrubbed_inode_count",
+                  header->get_scrubbed_inode_count());
 
     CachedStackStringStream optcss;
     if (header->get_recursive()) {
