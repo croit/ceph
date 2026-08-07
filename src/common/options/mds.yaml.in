@@ -1566,6 +1566,72 @@ options:
   default: 2
   services:
   - mds
+- name: mds_use_global_snaprealm_seq_for_subvol_case_a
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will use the global snaprealm's seq for journal_cow_dentry
+    case A. If disabled, MDS applies the subvolume snaprealm sequence selection
+    to this case.
+  flags:
+  - runtime
+- name: mds_use_global_snaprealm_seq_for_subvol_case_c
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will use the global snaprealm's seq for journal_cow_dentry
+    case C. If disabled, MDS applies the subvolume snaprealm sequence selection
+    to this case.
+  flags:
+  - runtime
+- name: mds_use_global_snaprealm_seq_for_subvol_case_d
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will use the global snaprealm's seq for journal_cow_dentry
+    case D. If disabled, MDS applies the subvolume snaprealm sequence selection
+    to this case.
+  flags:
+  - runtime
+- name: mds_use_global_snaprealm_seq_for_subvol_case_e
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will use the global snaprealm's seq for open-create case E.
+    If disabled, MDS applies the subvolume snaprealm sequence selection to this
+    case.
+  flags:
+  - runtime
+- name: mds_use_global_snaprealm_seq_for_subvol_case_f
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will use the global snaprealm's seq for mknod case F. If
+    disabled, MDS applies the subvolume snaprealm sequence selection to this
+    case.
+  flags:
+  - runtime
+- name: mds_use_global_snaprealm_seq_for_subvol_case_g
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will use the global snaprealm's seq for mkdir case G. If
+    disabled, MDS applies the subvolume snaprealm sequence selection to this
+    case.
+  flags:
+  - runtime
 - name: mds_max_snaps_per_dir
   type: uint
   level: advanced
