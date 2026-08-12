@@ -191,6 +191,14 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   kill_dirfrag_at = static_cast<enum dirfrag_killpoint>(g_conf().get_val<int64_t>("mds_kill_dirfrag_at"));
 
   kill_shutdown_at = g_conf().get_val<uint64_t>("mds_kill_shutdown_at");
+  use_global_snaprealm_seq = g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol");
+
+  use_global_snaprealm_seq_for_subvol_case_a =
+    g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_a");
+  use_global_snaprealm_seq_for_subvol_case_c =
+    g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_c");
+  use_global_snaprealm_seq_for_subvol_case_d =
+    g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_d");
 
   lru.lru_set_midpoint(g_conf().get_val<double>("mds_cache_mid"));
 
@@ -268,6 +276,22 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
   }
   if (changed.count("mds_kill_shutdown_at")) {
     kill_shutdown_at = g_conf().get_val<uint64_t>("mds_kill_shutdown_at");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_a")) {
+    use_global_snaprealm_seq_for_subvol_case_a =
+      g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_a");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_c")) {
+    use_global_snaprealm_seq_for_subvol_case_c =
+      g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_c");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_d")) {
+    use_global_snaprealm_seq_for_subvol_case_d =
+      g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_d");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol")) {
+    use_global_snaprealm_seq = g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol");
+    dout(20) << __func__ << " mds_use_global_snaprealm_seq_for_subvol now " << use_global_snaprealm_seq << dendl;
   }
 
   migrator->handle_conf_change(changed, mdsmap);
@@ -1659,6 +1683,207 @@ CInode *MDCache::cow_inode(CInode *in, snapid_t last)
   return oldin;
 }
 
+void MDCache::dump_snap_seq_state(const char *tag, MutationImpl *mut,
+                                  CDentry *dn, CInode *in, SnapRealm *realm,
+                                  snapid_t follows) {
+  SnapRealm *g = get_global_snaprealm();
+
+  // paths are const helpers (no cache side effects, unlike get_subvolume_ino())
+  auto ipath = [](CInode *i) -> std::string {
+    if (!i)
+      return std::string("(null)");
+    std::string s;
+    i->make_path_string(s);
+    return s.empty() ? std::string("/") : s;
+  };
+  auto dpath = [](CDentry *d) -> std::string {
+    if (!d)
+      return std::string("(null)");
+    std::string s;
+    d->make_path_string(s);
+    return s.empty() ? std::string("(empty)") : s;
+  };
+
+  // Single correlation key printed on EVERY line of this dump: grep one path
+  // to pull the entire related log set.
+  std::string _kpath = ipath(in);
+  const char *_ksrc = "ipath(in)";
+  if (_kpath == "(null)") {
+    _kpath = dpath(dn);
+    _ksrc = "dpath(dn)";
+  }
+  const std::string K =
+      "SNAPSEQ_BUG path=" + _kpath + " path_src=" + _ksrc + " ";
+
+  derr << K << " [" << tag << "]"
+       << " follows=" << follows
+       << " global_newest_seq=" << (g ? g->get_newest_seq() : snapid_t(0))
+       << " realm_newest_seq="
+       << (realm ? realm->get_newest_seq() : snapid_t(0)) << dendl;
+
+  derr << K << "   snapclient: last_created="
+       << mds->snapclient->get_last_created()
+       << " last_destroyed=" << mds->snapclient->get_last_destroyed()
+       << " last_seq=" << mds->snapclient->get_last_seq() << dendl;
+
+  if (g) {
+    derr << K << "   global_realm: " << *g
+         << " srnode(seq=" << g->srnode.seq << " created=" << g->srnode.created
+         << " last_created=" << g->srnode.last_created
+         << " last_destroyed=" << g->srnode.last_destroyed
+         << " subvolume_ino=" << g->get_subvolume_ino() << " flags=0x"
+         << std::hex << g->srnode.flags << std::dec << ")"
+         << " path=" << ipath(g->inode) << dendl;
+  }
+
+  if (dn) {
+    derr << K << "   dn: " << *dn << " dn_first=" << dn->first
+         << " dn_last=" << dn->last << " path=" << dpath(dn) << dendl;
+    if (dn->get_dir() && dn->get_dir()->get_inode()) {
+      CInode *diri = dn->get_dir()->get_inode();
+      derr << K << "   dn_parent: " << *diri
+           << " has_snaprealm=" << (diri->snaprealm ? 1 : 0)
+           << " path=" << ipath(diri) << dendl;
+    }
+  }
+
+  if (in) {
+    derr << K << "   in: " << *in << " ino=" << in->ino()
+         << " first=" << in->first << " last=" << in->last
+         << " multiversion=" << in->is_multiversion()
+         << " has_snaprealm=" << (in->snaprealm ? 1 : 0)
+         << " path=" << ipath(in) << dendl;
+    if (in->snaprealm) {
+      derr << K << "   in->snaprealm: " << *in->snaprealm
+           << " newest_seq=" << in->snaprealm->get_newest_seq()
+           << " subvolume_ino=" << in->snaprealm->get_subvolume_ino()
+           << " is_subvolume=" << in->snaprealm->srnode.is_subvolume() << dendl;
+    }
+
+    derr << K << "   in   ncaps=" << in->get_client_caps().size()
+         << " loner=" << in->get_loner()
+         << " wanted_loner=" << in->get_wanted_loner() << dendl;
+    for (const auto &c : in->get_client_caps()) {
+      derr << K << "   in   cap client." << c.first
+           << " issued=" << ccap_string(c.second.issued())
+           << " pending=" << ccap_string(c.second.pending())
+           << " wanted=" << ccap_string(c.second.wanted())
+           << " client_follows=" << c.second.client_follows
+           << " last_seq=" << c.second.get_last_seq() << dendl;
+    }
+  }
+
+  if (realm) {
+    // ---- current realm: dump everything ----
+    derr << K << "   realm: " << *realm << dendl;
+    derr << K << "   realm   ino="
+         << (realm->inode ? realm->inode->ino() : inodeno_t(0))
+         << " path=" << ipath(realm->inode)
+         << " newest_seq=" << realm->get_newest_seq()
+         << " subvolume_ino=" << realm->get_subvolume_ino()
+         << " is_global=" << (realm == g) << dendl;
+    derr << K << "   realm   srnode: seq=" << realm->srnode.seq
+         << " created=" << realm->srnode.created
+         << " last_created=" << realm->srnode.last_created
+         << " last_destroyed=" << realm->srnode.last_destroyed
+         << " current_parent_since=" << realm->srnode.current_parent_since
+         << " last_modified=" << realm->srnode.last_modified
+         << " change_attr=" << realm->srnode.change_attr << " flags=0x"
+         << std::hex << realm->srnode.flags << std::dec
+         << " is_subvolume=" << realm->srnode.is_subvolume()
+         << " parent_global=" << realm->srnode.is_parent_global() << dendl;
+    derr << K << "   realm   nsnaps=" << realm->srnode.snaps.size()
+         << " npast_parents=" << realm->srnode.past_parents.size()
+         << " npast_parent_snaps=" << realm->srnode.past_parent_snaps.size()
+         << " has_parent=" << (realm->parent ? 1 : 0)
+         << " nopen_children=" << realm->open_children.size() << dendl;
+    for (const auto &s : realm->srnode.snaps) {
+      derr << K << "   realm   snap " << s.first << " " << s.second
+           << dendl;
+    }
+    for (const auto &s : realm->srnode.past_parents) {
+      derr << K << "   realm   past_parent " << s.first << " " << s.second
+           << dendl;
+    }
+    for (const auto &s : realm->srnode.past_parent_snaps) {
+      derr << K << "   realm   past_parent_snap " << s << dendl;
+    }
+    derr << K << "   realm   effective_snaps=" << realm->get_snaps()
+         << dendl;
+    derr << K << "   realm   nclients_with_caps="
+         << realm->client_caps.size() << dendl;
+
+    // ---- ancestors (subvolume_ino and snaps are inherited up this chain) ----
+    int _d = 0;
+    for (SnapRealm *p = realm->parent; p && _d < 32; p = p->parent, ++_d) {
+      derr << K << "   ancestor[" << _d << "]: " << *p << dendl;
+      derr << K << "   ancestor[" << _d
+           << "]   ino=" << (p->inode ? p->inode->ino() : inodeno_t(0))
+           << " path=" << ipath(p->inode)
+           << " newest_seq=" << p->get_newest_seq()
+           << " subvolume_ino=" << p->get_subvolume_ino()
+           << " is_global=" << (p == g) << dendl;
+      derr << K << "   ancestor[" << _d
+           << "]   srnode: seq=" << p->srnode.seq
+           << " created=" << p->srnode.created
+           << " last_created=" << p->srnode.last_created
+           << " last_destroyed=" << p->srnode.last_destroyed
+           << " current_parent_since=" << p->srnode.current_parent_since
+           << " flags=0x" << std::hex << p->srnode.flags << std::dec
+           << " is_subvolume=" << p->srnode.is_subvolume()
+           << " parent_global=" << p->srnode.is_parent_global()
+           << " nsnaps=" << p->srnode.snaps.size() << dendl;
+    }
+  }
+
+  if (mut) {
+    derr << K << "   mut: reqid=" << mut->reqid
+         << " client=" << mut->get_client() << " is_leader=" << mut->is_leader()
+         << " reqid_is_client=" << mut->reqid.name.is_client() << dendl;
+    if (MDRequestImpl *mdr = dynamic_cast<MDRequestImpl *>(mut)) {
+      derr << K << "   mut   mdr: internal_op=" << mdr->internal_op
+           << " has_client_request=" << (mdr->client_request ? 1 : 0)
+           << " has_session=" << (mdr->session ? 1 : 0) << dendl;
+      if (mdr->client_request)
+        derr << K << "   mut   client_request: " << *mdr->client_request
+             << " source=" << mdr->client_request->get_source()
+             << " op=" << ceph_mds_op_name(mdr->client_request->get_op())
+             << dendl;
+      if (mdr->session)
+        derr << K << "   mut   session: " << mdr->session->info.inst
+             << " state=" << mdr->session->get_state_name() << dendl;
+    } else {
+      derr << K << "   mut   (plain MutationImpl: internal/no client -"
+           << " e.g. scatter_writebehind timer path)" << dendl;
+    }
+  }
+}
+
+snapid_t MDCache::get_snap_seq_follows(const char *tag, bool cond,
+                                       SnapRealm *realm, CInode *in) {
+  snapid_t follows;
+  bool using_global_snaprealm_seq = true;
+
+  if (cond) {
+    follows = get_global_snaprealm()->get_newest_seq();
+  } else if (realm->get_subvolume_ino() || realm->get_newest_seq() <= 1) {
+    // A subvolume realm cannot have cross-realm hardlinks or renames. It is
+    // also safe to use the realm sequence when the realm has no snapshots.
+    follows = realm->get_newest_seq();
+    using_global_snaprealm_seq = false;
+  } else {
+    // A non-subvolume realm with snapshots may have cross-realm hardlinks or
+    // renames, so continue using the global sequence.
+    follows = get_global_snaprealm()->get_newest_seq();
+  }
+  dout(5) << __func__ << " " << tag << ": "
+          << " using_global_snaprealm_seq:"
+          << (using_global_snaprealm_seq ? "yes " : "no ") << " follows "
+          << follows << " on " << *in << " snaprealm=" << *realm << dendl;
+
+  return follows;
+}
+
 void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
                                  CDentry *dn, snapid_t follows,
 				 CInode **pcow_inode, CDentry::linkage_t *dnl)
@@ -1688,7 +1913,13 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
     if (in->get_projected_parent_dn() != dn) {
       ceph_assert(follows == CEPH_NOSNAP);
       realm = dn->dir->inode->find_snaprealm();
-      snapid_t dir_follows = get_global_snaprealm()->get_newest_seq();
+      snapid_t dir_follows =
+          get_snap_seq_follows("A:dir_follows",
+                               use_global_snaprealm_seq_for_subvol_case_a,
+                               realm, dn->dir->inode);
+      if (dir_follows < realm->get_newest_seq()) {
+        dump_snap_seq_state("A:dir_follows", mut, dn, in, realm, dir_follows);
+      }
       ceph_assert(dir_follows >= realm->get_newest_seq());
 
       if (dir_follows+1 > dn->first) {
@@ -1712,12 +1943,20 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
       follows = dir_follows;
       if (in->snaprealm) {
 	realm = in->snaprealm;
+	if (follows < realm->get_newest_seq()) {
+	  dump_snap_seq_state("B:in_snaprealm", mut, dn, in, realm, follows);
+	}
 	ceph_assert(follows >= realm->get_newest_seq());
       }
     } else {
       realm = in->find_snaprealm();
       if (follows == CEPH_NOSNAP) {
-	follows = get_global_snaprealm()->get_newest_seq();
+	follows = get_snap_seq_follows("C:multiversion_nosnap",
+				       use_global_snaprealm_seq_for_subvol_case_c,
+				       realm, in);
+	if (follows < realm->get_newest_seq()) {
+	  dump_snap_seq_state("C:multiversion_nosnap", mut, dn, in, realm, follows);
+	}
 	ceph_assert(follows >= realm->get_newest_seq());
       }
     }
@@ -1739,7 +1978,12 @@ void MDCache::journal_cow_dentry(MutationImpl *mut, EMetaBlob *metablob,
   } else {
     SnapRealm *realm = dn->dir->inode->find_snaprealm();
     if (follows == CEPH_NOSNAP) {
-      follows = get_global_snaprealm()->get_newest_seq();
+      follows = get_snap_seq_follows("D:simple_nosnap",
+                                     use_global_snaprealm_seq_for_subvol_case_d,
+                                     realm, dn->dir->inode);
+      if (follows < realm->get_newest_seq()) {
+	dump_snap_seq_state("D:simple_nosnap", mut, dn, in, realm, follows);
+      }
       ceph_assert(follows >= realm->get_newest_seq());
     }
 

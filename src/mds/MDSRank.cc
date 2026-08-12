@@ -4199,7 +4199,14 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_session_cap_acquisition_throttle",
     "mds_session_max_caps_throttle_ratio",
     "mds_session_metadata_threshold",
-    "mds_symlink_recovery"
+    "mds_symlink_recovery",
+    "mds_use_global_snaprealm_seq_for_subvol_case_a",
+    "mds_use_global_snaprealm_seq_for_subvol_case_c",
+    "mds_use_global_snaprealm_seq_for_subvol_case_d",
+    "mds_use_global_snaprealm_seq_for_subvol_case_e",
+    "mds_use_global_snaprealm_seq_for_subvol_case_f",
+    "mds_use_global_snaprealm_seq_for_subvol_case_g"
+    "mds_use_global_snaprealm_seq_for_subvol"
   });
   static_assert(std::is_sorted(as_sv.begin(), as_sv.end()),
                 "keys are not sorted!");

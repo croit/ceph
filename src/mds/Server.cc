@@ -292,6 +292,12 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   bal_fragment_size_max = g_conf().get_val<int64_t>("mds_bal_fragment_size_max");
   dispatch_client_request_delay = g_conf().get_val<std::chrono::milliseconds>("mds_server_dispatch_client_request_delay");
   dispatch_killpoint_random = g_conf().get_val<double>("mds_server_dispatch_killpoint_random");
+  use_global_snaprealm_seq_for_subvol_case_e =
+    g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_e");
+  use_global_snaprealm_seq_for_subvol_case_f =
+    g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_f");
+  use_global_snaprealm_seq_for_subvol_case_g =
+    g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_g");
   supported_features = feature_bitset_t(CEPHFS_FEATURES_MDS_SUPPORTED);
   supported_metric_spec = feature_bitset_t(CEPHFS_METRIC_FEATURES_ALL);
 }
@@ -1394,6 +1400,18 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
     max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
     dout(20) << __func__ << " max snapshots per directory changed to "
             << max_snaps_per_dir << dendl;
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_e")) {
+    use_global_snaprealm_seq_for_subvol_case_e =
+      g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_e");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_f")) {
+    use_global_snaprealm_seq_for_subvol_case_f =
+      g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_f");
+  }
+  if (changed.count("mds_use_global_snaprealm_seq_for_subvol_case_g")) {
+    use_global_snaprealm_seq_for_subvol_case_g =
+      g_conf().get_val<bool>("mds_use_global_snaprealm_seq_for_subvol_case_g");
   }
   if (changed.count("mds_client_delegate_inos_pct")) {
     delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
@@ -4911,7 +4929,12 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
   _inode->accounted_rstat = _inode->rstat;
 
   SnapRealm *realm = diri->find_snaprealm();
-  snapid_t follows = mdcache->get_global_snaprealm()->get_newest_seq();
+  snapid_t follows = mdcache->get_snap_seq_follows(
+    "E:openc", use_global_snaprealm_seq_for_subvol_case_e, realm, diri);
+  if (follows < realm->get_newest_seq()) {
+    mdcache->dump_snap_seq_state("E:openc", mdr.get(), dn, diri, realm,
+                                 follows);
+  }
   ceph_assert(follows >= realm->get_newest_seq());
 
   ceph_assert(dn->first == follows+1);
@@ -6427,7 +6450,7 @@ void Server::handle_client_setvxattr(const MDRequestRef& mdr, CInode *cur)
     try {
       if (is_rmxattr) {
         const auto srnode = cur->get_projected_srnode();
-	if (!srnode->is_subvolume()) {
+	if (srnode && !srnode->is_subvolume()) {
 	  respond_to_request(mdr, 0);
 	  return;
 	}
@@ -7416,8 +7439,13 @@ void Server::handle_client_mknod(const MDRequestRef& mdr)
     _inode->add_old_pool(mdcache->default_file_layout.pool_id);
   _inode->update_backtrace();
 
-  snapid_t follows = mdcache->get_global_snaprealm()->get_newest_seq();
   SnapRealm *realm = dn->get_dir()->inode->find_snaprealm();
+  snapid_t follows = mdcache->get_snap_seq_follows(
+    "F:mknod", use_global_snaprealm_seq_for_subvol_case_f, realm, diri);
+  if (follows < realm->get_newest_seq()) {
+    mdcache->dump_snap_seq_state("F:mknod", mdr.get(), dn, diri, realm,
+                                 follows);
+  }
   ceph_assert(follows >= realm->get_newest_seq());
 
   // if the client created a _regular_ file via MKNOD, it's highly likely they'll
@@ -7525,8 +7553,13 @@ void Server::handle_client_mkdir(const MDRequestRef& mdr)
     c = *csp;
   }
 
-  snapid_t follows = mdcache->get_global_snaprealm()->get_newest_seq();
   SnapRealm *realm = dn->get_dir()->inode->find_snaprealm();
+  snapid_t follows = mdcache->get_snap_seq_follows(
+    "G:mkdir", use_global_snaprealm_seq_for_subvol_case_g, realm, diri);
+  if (follows < realm->get_newest_seq()) {
+    mdcache->dump_snap_seq_state("G:mkdir", mdr.get(), dn, diri, realm,
+                                 follows);
+  }
   ceph_assert(follows >= realm->get_newest_seq());
 
   dout(12) << " follows " << follows << dendl;

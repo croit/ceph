@@ -257,6 +257,10 @@ class MDCache {
     return symlink_recovery;
   }
 
+  bool get_use_global_snaprealm_seq(void) const {
+    return use_global_snaprealm_seq;
+  }
+
   /**
    * Call this when you know that a CDentry is ready to be passed
    * on to StrayManager (i.e. this is a stray you've just created)
@@ -439,6 +443,12 @@ class MDCache {
                           snapid_t follows=CEPH_NOSNAP,
 			  CInode **pcow_inode=0, CDentry::linkage_t *dnl=0);
   void journal_dirty_inode(MutationImpl *mut, EMetaBlob *metablob, CInode *in, snapid_t follows=CEPH_NOSNAP);
+  // DEBUG: dump snaprealm/snapclient seq state when the cow seq invariant
+  // (follows >= realm->get_newest_seq()) is about to be violated.
+  void dump_snap_seq_state(const char *tag, MutationImpl *mut, CDentry *dn,
+			   CInode *in, SnapRealm *realm, snapid_t follows);
+  snapid_t get_snap_seq_follows(const char *tag, bool cond,
+                                SnapRealm *realm, CInode *in);
 
   void project_rstat_inode_to_frag(const MutationRef& mut,
 				   CInode *cur, CDir *parent, snapid_t first,
@@ -1589,6 +1599,10 @@ private:
 
   // -- snaprealms --
   SnapRealm *global_snaprealm = nullptr;
+  bool use_global_snaprealm_seq_for_subvol_case_a = true;
+  bool use_global_snaprealm_seq_for_subvol_case_c = true;
+  bool use_global_snaprealm_seq_for_subvol_case_d = true;
+  bool use_global_snaprealm_seq = true;
 
   std::map<dirfrag_t, ufragment> uncommitted_fragments;
 

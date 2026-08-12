@@ -621,6 +621,9 @@ private:
   uint64_t dir_max_entries = 0;
   int64_t bal_fragment_size_max = 0;
   bool allow_batched_ops = true;
+  bool use_global_snaprealm_seq_for_subvol_case_e = true;
+  bool use_global_snaprealm_seq_for_subvol_case_f = true;
+  bool use_global_snaprealm_seq_for_subvol_case_g = true;
 
   double inject_rename_corrupt_dentry_first = 0.0;
 
