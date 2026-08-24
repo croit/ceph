@@ -9903,6 +9903,7 @@ void MDCache::request_cleanup(MDRequestRef& mdr)
     //the new "head of the batch ops" and go on processing the new one.
     int mask = mdr->client_request->head.args.getattr.mask;
     auto it = mdr->batch_op_map->find(mask);
+    ceph_assert(it != mdr->batch_op_map->end());
     auto new_batch_head = it->second->find_new_head();
     if (!new_batch_head) {
       mdr->batch_op_map->erase(it);
@@ -9910,6 +9911,8 @@ void MDCache::request_cleanup(MDRequestRef& mdr)
     else {
       mds->finisher->queue(new C_MDS_RetryRequest(this, new_batch_head));
     }
+    /* this request is dead and owns no entry in that map anymore */
+    mdr->batch_op_map = nullptr;
   }
 
   if (mdr->has_more()) {
