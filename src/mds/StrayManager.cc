@@ -37,6 +37,48 @@ static ostream& _prefix(std::ostream *_dout, MDSRank *mds) {
   return *_dout << "mds." << mds->get_nodeid() << ".cache.strays ";
 }
 
+static void dump_purge_state_mismatch(
+    MDSRank *mds, const char *phase, CInode *in, int expected_in_refs,
+    CDentry *dn, int expected_dn_refs, bool expect_null_projected)
+{
+  auto *dnl = dn->get_projected_linkage();
+  int in_refs = in->get_num_ref();
+  int dn_refs = dn->get_num_ref();
+  bool state_fragmenting = dn->state_test(CDentry::STATE_FRAGMENTING);
+  bool bad_in_refs = in_refs != expected_in_refs;
+  bool bad_dn_refs = dn_refs != expected_dn_refs;
+  bool bad_projected_linkage =
+      expect_null_projected && !dnl->is_null();
+
+  derr << __func__ << ": stray purge state mismatch"
+       << ", phase=" << phase
+       << ", bad_inode_refs=" << bad_in_refs
+       << ", bad_dentry_refs=" << bad_dn_refs
+       << ", bad_projected_linkage=" << bad_projected_linkage
+       << ", in_refs=" << in_refs
+       << ", expected_in_refs=" << expected_in_refs
+       << ", dn_refs=" << dn_refs
+       << ", expected_dn_refs=" << expected_dn_refs
+       << ", state_fragmenting=" << state_fragmenting
+       << ", expect_null_projected=" << expect_null_projected
+       << ", is_projected=" << dn->is_projected()
+       << ", projected_type="
+       << (dnl->is_primary() ? "primary" :
+           dnl->is_remote() ? "remote" : "null")
+       << ", projected_inode=" << dnl->get_inode()
+       << ", remote_ino=" << dnl->get_remote_ino()
+       << ", remote_type="
+       << static_cast<unsigned>(dnl->get_remote_d_type()) << dendl;
+  derr << __func__ << ": phase=" << phase
+       << ", inode (named pins and state): " << *in << dendl;
+  derr << __func__ << ": phase=" << phase
+       << ", dentry (named pins and state): " << *dn << dendl;
+  derr << __func__ << ": phase=" << phase
+       << ", expected dentry refs: dirty=" << !!dn->is_dirty()
+       << ", fragmenting=" << state_fragmenting
+       << ", inodepin=" << !!in_refs << ", purging=1" << dendl;
+}
+
 class StrayManagerIOContext : public virtual MDSIOContextBase {
 protected:
   StrayManager *sm;
@@ -219,6 +261,12 @@ void StrayManager::_purge_stray_purged(
       // is being purged (aside from it were 
 
       derr << "Rogue reference after purge to " << *dn << " " << *in << dendl;
+      int expected_in_refs = (int)in->is_dirty();
+      int expected_dn_refs = (int)dn->is_dirty() +
+                             !!dn->state_test(CDentry::STATE_FRAGMENTING) +
+                             !!in->get_num_ref() + 1; /* PIN_PURGING */
+      dump_purge_state_mismatch(mds, "purge-queue-callback", in,
+                                expected_in_refs, dn, expected_dn_refs, false);
       ceph_abort_msg("rogue reference to purging inode");
     }
 
@@ -262,8 +310,18 @@ void StrayManager::_purge_stray_logged(CDentry *dn, version_t pdv, MutationRef& 
 
   bool new_dn = dn->is_new();
 
+  int expected_in_refs = (int)in->is_dirty();
+  auto *dnl = dn->get_projected_linkage();
+  if (in->get_num_ref() != expected_in_refs || !dnl->is_null()) {
+    int expected_dn_refs = (int)dn->is_dirty() +
+                           !!dn->state_test(CDentry::STATE_FRAGMENTING) +
+                           !!in->get_num_ref() + 1; /* PIN_PURGING */
+    dump_purge_state_mismatch(mds, "purge-log-callback", in,
+                              expected_in_refs, dn, expected_dn_refs, true);
+  }
+
   // unlink
-  ceph_assert(dn->get_projected_linkage()->is_null());
+  ceph_assert(dnl->is_null());
   dir->unlink_inode(dn, !new_dn);
   dn->pop_projected_linkage();
   dn->mark_dirty(pdv, mut->ls);
@@ -791,4 +849,3 @@ void StrayManager::_truncate_stray_logged(CDentry *dn, MutationRef& mut)
   if (!dn->state_test(CDentry::STATE_PURGING) &&  mds->is_stopping())
     mds->mdcache->shutdown_export_stray_finish(in->ino());
 }
-
