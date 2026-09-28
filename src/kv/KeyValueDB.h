@@ -153,7 +153,8 @@ public:
     virtual void rm_range_keys(
       const std::string &prefix,    ///< [in] Prefix by which to remove keys
       const std::string &start,     ///< [in] The start bound of remove keys
-      const std::string &end        ///< [in] The start bound of remove keys
+      const std::string &end,       ///< [in] The start bound of remove keys
+      bool enforced = false         ///< [in] Enforce ranged delete if supported
       ) = 0;
 
     /// Merge value into key

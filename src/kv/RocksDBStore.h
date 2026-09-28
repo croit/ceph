@@ -363,7 +363,8 @@ public:
     void rm_range_keys(
       const std::string &prefix,
       const std::string &start,
-      const std::string &end) override;
+      const std::string &end,
+      bool enforced = false) override;
     void merge(
       const std::string& prefix,
       const std::string& k,

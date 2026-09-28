@@ -1795,7 +1795,8 @@ void RocksDBStore::RocksDBTransactionImpl::rmkeys_by_prefix(const string &prefix
 
 void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
                                                          const string &start,
-                                                         const string &end)
+                                                         const string &end,
+							 bool enforced)
 {
   ldout(db->cct, 10) << __func__
                      << " enter prefix=" << prefix
@@ -1806,16 +1807,18 @@ void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
   if (p_iter == db->cf_handles.end()) {
     uint64_t cnt0 = cnt;
     bat.SetSavePoint();
-    auto it = db->get_iterator(prefix);
-    for (it->lower_bound(start);
-	 it->valid() && db->comparator->Compare(it->key(), end) < 0 && (--cnt) != 0;
-	 it->next()) {
-      bat.Delete(db->default_cf, combine_strings(prefix, it->key()));
+    if (!enforced) {
+      auto it = db->get_iterator(prefix);
+      for (it->lower_bound(start);
+	   it->valid() && db->comparator->Compare(it->key(), end) < 0 && (--cnt) != 0;
+	   it->next()) {
+	bat.Delete(db->default_cf, combine_strings(prefix, it->key()));
+      }
+      ldout(db->cct, 15) << __func__
+			 << " count = " << cnt0 - cnt
+			 << dendl;
     }
-    ldout(db->cct, 15) << __func__
-                       << " count = " << cnt0 - cnt
-                       << dendl;
-    if (cnt == 0) {
+    if (cnt == 0 || enforced) {
       ldout(db->cct, 10) << __func__ << " p_iter == end(), resorting to DeleteRange"
 			 << dendl;
       bat.RollbackToSavePoint();
@@ -1825,7 +1828,7 @@ void RocksDBStore::RocksDBTransactionImpl::rm_range_keys(const string &prefix,
     } else {
       bat.PopSavePoint();
     }
-  } else if (cnt == 0) {
+  } else if (cnt == 0 || enforced) {
     ceph_assert(p_iter->second.handles.size() >= 1);
     for (auto cf : p_iter->second.handles) {
       ldout(db->cct, 10) << __func__ << " p_iter != end(), resorting to DeleteRange"

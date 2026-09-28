@@ -136,7 +136,7 @@ public:
       }
     };
 
-    void rm_range_keys(const std::string &prefix, const std::string &start, const std::string &end) {
+    void rm_range_keys(const std::string &prefix, const std::string &start, const std::string &end, bool enforced = false) {
       on_commit.push_back(new RmRangeKeys(db, prefix, start, end));
     }
 
