@@ -1602,13 +1602,17 @@ int ECBackend::be_deep_scrub(
   auto& perf_logger = *(get_parent()->get_logger());
   perf_logger.inc(io_counters.read_cnt);
   bufferlist bl;
+  auto fadv_flags = ECCommon::scrub_fadvise_flags;
+  if (get_parent()->pgb_is_primary()) {
+    fadv_flags |= CEPH_OSD_OP_FLAG_PRIMARY;
+  }
   r = switcher->store->read(
     switcher->ch,
     ghobject_t(
       poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
     pos.data_pos,
     stride, bl,
-    ECCommon::scrub_fadvise_flags);
+    fadv_flags);
   if (r < 0) {
     dout(20) << __func__ << "  " << poid << " got "
 	     << r << " on read, read_error" << dendl;

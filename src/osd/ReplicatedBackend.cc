@@ -813,10 +813,14 @@ std::optional<int32_t> ReplicatedBackend::be_deep_scrub_read_data(
   auto& perf_logger = *(get_parent()->get_logger());
   perf_logger.inc(io_counters.read_cnt);
   bufferlist bl;
+  auto fadv_flags = scrub_fadvise_flags;
+  if (get_parent()->pgb_is_primary()) {
+    fadv_flags |= CEPH_OSD_OP_FLAG_PRIMARY;
+  }
   const int r = store->read(
       ch,
       ghobject_t(poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
-      pos.data_pos, to_read, bl, scrub_fadvise_flags);
+      pos.data_pos, to_read, bl, fadv_flags);
   if (r < 0) {
     dout(5) << fmt::format(
                    "{}: {} got {} on read, read_error", __func__, poid, r)

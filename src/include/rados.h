@@ -507,6 +507,7 @@ enum {
 									 * and handle them separately from normal ops,
 									 * apply scrub-specific behavior (e.g. bypassing clean cache)
 									 */
+        CEPH_OSD_OP_FLAG_PRIMARY = 0x200,	/* if current OSD primary for PG-in-action */
 };
 
 #define EOLDSNAPC    85  /* ORDERSNAP flag set; writer has old snapc*/
