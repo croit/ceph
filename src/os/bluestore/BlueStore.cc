@@ -66,6 +66,7 @@
 #include "Compression.h"
 #include "BlueAdmin.h"
 #include "OnodeReformat.h"
+#include "DedupStatsCollector.h"
 #include "extblkdev/ExtBlkDevPlugin.h"
 
 #if defined(WITH_LTTNG)
@@ -145,6 +146,7 @@ const string PREFIX_DEFERRED = "L";    // id -> deferred_transaction_t
 const string PREFIX_ALLOC = "B";       // u64 offset -> u64 length (freelist)
 const string PREFIX_ALLOC_BITMAP = "b";// (see BitmapFreelistManager)
 const string PREFIX_SHARED_BLOB = "X"; // u64 SB id -> shared_blob_t
+extern const string PREFIX_DEDUP_CSUM; // = "D"
 
 const string BLUESTORE_GLOBAL_STATFS_KEY = "bluestore_statfs";
 
@@ -5879,6 +5881,7 @@ BlueStore::BlueStore(CephContext *cct,
   set_cache_shards(1);
   bluestore_bdev_label_require_all = cct->_conf.get_val<bool>("bluestore_bdev_label_require_all");
   asok_hook = new SocketHook(*this);
+  dedup_collector = std::make_unique<DedupStatsCollector>(cct);
 }
 
 BlueStore::~BlueStore()
@@ -6720,6 +6723,9 @@ void BlueStore::_init_logger()
   b.add_time_avg(l_bluestore_clist_lat, "clist_lat",
     "Average collection listing latency",
     "cl_l", PerfCountersBuilder::PRIO_USEFUL);
+  b.add_time_avg(l_bluestore_dedup_list_lat, "dedup_list_lat",
+    "Average dedup candidates listing latency",
+    "dl_l", PerfCountersBuilder::PRIO_USEFUL);
   b.add_time_avg(l_bluestore_remove_lat, "remove_lat",
     "Average removal latency",
     "rm_l", PerfCountersBuilder::PRIO_USEFUL);
@@ -9883,6 +9889,9 @@ int BlueStore::_mount()
     bluefs->spillover_cleaner_start();
   }
 
+  if (dedup_collector)
+    dedup_collector->start();
+
   mounted = true;
   return 0;
 }
@@ -9896,6 +9905,8 @@ int BlueStore::umount()
   if (bluefs) {
     bluefs->spillover_cleaner_stop();
   }
+  if (dedup_collector)
+    dedup_collector->stop();
 
   mounted = false;
 
@@ -13102,7 +13113,10 @@ void BlueStore::_update_reformat_engines(Collection* c)
       std::min(args.find_first_not_of(" \t\n\r\f\v"), args.size()));
     int e = -1;
     OnodeReformatEngine* engine = nullptr;
-    if (args.starts_with("recompress")) {
+    if (args.starts_with("collect_csum")) {
+      e = CHECKSUM_COLLECTION_ENGINE;
+      engine = new OnodeChecksumCollectEngine(args);
+    } else if (args.starts_with("recompress")) {
       e = RECOMPRESS_ENGINE;
       engine = new OnodeReformatRecompressEngine(args);
     } else if (args.starts_with("defragment")) {
@@ -14504,6 +14518,75 @@ int BlueStore::_collection_list(
   *pnext = ghobject_t::get_max();
   return 0;
 }
+
+int BlueStore::dedup_candidate_list(
+  int64_t pool,
+  uint64_t digest_msb,
+  size_t digest_msb_bits,
+  size_t digest_all_bits,
+  const ceph::mono_clock::time_point& retrieve_after_btime,
+  const ceph::mono_clock::time_point& remove_before_btime,
+  int max_return,
+  int max_deletion,
+  double max_duration,
+  std::vector<std::string>& ls,
+  std::string* pnext)
+{
+  auto start_time = mono_clock::now();
+  auto log_latency = make_scope_guard(
+    [&, func_name = __func__] {
+      log_latency_fn(
+	func_name,
+	l_bluestore_dedup_list_lat,
+	mono_clock::now() - start_time,
+	max_duration * 2, // log if duration is 2x times longer than requested
+	[&](const ceph::timespan& lat) {
+	  ostringstream ostr;
+	  ostr << ", lat = " << timespan_str(lat)
+	    << " pool =" << pool
+	    << " digest_msb " << digest_msb
+	    << " max_ret " << max_return
+	    << " max_del " << max_deletion
+	    << " max_dur " << max_duration;
+	  return ostr.str();
+	});
+    });
+
+  ceph_assert(db);
+  return dedup_collector->list_candidates(
+    *db,
+    pool,
+    digest_msb,
+    digest_msb_bits,
+    digest_all_bits,
+    retrieve_after_btime,
+    remove_before_btime,
+    max_return,
+    max_deletion,
+    max_duration,
+    ls,
+    pnext);
+}
+
+int BlueStore::clear_dedup_info(int64_t pool, bool async_compact)
+{
+  ceph_assert(db);
+  return dedup_collector->clear_all_candidates(
+    *db,
+    pool,
+    async_compact);
+}
+
+int64_t BlueStore::estimate_dedup_info(int64_t pool,
+  uint64_t* entry_count)
+{
+  ceph_assert(db);
+  return dedup_collector->estimate_size(
+    *db,
+    pool,
+    entry_count);
+}
+
 
 int BlueStore::omap_get(
   CollectionHandle &c_,    ///< [in] Collection containing oid

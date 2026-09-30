@@ -182,6 +182,18 @@ BlueStore::SocketHook::SocketHook(BlueStore& store)
                                        "Instruct BlueFS to check the size of its block devices"
                                        " and, if they have expanded, make use of the additional space.");
     ceph_assert(r == 0);
+    r = admin_socket->register_command(
+      "bluestore dedup stats "
+      "name=pool,type=CephInt,req=true",
+      this,
+      "print statistics for accumulated deduplication info, per pool");
+    ceph_assert(r == 0);
+    r = admin_socket->register_command(
+      "bluestore dedup clear "
+      "name=pool,type=CephInt,req=true",
+      this,
+      "clear accumulated deduplication info, per pool");
+    ceph_assert(r == 0);
   }
 }
 
@@ -437,6 +449,41 @@ int BlueStore::SocketHook::call(
       out.append(result.str());
     }
     return ret;
+  } else if (command == "bluestore dedup stats") {
+    int64_t pool = -1;
+    cmd_getval(cmdmap, "pool", pool);
+    if (pool < 0) {
+      ss << "Invalid pool id:" << pool << std::endl;
+      r = -EINVAL;
+    } else {
+      uint64_t entries = 0;
+      auto sz = store.estimate_dedup_info(pool, &entries);
+      if (sz >= 0) {
+        f->open_object_section("deduplication stats");
+        f->dump_unsigned("pool", pool);
+        f->dump_unsigned("bytes", (uint64_t)sz);
+        f->dump_unsigned("entries", entries);
+        f->close_section();
+      } else {
+        ss << "Execution error" << std::endl;
+        r = -EIO;
+      }
+    }
+    return r;
+  } else if (command == "bluestore dedup clear") {
+    int64_t pool = -1;
+    cmd_getval(cmdmap, "pool", pool);
+    if (pool < 0) {
+      ss << "Invalid pool id:" << pool << std::endl;
+      r = -EINVAL;
+    } else {
+      auto err = store.clear_dedup_info(pool, true);
+      if (err < 0) {
+        ss << "Execution error:" << cpp_strerror(err) << std::endl;
+        r = -EIO;
+      }
+    }
+    return r;
   } else {
     ss << "Invalid command" << std::endl;
     r = -ENOSYS;

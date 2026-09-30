@@ -22,7 +22,8 @@ add_library(bluestore OBJECT
   OnodeScan.cc
   BlueAdmin.cc
   BlueEnv.cc
-  OnodeReformat.cc)
+  OnodeReformat.cc
+  DedupStatsCollector.cc)
 
 target_link_libraries(bluestore
   PRIVATE

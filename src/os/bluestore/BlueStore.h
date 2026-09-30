@@ -1,4 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab
 
 /*
@@ -74,6 +75,7 @@ class BlueStoreRepairer;
 class SimpleBitmap;
 class OnodeReformatContext;
 class OnodeReformatEngine;
+class DedupStatsCollector;
 using reformat_engines_t =
   std::array<std::shared_ptr<OnodeReformatEngine>, MAX_REFORMAT_ENGINES>;
 
@@ -233,6 +235,7 @@ enum {
   l_bluestore_omap_get_values_lat,
   l_bluestore_omap_clear_lat,
   l_bluestore_clist_lat,
+  l_bluestore_dedup_list_lat,
   l_bluestore_remove_lat,
   l_bluestore_truncate_lat,
   l_bluestore_exists_lat,
@@ -283,6 +286,7 @@ enum {
   l_bluestore_reformat_defragment_attempted,
   l_bluestore_reformat_defragment_omitted,
   l_bluestore_reformat_issued,
+  //l_bluestore_reformat_csum_collected,
   //****************************************
 
   l_bluestore_last
@@ -2512,6 +2516,8 @@ private:
   Allocator *alloc = nullptr;   ///< allocator consumed by BlueStore
   bluefs_shared_alloc_context_t shared_alloc; ///< consumed by BlueFS (may be == alloc)
 
+  std::unique_ptr<DedupStatsCollector> dedup_collector;
+
   uuid_d fsid;
   int path_fd = -1;  ///< open handle to $path
   int fsid_fd = -1;  ///< open handle (locked) to $path/fsid
@@ -3608,6 +3614,24 @@ public:
                              int max,
                              std::vector<ghobject_t> *ls,
                              ghobject_t *next) override;
+
+  // returns:
+  // >0 - amount of retrieved entries, more entries to be retrieved
+  //  0 - interrupted, more entries to be retrieved,
+  // -1 - end of list, no more entries
+  int dedup_candidate_list(int64_t pool,
+                            uint64_t digest_msb,
+			    size_t digest_msb_bits,
+			    size_t all_digest_bits,
+                            const ceph::mono_clock::time_point& retrieve_after_btime,
+			    const ceph::mono_clock::time_point& remove_before_btime,
+                            int max_return,
+                            int max_deletion,
+                            double max_duration,
+			    std::vector<std::string>& ls,
+			    std::string* pnext);
+  int clear_dedup_info(int64_t pool, bool async_compact);
+  int64_t estimate_dedup_info(int64_t pool, uint64_t* entry_count);
 
   int omap_get(
     CollectionHandle &c,     ///< [in] Collection containing oid

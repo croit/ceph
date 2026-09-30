@@ -85,8 +85,11 @@ enum {
   // Then the engines passed the validation are offered to execution
   // by OnodeReformatEngine::execute() call.
   // And the first successful one terminates the enumeration.
-  RECOMPRESS_ENGINE = 0,
-  DEFRAGMENT_ENGINE = 1,
+  CHECKSUM_COLLECTION_ENGINE = 0, // This should stay prior to any engine able
+                                  // to terminate the processing, i.e. returning true
+                                  // from execute() call.
+  RECOMPRESS_ENGINE = 1,
+  DEFRAGMENT_ENGINE = 2,
   MAX_REFORMAT_ENGINES
 };
 

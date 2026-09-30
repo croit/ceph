@@ -5517,7 +5517,7 @@ options:
     and B prefixes is inadvised. The optimal value depends on many factors and changing it
     is inadvisable. This setting is applied only when the OSD runs ``--mkfs``; later starts
     read the sharding from disk.
-  default: m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} L=min_write_buffer_number_to_merge=32 P=min_write_buffer_number_to_merge=32
+  default: D(3,0-24) m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} L=min_write_buffer_number_to_merge=32 P=min_write_buffer_number_to_merge=32
 - name: bluestore_async_db_compaction
   type: bool
   level: dev

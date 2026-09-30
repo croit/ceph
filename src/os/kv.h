@@ -73,4 +73,17 @@ inline static const char *_key_decode_u64(const char *key, uint64_t *pu) {
   return key + 8;
 }
 
+template<typename T>
+inline static void _key_encode_any_int(uint64_t u, size_t n, T* key) {
+  uint64_t bu;
+#ifdef CEPH_BIG_ENDIAN
+  bu = swab(u);
+#elif defined(CEPH_LITTLE_ENDIAN)
+  bu = u;
+#else
+# error wtf
+#endif
+  key->append((char*)&bu, n);
+}
+
 #endif

@@ -42,6 +42,18 @@ public:
     PerfCounters& _logger) override;
 };
 
+class OnodeChecksumCollectEngine : public OnodeReformatEngine {
+  BlueStore::Collection* c;
+public:
+  OnodeChecksumCollectEngine(std::string_view args)
+    : OnodeReformatEngine(args)
+  {
+  }
+  bool validate(OnodeReformatContext& ctx) override;
+  bool execute(OnodeReformatContext& ctx,
+    PerfCounters& _logger) override;
+};
+
 class OnodeReformatContext : public BlueStore::read_context_t {
 
 private:

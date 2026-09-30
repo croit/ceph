@@ -77,7 +77,7 @@ static uint64_t get_testing_seed(const char* function) {
 
 #define TEST_RANDOM_SEED get_testing_seed(__func__)
 
-static bool bl_eq(bufferlist& expected, bufferlist& actual)
+static bool bl_eq(const bufferlist& expected, const bufferlist& actual)
 {
   if (expected.contents_equal(actual))
     return true;
@@ -14332,6 +14332,221 @@ TEST_P(StoreTestReformatting, LazyCompressionTest) {
     ASSERT_EQ(r, 0);
   }
 }
+
+#include "common/ceph_crypto.h"
+TEST_P(StoreTestReformatting, CollectCsumTest) {
+
+  // enforce 'ssd' settings to avoid deferred writes
+  // which result in cached data blocks and hence
+  // prevents from reformatting
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  //use 8 bytes for pool id + 16 for md5 digest -> 24 bytes for hash end
+  SetVal(g_conf(), "bluestore_rocksdb_cfs", "D(3,0-24) m(3) p(3,0-12) O(3,0-13)=block_cache={type=binned_lru} L=min_write_buffer_number_to_merge=32 P=min_write_buffer_number_to_merge=32");
+
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  ghobject_t obj2(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+  ghobject_t obj3(hobject_t(sobject_t("Object 3", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  const PerfCounters* logger = store->get_perf_counters();
+
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "collect_csum");
+
+  store->set_collection_opts(ch, popts);
+
+  auto ts0 = ceph::mono_clock::now();
+
+  cerr << "Creating collection " << cid << std::endl;
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  cerr << "Making object " << cid << " " << obj << std::endl;
+  auto wait_fn = [&]() {
+    C_SaferCond c;
+    ObjectStore::Transaction t;
+    t.touch(cid, obj);
+    t.register_on_complete(&c);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+    c.wait();
+    };
+  bufferlist expected_bl, expected_bl3;
+  uint64_t len = 500 * 1024;
+  uint64_t len3 = len / 3;
+  expected_bl.append(std::string(len, 'a'));
+  expected_bl3.append(std::string(len3, 'a'));
+
+  auto list_dedup_candidates = [&](ceph::mono_clock::time_point take_after,
+				    ceph::mono_clock::time_point remove_prior,
+				    int max,
+				    std::vector<std::string>& ls) {
+    std::string next;
+    r = 0;
+    ls.clear();
+    next.clear();
+    r = 0;
+    for (size_t i = 0; i < 32; i++) {
+      int delta;
+      do {
+	delta = bstore->dedup_candidate_list(cid.pool(),
+	  i,
+	  5,
+	  CEPH_CRYPTO_MD5_DIGESTSIZE * 8,
+	  take_after,
+	  remove_prior,
+	  max,
+	  0,   // no delete count restriction
+	  0.0, // no exec time restriction
+	  ls,
+	  &next);
+	r += delta >= 0 ? delta : 0;
+      } while ((delta > 0) || (delta == -EINTR));
+      next.clear();
+    }
+    return r;
+  };
+  auto test_read = [&](
+    const ghobject_t& obj,
+    size_t len,
+    const bufferlist& expected_bl,
+    int flags = CEPH_OSD_OP_FLAG_SCRUB |
+		CEPH_OSD_OP_FLAG_PRIMARY) {
+    bufferlist bl;
+    auto count0 = logger->get_tavg_ns(l_bluestore_reformat_lat).second;
+
+    int r = store->read(ch, obj, 0, len, bl, flags);
+    bool b1 = r == (int)len;
+    EXPECT_TRUE (b1) << " read len is unexpected:" << r;
+    bool b2 = bl_eq(expected_bl, bl);
+    EXPECT_TRUE(b2) << " read data is unexpected.";
+    auto count = logger->get_tavg_ns(l_bluestore_reformat_lat).second;
+    bool b3;
+    if (flags & CEPH_OSD_OP_FLAG_PRIMARY) {
+      b3 = count0 + 1 == count;
+    } else {
+      b3 = count0 == count;
+    }
+    EXPECT_TRUE(b3) << " reformat counter is unexpected:" << count;
+    return b1 && b2 && b3;
+  };
+  {
+    C_SaferCond c;
+    ObjectStore::Transaction t;
+    t.write(cid, obj, 0, len, expected_bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.write(cid, obj2, 0, len, expected_bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.write(cid, obj3, 0, len3, expected_bl3, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.register_on_complete(&c);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+    c.wait();
+  }
+  wait_fn();
+  cerr << "Collecting csum..." << std::endl;
+  ASSERT_TRUE(test_read(obj, len, expected_bl));
+
+  //This wouldn't be noted for dedup as it doesn't indicate PG is primary
+  ASSERT_TRUE(test_read(obj, len, expected_bl,
+    CEPH_OSD_OP_FLAG_SCRUB));
+
+  cerr << "Collecting csum again..." << std::endl;
+  ASSERT_TRUE(test_read(obj, len, expected_bl));
+
+  cerr << "Collecting csum for obj2..." << std::endl;
+  ASSERT_TRUE(test_read(obj2, len, expected_bl));
+
+  cerr << "Collecting csum for obj3..." << std::endl;
+  ASSERT_TRUE(test_read(obj3, len3, expected_bl3));
+
+  std::vector<std::string> ls;
+  r = list_dedup_candidates(
+    ts0,
+    ceph::mono_clock::time_point(),
+    1,
+    ls);
+  ASSERT_EQ(r, 4);
+  ASSERT_EQ(ls.size(), 4);
+  {
+    uint64_t entries = 0;
+    auto sz = bstore->estimate_dedup_info(cid.pool(), &entries);
+    cerr << "Current dedup info size = " << sz <<"bytes, " << entries << " records" << std::endl;
+  }
+
+  auto ts = ceph::mono_clock::now();
+  r = list_dedup_candidates(
+    ts,
+    ceph::mono_clock::time_point(),
+    1,
+    ls);
+  ASSERT_EQ(r, 0);
+  ASSERT_EQ(ls.size(), 0);
+
+  cerr << "Collecting 2 csums one more time..." << std::endl;
+  ASSERT_TRUE(test_read(obj, len, expected_bl));
+  ASSERT_TRUE(test_read(obj2, len, expected_bl));
+
+  r = list_dedup_candidates(
+    ts,
+    ts,
+    1,
+    ls);
+  ASSERT_EQ(r, 2);
+  ASSERT_EQ(ls.size(), 2);
+
+  // We've just removed old (t < ts) entries hence another listing
+  // with original time frame settings (ts0, now) should return less
+  // entries (1 vs. original 4)
+  r = list_dedup_candidates(
+    ts0,
+    mono_clock::now(),
+    1,
+    ls);
+  ASSERT_EQ(r, 2);
+  ASSERT_EQ(ls.size(), 2);
+
+  uint64_t entries = 0;
+  auto sz0 = bstore->estimate_dedup_info(cid.pool(), &entries);
+  cerr << "Cleaning dedup info, current bytes = " << sz0
+       << ", " << entries << " entries"
+       << std::endl;
+  bstore->clear_dedup_info(cid.pool(), false);
+  entries = 0;
+  auto sz = bstore->estimate_dedup_info(cid.pool(), &entries);
+  cerr << "Cleaned dedup info, current bytes = " << sz
+       << ", " << entries << " entries"
+       << std::endl;
+
+  // Now the list should be empty
+  r = list_dedup_candidates(
+    ts0,
+    mono_clock::now(),
+    1,
+    ls);
+  ASSERT_EQ(r, 0);
+  ASSERT_EQ(ls.size(), 0);
+
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove(cid, obj2);
+    t.remove(cid, obj3);
+    t.remove_collection(cid);
+    cerr << "Cleaning" << std::endl;
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Vary write_v2 mode
 INSTANTIATE_TEST_SUITE_P(
   BlueStore,

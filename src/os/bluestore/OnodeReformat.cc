@@ -1,12 +1,14 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab
 
+#include <random>
 #include "common/ceph_context.h"
 #include "common/dout.h"
 
 #include "include/intarith.h"
 #include "include/ceph_assert.h"
 
+#include "os/kv.h"
 #include "OnodeReformat.h"
 #include "Allocator.h"
 
@@ -175,6 +177,58 @@ bool OnodeReformatDefragmentEngine::execute(OnodeReformatContext& ctx,
     << " apply: " << will_do
     << dendl;
   return will_do;
+};
+
+/////////////////////////////////////////
+/// OnodeChecksumCollectEngine
+/////////////////////////////////////////
+#include "DedupStatsCollector.h"
+
+std::string bin2hex_str(const std::string& s);
+
+/*std::string get_dedup_entry_key(int64_t pool,
+                                const ghobject_t& oid, const std::string& digest,
+                                const mono_clock::time_point& ts);*/
+
+#undef dout_prefix
+#define dout_prefix *_dout << "OnodeChecksumCollectEngine"
+
+bool OnodeChecksumCollectEngine::validate(OnodeReformatContext& ctx)
+{
+  auto kv = ctx.store.get_kv();
+  if (!kv)
+    return false;
+
+  ceph_assert(ctx.store.cct);
+  bool will_handle = false;
+  uint64_t want_flags = CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY;
+  if ((ctx.op_flags & want_flags) == want_flags) {
+    will_handle = ctx.offset == 0 && ctx.length == ctx.o->onode.size;
+    if (!will_handle) {
+      ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"
+	<< " skipped due to incomplete object read "
+	<< ctx.offset << "~" << ctx.length << " vs. 0~" << ctx.o->onode.size
+	<< dendl;
+    } else {
+      ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"
+	<< " enabled "
+	<< dendl;
+    }
+  }
+  return will_handle;
+}
+
+bool OnodeChecksumCollectEngine::execute(OnodeReformatContext& ctx,
+  PerfCounters& logger)
+{
+  ceph_assert(ctx.store.get_kv());
+  DedupStatsCollector::record_candidate(
+    ctx.store.cct,
+    *ctx.store.get_kv(),
+    ctx.o->c->pool(),
+    ctx.o->oid,
+    ctx.bl);
+  return false; // let other engines work too, FIXME: what happens if rewrite occurs? Shouldn't we omit mtime change then?
 };
 
 /////////////////////////////////////////
