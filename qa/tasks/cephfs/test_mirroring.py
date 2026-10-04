@@ -1,18 +1,653 @@
 import os
+import copy
 import json
 import errno
+import importlib.util
 import logging
 import random
+import sys
 import time
+import types
 
 from io import StringIO
-from collections import deque
+from collections import Counter, deque
 
 from tasks.cephfs.cephfs_test_case import CephFSTestCase
 from teuthology.exceptions import CommandFailedError
 from teuthology.contextutil import safe_while
 
 log = logging.getLogger(__name__)
+pw_log = logging.getLogger('tasks.vstart_runner')
+
+mgr_python_path = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), '..', '..', '..', 'src', 'pybind', 'mgr'))
+
+
+def _load_mirroring_fs_module(name):
+    mirroring_path = os.path.join(mgr_python_path, 'mirroring')
+    fs_path = os.path.join(mirroring_path, 'fs')
+    package_name = '_peer_writer_test_mirroring'
+    fs_package_name = f'{package_name}.fs'
+    if package_name not in sys.modules:
+        module = types.ModuleType(package_name)
+        module.__path__ = [mirroring_path]
+        sys.modules[package_name] = module
+    if fs_package_name not in sys.modules:
+        module = types.ModuleType(fs_package_name)
+        module.__path__ = [fs_path]
+        sys.modules[fs_package_name] = module
+    module_name = f'{fs_package_name}.{name}'
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(
+        module_name, os.path.join(fs_path, f'{name}.py'))
+    if spec is None or spec.loader is None:
+        raise ImportError(f'cannot load mirroring.fs.{name}')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+PEER_WRITER_TOPOLOGY = {
+    'fs0': {'peer00': 7, 'peer01': 5},
+    'fs1': {'peer10': 6, 'peer11': 7},
+    'fs2': {'peer20': 5, 'peer21': 6},
+}
+
+PEER_WRITER_UUIDS = {
+    'peer00': '00000000-0000-0000-0000-000000000000',
+    'peer01': '00000000-0000-0000-0000-000000000001',
+    'peer10': '00000000-0000-0000-0000-000000000010',
+    'peer11': '00000000-0000-0000-0000-000000000011',
+    'peer20': '00000000-0000-0000-0000-000000000020',
+    'peer21': '00000000-0000-0000-0000-000000000021',
+}
+
+
+class _PeerWriterAckGate:
+    def __init__(self):
+        # Watch callbacks run on native RADOS threads, not gevent greenlets.
+        from gevent.monkey import get_original
+        allocate_lock = get_original('_thread', 'allocate_lock')
+        self.received = allocate_lock()
+        self.proceed = allocate_lock()
+        self.received.acquire()
+        self.proceed.acquire()
+        self.message = None
+        self.opened = False
+        self.timed_out = False
+
+    def hold(self, message):
+        if self.message is None:
+            self.message = dict(message)
+            self.received.release()
+        if not self.proceed.acquire(timeout=10):
+            self.timed_out = True
+            return False
+        self.proceed.release()
+        return True
+
+    def wait_received(self):
+        if not self.received.acquire(timeout=2):
+            raise AssertionError('delayed writer notification was not received')
+        return self.message
+
+    def allow_ack(self):
+        if not self.opened:
+            self.opened = True
+            self.proceed.release()
+
+
+class _PeerWriterFakeDaemon:
+    def __init__(self, env, daemon_id):
+        import rados
+        self.env = env
+        self.daemon_id = daemon_id
+        self.cluster = rados.Rados(conffile=env.conffile)
+        self.cluster.connect()
+        self.instance_id = str(self.cluster.get_instance_id())
+        self.ioctxs = {}
+        self.alive = False
+        self.acquired = []
+        self.released = []
+        self.process_incarnation = f'incarnation-{daemon_id}'
+        self.destination_client_identity = f'client-{daemon_id}'
+        self.discovery_watches = []
+        self.command_watches = []
+        self.discovery_acks = 0
+        self.last_discovery_ack = None
+        self.watch_errors = []
+        self.callback_logs = deque()
+        self.ack_gates = {}
+        self.closed = False
+
+    def record(self):
+        return {
+            'version': 1,
+            'addr': f'127.0.0.1:68{self.daemon_id[-1]}',
+            'daemon_id': self.daemon_id,
+            'process_incarnation': self.process_incarnation,
+            'protocol_version': 1,
+            'destination_client_identity':
+                self.destination_client_identity,
+            'filesystems': sorted(self.env.topology),
+            'features': ['assignment_epoch', 'quiesced_release'],
+        }
+
+    def publish(self, fs_name):
+        self.alive = True
+        writer_state = _load_mirroring_fs_module('writer_state')
+        WRITER_OBJECT_NAME = writer_state.WRITER_OBJECT_NAME
+        WRITER_OBJECT_PREFIX = writer_state.WRITER_OBJECT_PREFIX
+        ioctx = self.ioctxs.get(fs_name)
+        if ioctx is None:
+            ioctx = self.cluster.open_ioctx2(self.env.pool_ids[fs_name])
+            self.ioctxs[fs_name] = ioctx
+        self.command_object = f'{WRITER_OBJECT_PREFIX}.{self.instance_id}'
+        ioctx.write_full(self.command_object, b'')
+        self.discovery_watches.append(ioctx.watch(
+            WRITER_OBJECT_NAME, self._discovery_notify,
+            self._watch_error))
+        self.command_watches.append(ioctx.watch(
+            self.command_object, self._command_notify,
+            self._watch_error))
+        pw_log.info('PEER_WRITER_TEST daemon %s published watch for %s '
+                    'instance %s', self.daemon_id, fs_name,
+                    self.instance_id)
+        return self.record()
+
+    def stop_heartbeat(self):
+        self.alive = False
+        pw_log.info('PEER_WRITER_TEST daemon %s stopping discovery heartbeat',
+                    self.daemon_id)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.release_delayed_acks()
+        errors = []
+        for watches in (self.command_watches, self.discovery_watches):
+            while watches:
+                try:
+                    watches.pop().close()
+                except Exception as error:
+                    errors.append(error)
+        self.flush_callback_logs()
+        for ioctx in self.ioctxs.values():
+            try:
+                ioctx.close()
+            except Exception as error:
+                errors.append(error)
+        try:
+            self.cluster.shutdown()
+        except Exception as error:
+            errors.append(error)
+        if errors:
+            raise errors[0]
+
+    def current_dirs(self):
+        return self.env.get_daemon_dirs(self.daemon_id)
+
+    def _discovery_notify(self, notify_id, notifier_id, watch_id, data):
+        if not self.alive:
+            return ''
+        self.discovery_acks += 1
+        self.last_discovery_ack = time.monotonic()
+        return json.dumps(self.record(), sort_keys=True)
+
+    def _command_notify(self, notify_id, notifier_id, watch_id, data):
+        message = json.loads(data.decode('utf-8'))
+        directory = self.env.directory_id(message['peer_uuid'],
+                                          message['path'])
+        gate = self.ack_gates.get((message['mode'], directory))
+        if gate is not None and not gate.hold(message):
+            self.watch_errors.append((watch_id, 'delayed ACK gate timed out'))
+            return ''
+        if message['mode'] == 'acquire':
+            self.acquired.append(directory)
+        else:
+            self.released.append(directory)
+        # RADOS invokes this on a native thread. Teuthology's gevent-patched
+        # logging locks cannot safely be used there; drain logs on the test
+        # thread instead so returning the acknowledgment never blocks on them.
+        self.callback_logs.append((
+            logging.INFO,
+            'PEER_WRITER_TEST daemon %s ack %s %s epoch %s',
+            (self.daemon_id, message['mode'], directory,
+             message['assignment_epoch'])))
+        return json.dumps({
+            'version': 1,
+            'operation_id': message['operation_id'],
+            'peer_uuid': message['peer_uuid'],
+            'path': message['path'],
+            'assignment_epoch': message['assignment_epoch'],
+            'process_incarnation': message['process_incarnation'],
+            'result': 0,
+            'quiesced': True,
+        }, sort_keys=True)
+
+    def _watch_error(self, watch_id, error):
+        self.watch_errors.append((watch_id, error))
+        self.callback_logs.append((
+            logging.ERROR,
+            'PEER_WRITER_TEST daemon %s watch %s failed: %s',
+            (self.daemon_id, watch_id, error)))
+
+    def flush_callback_logs(self):
+        while self.callback_logs:
+            level, message, args = self.callback_logs.popleft()
+            pw_log.log(level, message, *args)
+
+    def delay_ack(self, mode, peer_uuid, path):
+        key = (mode, self.env.directory_id(peer_uuid, path))
+        assert key not in self.ack_gates
+        gate = _PeerWriterAckGate()
+        self.ack_gates[key] = gate
+        return gate
+
+    def release_delayed_acks(self):
+        for gate in self.ack_gates.values():
+            gate.allow_ack()
+        self.ack_gates.clear()
+
+
+class _PeerWriterBalancerEnv:
+    def __init__(self, testcase, topology=None, daemon_count=4):
+        self.WriterState = _load_mirroring_fs_module('writer_state').WriterState
+        self.testcase = testcase
+        self.topology = topology or PEER_WRITER_TOPOLOGY
+        self.daemon_count = daemon_count
+        self.cluster = None
+        self.ioctxs = {}
+        self.pool_ids = {}
+        self.conffile = 'ceph.conf' if os.path.exists('ceph.conf') else None
+        self.states = {}
+        self.daemons = {}
+        self.instance_to_daemon = {}
+        self.all_dirs = []
+        self.closed = False
+        try:
+            self._connect_rados()
+        except Exception:
+            try:
+                self.close()
+            except Exception:
+                pw_log.exception(
+                    'PEER_WRITER_TEST partial environment cleanup failed')
+            raise
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        errors = []
+        for daemon in self.daemons.values():
+            try:
+                daemon.close()
+            except Exception as error:
+                errors.append(error)
+        for ioctx in self.ioctxs.values():
+            try:
+                ioctx.close()
+            except Exception as error:
+                errors.append(error)
+        if self.cluster is not None:
+            try:
+                self.cluster.shutdown()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
+
+    def _connect_rados(self):
+        import rados
+        self._ensure_filesystems()
+        fs_map = json.loads(self.testcase.get_ceph_cmd_stdout(
+            'fs', 'dump', '--format=json'))
+        filesystems = {
+            fs['mdsmap']['fs_name']: fs
+            for fs in fs_map['filesystems']
+        }
+        self.cluster = rados.Rados(conffile=self.conffile)
+        self.cluster.connect()
+        for fs_name in self.topology:
+            fs = filesystems[fs_name]
+            pool_id = fs['mdsmap']['metadata_pool']
+            self.pool_ids[fs_name] = pool_id
+            ioctx = self.cluster.open_ioctx2(pool_id)
+            self.ioctxs[fs_name] = ioctx
+            self.states[fs_name] = self.WriterState(ioctx)
+
+    def _ensure_filesystems(self):
+        if len(self.topology) > 1:
+            self.testcase.run_ceph_cmd('fs', 'flag', 'set',
+                                       'enable_multiple', 'true',
+                                       '--yes-i-really-mean-it')
+        existing = {fs['mdsmap']['fs_name'] for fs in json.loads(
+            self.testcase.get_ceph_cmd_stdout(
+                'fs', 'dump', '--format=json'))['filesystems']}
+        for fs_name in self.topology:
+            if fs_name in existing:
+                continue
+            meta_pool = f'{fs_name}_meta'
+            data_pool = f'{fs_name}_data'
+            self.testcase.run_ceph_cmd('osd', 'pool', 'create', meta_pool)
+            self.testcase.run_ceph_cmd('osd', 'pool', 'create', data_pool)
+            self.testcase.run_ceph_cmd('fs', 'new', fs_name, meta_pool,
+                                       data_pool)
+
+    @staticmethod
+    def directory_id(peer_uuid, path):
+        return f'{peer_uuid}{path}'
+
+    @staticmethod
+    def peer_uuid(peer_label):
+        return PEER_WRITER_UUIDS.get(peer_label, peer_label)
+
+    def populate(self):
+        pw_log.info('PEER_WRITER_TEST populate start')
+        for fs_name, peers in self.topology.items():
+            for peer_label in peers:
+                peer_uuid = self.peer_uuid(peer_label)
+                self.testcase.run_ceph_cmd(
+                    'fs', 'mirror', 'peer_writer', 'peer_add', fs_name,
+                    peer_uuid, f'client.{peer_uuid}@fake-site',
+                    f'source-{fs_name}')
+        for idx in range(self.daemon_count):
+            daemon = _PeerWriterFakeDaemon(self, f'daemon.{idx}')
+            self.daemons[daemon.daemon_id] = daemon
+            self.instance_to_daemon[daemon.instance_id] = daemon.daemon_id
+        for fs_name, peers in self.topology.items():
+            for peer_label, count in peers.items():
+                peer_uuid = self.peer_uuid(peer_label)
+                for idx in range(count):
+                    path = f'/{peer_label}/dir{idx}'
+                    self.all_dirs.append(self.directory_id(peer_uuid, path))
+                    self.testcase.run_ceph_cmd(
+                        'fs', 'snapshot', 'mirror', 'peer_writer', 'add',
+                        fs_name, peer_uuid, path)
+        # Initialize directory state before registering watches, but do not
+        # let discovery place the backlog against a partially published set
+        # of daemons. Module changes respawn the mgr; wait for the old process
+        # to disappear before installing any discovery watches.
+        previous_mgr_gid = json.loads(self.testcase.get_ceph_cmd_stdout(
+            'mgr', 'dump', '--format=json'))['active_gid']
+        self.testcase.run_ceph_cmd('mgr', 'module', 'disable',
+                                   self.testcase.MODULE_NAME)
+        self.testcase.mirroring_module_enabled = False
+
+        def module_stopped():
+            mgr_map = json.loads(self.testcase.get_ceph_cmd_stdout(
+                'mgr', 'dump', '--format=json'))
+            return mgr_map['available'] and \
+                mgr_map['active_gid'] != previous_mgr_gid
+
+        self.wait_until(module_stopped)
+        for daemon in self.daemons.values():
+            for fs_name in self.topology:
+                daemon.publish(fs_name)
+        self.testcase.run_ceph_cmd('mgr', 'module', 'enable',
+                                   self.testcase.MODULE_NAME)
+        self.testcase.mirroring_module_enabled = True
+        self.wait_for_instances()
+        self.wait_for_assignments()
+        self.log_state('populate complete')
+
+    def restart_mgr_module(self):
+        self.log_state('before mgr module restart')
+        discovery_acks = {
+            daemon_id: daemon.discovery_acks
+            for daemon_id, daemon in self.daemons.items()
+        }
+        self.testcase.run_ceph_cmd('mgr', 'module', 'disable',
+                                   self.testcase.MODULE_NAME)
+        self.testcase.mirroring_module_enabled = False
+        self.testcase.run_ceph_cmd('mgr', 'module', 'enable',
+                                   self.testcase.MODULE_NAME)
+        self.testcase.mirroring_module_enabled = True
+        self.wait_until(lambda: all(
+            daemon.discovery_acks > discovery_acks[daemon_id]
+            for daemon_id, daemon in self.daemons.items()))
+        self.wait_for_assignments(retry_command_timeout=True)
+        self.log_state('after mgr module restart')
+
+    def load_state(self, fs_name):
+        return self.states[fs_name].load()
+
+    def stop_daemon(self, daemon_id):
+        self.log_state(f'before stopping {daemon_id}')
+        daemon = self.daemons[daemon_id]
+        owned = set(self.get_daemon_dirs(daemon_id))
+        daemon.stop_heartbeat()
+        started = time.monotonic()
+
+        def expired():
+            records = self.directory_records()
+            pending = {self.directory_id(item['peer_uuid'], item['path'])
+                       for items in records.values() for item in items
+                       if item.get('instance_id') == daemon.instance_id and
+                       item.get('state') == 'fencing'}
+            return pending == owned and all(
+                daemon.instance_id not in self.load_state(fs_name)[0]
+                for fs_name in self.topology)
+
+        self.wait_until(expired, timeout=45)
+        silence = None if daemon.last_discovery_ack is None else \
+            time.monotonic() - daemon.last_discovery_ack
+        pw_log.info('PEER_WRITER_TEST daemon %s removed after %.3fs; '
+                    'discovery silence %.3fs', daemon_id,
+                    time.monotonic() - started, silence or 0)
+        self.log_state(f'after stopping {daemon_id}')
+
+    def directory_records(self):
+        return {fs_name: self.list_directories(fs_name)
+                for fs_name in self.topology}
+
+    def owners(self, records=None):
+        records = records or self.directory_records()
+        result = {}
+        for items in records.values():
+            for item in items:
+                instance_id = item.get('instance_id')
+                if instance_id:
+                    result[self.directory_id(item['peer_uuid'],
+                                             item['path'])] = \
+                        self.instance_to_daemon.get(instance_id, instance_id)
+        return result
+
+    def _daemon_for_record(self, record):
+        instance_id = record['instance_id']
+        return self.instance_to_daemon.get(instance_id, instance_id)
+
+    def list_directories(self, fs_name):
+        return json.loads(self.testcase.get_ceph_cmd_stdout(
+            'fs', 'snapshot', 'mirror', 'peer_writer', 'ls', fs_name,
+            '--format=json'))
+
+    def assigned_directory_count(self):
+        return len(self.owners())
+
+    def unassigned_directory_count(self):
+        return len(self.all_dirs) - self.assigned_directory_count()
+
+    def get_daemon_dirs(self, daemon_id):
+        return sorted(directory for directory, owner in self.owners().items()
+                      if owner == daemon_id)
+
+    def peer_distribution(self, peer_uuid, daemons=None, records=None):
+        peer_uuid = self.peer_uuid(peer_uuid)
+        daemons = sorted(daemons or self.daemons)
+        counts = Counter()
+        prefix = f'{peer_uuid}/'
+        for directory, owner in self.owners(records).items():
+            if directory.startswith(prefix):
+                counts[owner] += 1
+        return [counts[daemon] for daemon in daemons]
+
+    def fs_distribution(self, fs_name, daemons=None, records=None):
+        daemons = sorted(daemons or self.daemons)
+        counts = Counter()
+        records = records or self.directory_records()
+        for item in records[fs_name]:
+            if item.get('instance_id'):
+                counts[self.instance_to_daemon.get(item['instance_id'],
+                                                   item['instance_id'])] += 1
+        return [counts[daemon] for daemon in daemons]
+
+    def total_distribution(self, daemons=None, records=None):
+        daemons = sorted(daemons or self.daemons)
+        counts = Counter(self.owners(records).values())
+        return [counts[daemon] for daemon in daemons]
+
+    def assert_unique_assignment(self, testcase):
+        testcase.assertEqual(set(self.owners()), set(self.all_dirs))
+        testcase.assertEqual(len(self.owners()), len(self.all_dirs))
+
+    def assert_rados_matches_policy(self, testcase):
+        rados_owners, rados_epochs = self.rados_owners_and_epochs(testcase)
+        testcase.assertEqual(rados_owners, self.owners())
+        testcase.assertEqual(set(rados_epochs), set(self.owners()))
+
+    def rados_owners_and_epochs(self, testcase):
+        rados_owners = {}
+        rados_epochs = {}
+        for fs_name in self.topology:
+            _, directories, epochs = self.load_state(fs_name)
+            mgr_keys = {(item['peer_uuid'], item['path'])
+                        for item in self.list_directories(fs_name)}
+            testcase.assertEqual(set(directories), mgr_keys)
+            testcase.assertEqual(set(epochs), set(directories))
+            for key, record in directories.items():
+                testcase.assertEqual(record['assignment_epoch'], epochs[key])
+                if record['instance_id']:
+                    rados_owners[self.directory_id(key[0], key[1])] = \
+                        self._daemon_for_record(record)
+                    rados_epochs[self.directory_id(key[0], key[1])] = \
+                        epochs[key]
+        return rados_owners, rados_epochs
+
+    def rados_peer_distribution(self, testcase, peer_uuid, daemons=None):
+        peer_uuid = self.peer_uuid(peer_uuid)
+        daemons = sorted(daemons or self.daemons)
+        rados_owners, _ = self.rados_owners_and_epochs(testcase)
+        counts = Counter()
+        prefix = f'{peer_uuid}/'
+        for directory, owner in rados_owners.items():
+            if directory.startswith(prefix):
+                counts[owner] += 1
+        return [counts[daemon] for daemon in daemons]
+
+    def rados_fs_distribution(self, testcase, fs_name, daemons=None):
+        daemons = sorted(daemons or self.daemons)
+        counts = Counter()
+        _, directories, _ = self.load_state(fs_name)
+        for key, record in directories.items():
+            if record['instance_id']:
+                counts[self._daemon_for_record(record)] += 1
+        return [counts[daemon] for daemon in daemons]
+
+    def rados_total_distribution(self, testcase, daemons=None):
+        daemons = sorted(daemons or self.daemons)
+        rados_owners, _ = self.rados_owners_and_epochs(testcase)
+        counts = Counter(rados_owners.values())
+        return [counts[daemon] for daemon in daemons]
+
+    def _all_assigned(self, records):
+        items = [item for fs_items in records.values() for item in fs_items]
+        return len(items) == len(self.all_dirs) and all(
+            item.get('instance_id') and item.get('state') == 'assigned'
+            for item in items)
+
+    def wait_for_instances(self):
+        expected = set(self.instance_to_daemon)
+        MirrorException = _load_mirroring_fs_module('exception').MirrorException
+
+        def ready():
+            try:
+                return all(set(self.load_state(fs_name)[0]) == expected
+                           for fs_name in self.topology)
+            except MirrorException as error:
+                if error.args[0] != -errno.EAGAIN:
+                    raise
+                pw_log.info('PEER_WRITER_TEST writer state changed during '
+                            'discovery readiness check; retrying')
+                return False
+
+        pw_log.info('PEER_WRITER_TEST waiting for %s instances',
+                    len(expected))
+        self.wait_until(ready)
+        pw_log.info('PEER_WRITER_TEST observed %s instances', len(expected))
+
+    def wait_for_assignments(self, retry_command_timeout=False):
+        def ready():
+            try:
+                return self._all_assigned(self.directory_records())
+            except CommandFailedError as error:
+                if not retry_command_timeout or \
+                   error.exitstatus != errno.ETIMEDOUT:
+                    raise
+                pw_log.info('PEER_WRITER_TEST mgr module is not ready; '
+                            'retrying directory query')
+                return False
+
+        expected = len(self.all_dirs)
+        pw_log.info('PEER_WRITER_TEST waiting for %s assigned directories',
+                    expected)
+        self.wait_until(ready)
+        pw_log.info('PEER_WRITER_TEST observed %s assigned directories',
+                    expected)
+
+    def wait_until(self, predicate, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            for daemon in self.daemons.values():
+                daemon.flush_callback_logs()
+            watch_errors = {
+                daemon_id: daemon.watch_errors
+                for daemon_id, daemon in self.daemons.items()
+                if daemon.watch_errors
+            }
+            if watch_errors:
+                raise AssertionError(f'writer watch errors: {watch_errors}')
+            if predicate():
+                return
+            time.sleep(5)
+        raise AssertionError(self.debug_state())
+
+    def debug_state(self):
+        return '\n'.join([
+            f'alive daemons: {[d for d, v in self.daemons.items() if v.alive]}',
+            f'owners: {self.owners()}',
+            f'unassigned dirs: {self.unassigned_directory_count()}',
+            f'per-peer: {self._debug_peer_counts()}',
+            f'per-fs: {self._debug_fs_counts()}',
+            f'totals: {dict(zip(sorted(self.daemons), self.total_distribution()))}',
+        ])
+
+    def log_state(self, label):
+        records = self.directory_records()
+        pw_log.info('PEER_WRITER_TEST %s totals=%s per_fs=%s per_peer=%s',
+                    label,
+                    dict(zip(sorted(self.daemons),
+                             self.total_distribution(records=records))),
+                    self._debug_fs_counts(records),
+                    self._debug_peer_counts(records))
+
+    def _debug_peer_counts(self, records=None):
+        return {peer: self.peer_distribution(peer, records=records)
+                for peers in self.topology.values()
+                for peer in peers}
+
+    def _debug_fs_counts(self, records=None):
+        return {fs_name: self.fs_distribution(fs_name, records=records)
+                for fs_name in self.topology}
+
 
 class TestMirroring(CephFSTestCase):
     MDSS_REQUIRED = 5
@@ -1676,3 +2311,249 @@ class TestMirroring(CephFSTestCase):
         self.verify_snapshot(dir_name, snap_a)
         self.verify_snapshot(dir_name, snap_b)
         self.disable_mirroring(self.primary_fs_name, self.primary_fs_id)
+
+
+class TestPeerWriterMirroring(CephFSTestCase):
+    MDSS_REQUIRED = 1
+    CLIENTS_REQUIRED = 0
+    REQUIRE_FILESYSTEM = False
+
+    MODULE_NAME = 'mirroring'
+
+    def run(self, result=None):
+        try:
+            return super(TestPeerWriterMirroring, self).run(result)
+        except KeyboardInterrupt:
+            try:
+                self._shutdown_peer_writer()
+            except Exception:
+                pw_log.exception(
+                    'PEER_WRITER_TEST interrupt cleanup failed')
+            raise
+
+    def setUp(self):
+        self.peer_writer_env = None
+        self.mirroring_module_enabled = False
+        super(TestPeerWriterMirroring, self).setUp()
+        self.run_ceph_cmd('mgr', 'module', 'enable', self.MODULE_NAME)
+        self.mirroring_module_enabled = True
+
+    def tearDown(self):
+        errors = self._shutdown_peer_writer()
+        try:
+            super(TestPeerWriterMirroring, self).tearDown()
+        except Exception as error:
+            errors.append(error)
+        if errors:
+            raise errors[0]
+
+    def _shutdown_peer_writer(self):
+        errors = []
+        if self.mirroring_module_enabled:
+            try:
+                self.run_ceph_cmd('mgr', 'module', 'disable',
+                                  self.MODULE_NAME)
+                self.mirroring_module_enabled = False
+            except Exception as error:
+                errors.append(error)
+        if self.peer_writer_env is not None and \
+           not self.mirroring_module_enabled:
+            try:
+                self.peer_writer_env.close()
+                self.peer_writer_env = None
+            except Exception as error:
+                errors.append(error)
+        return errors
+
+    def create_env(self, topology=None, daemon_count=4):
+        self.assertIsNone(self.peer_writer_env)
+        self.peer_writer_env = _PeerWriterBalancerEnv(self, topology, daemon_count)
+        return self.peer_writer_env
+
+    def test_peer_writer_directory_add_remove_with_delayed_acks(self):
+        env = self.create_env({'fs0': {'peer00': 1}}, daemon_count=1)
+        env.populate()
+        daemon = env.daemons['daemon.0']
+        peer_uuid = env.peer_uuid('peer00')
+        key = (peer_uuid, '/peer00/delayed')
+        directory_id = env.directory_id(*key)
+        baseline = copy.deepcopy(env.load_state('fs0')[1])
+
+        def maps(label):
+            memory = {(item['peer_uuid'], item['path']): item
+                      for item in env.list_directories('fs0')}
+            _, persisted, epochs = env.load_state('fs0')
+            self.assertEqual(set(memory), set(persisted))
+            for directory, record in persisted.items():
+                for field in ('instance_id', 'assignment_epoch', 'purging'):
+                    self.assertEqual(memory[directory][field], record[field])
+                self.assertEqual(record['assignment_epoch'], epochs[directory])
+            for directory, record in baseline.items():
+                self.assertEqual(persisted[directory], record)
+                self.assertEqual(memory[directory]['state'], 'assigned')
+            daemon.flush_callback_logs()
+            pw_log.info('PEER_WRITER_TEST delayed ACK %s dir_map=%s '
+                        'rados_dir_map=%s epochs=%s', label, memory, persisted, epochs)
+            return memory, persisted, epochs
+
+        def ready(state):
+            memory = {(item['peer_uuid'], item['path']): item
+                      for item in env.list_directories('fs0')}
+            return key not in memory if state is None else \
+                memory.get(key, {}).get('state') == state
+
+        memory, persisted, epochs = maps('before add')
+        self.assertNotIn(key, memory)
+        self.assertNotIn(key, persisted)
+        self.assertNotIn(key, epochs)
+        try:
+            acquire_gate = daemon.delay_ack('acquire', *key)
+            self.run_ceph_cmd('fs', 'snapshot', 'mirror', 'peer_writer', 'add',
+                              'fs0', *key)
+            env.all_dirs.append(directory_id)
+            acquire = acquire_gate.wait_received()
+            memory, persisted, epochs = maps('before acquire ACK')
+            self.assertEqual(memory[key]['state'], 'acquiring')
+            self.assertFalse(memory[key]['purging'])
+            self.assertEqual(memory[key]['instance_id'], daemon.instance_id)
+            self.assertEqual(epochs[key], 1)
+            self.assertEqual(acquire['assignment_epoch'], epochs[key])
+            self.assertNotIn(directory_id, daemon.acquired)
+            assigned = copy.deepcopy(persisted[key])
+            daemon.release_delayed_acks()
+            env.wait_until(lambda: ready('assigned'))
+            memory, persisted, epochs = maps('after acquire ACK')
+            self.assertEqual(memory[key]['state'], 'assigned')
+            self.assertEqual(persisted[key], assigned)
+            self.assertIn(directory_id, daemon.acquired)
+            self.assertFalse(acquire_gate.timed_out)
+
+            release_gate = daemon.delay_ack('release', *key)
+            self.run_ceph_cmd('fs', 'snapshot', 'mirror', 'peer_writer', 'remove',
+                              'fs0', *key)
+            release = release_gate.wait_received()
+            memory, persisted, epochs = maps('before release ACK')
+            self.assertEqual(memory[key]['state'], 'releasing')
+            self.assertTrue(memory[key]['purging'])
+            self.assertEqual(persisted[key], dict(assigned, purging=True))
+            self.assertEqual(release['assignment_epoch'], assigned['assignment_epoch'])
+            self.assertNotIn(directory_id, daemon.released)
+            daemon.release_delayed_acks()
+            env.wait_until(lambda: ready(None))
+            env.all_dirs.remove(directory_id)
+            memory, persisted, epochs = maps('after release ACK')
+            self.assertNotIn(key, memory)
+            self.assertNotIn(key, persisted)
+            self.assertEqual(epochs[key], assigned['assignment_epoch'])
+            self.assertIn(directory_id, daemon.released)
+            self.assertFalse(release_gate.timed_out)
+        finally:
+            daemon.release_delayed_acks()
+
+    def test_global_peer_writer_directory_balancing(self):
+        env = self.create_env()
+        env.populate()
+
+        self.assertEqual(env.assigned_directory_count(), 36)
+        self.assertEqual(env.unassigned_directory_count(), 0)
+        env.assert_unique_assignment(self)
+        env.assert_rados_matches_policy(self)
+
+        expected_peer_distributions = {
+            'peer00': [1, 2, 2, 2],
+            'peer01': [1, 1, 1, 2],
+            'peer10': [1, 1, 2, 2],
+            'peer11': [1, 2, 2, 2],
+            'peer20': [1, 1, 1, 2],
+            'peer21': [1, 1, 2, 2],
+        }
+        for peer_uuid, expected in expected_peer_distributions.items():
+            dist = env.peer_distribution(peer_uuid)
+            self.assertLessEqual(max(dist) - min(dist), 1)
+            self.assertEqual(sorted(dist), expected)
+            rados_dist = env.rados_peer_distribution(self, peer_uuid)
+            self.assertLessEqual(max(rados_dist) - min(rados_dist), 1)
+            self.assertEqual(sorted(rados_dist), expected)
+
+        self.assertEqual(sorted(env.fs_distribution('fs0')), [3, 3, 3, 3])
+        self.assertEqual(sorted(env.fs_distribution('fs1')), [3, 3, 3, 4])
+        self.assertEqual(sorted(env.fs_distribution('fs2')), [2, 3, 3, 3])
+        self.assertEqual(sorted(env.total_distribution()), [9, 9, 9, 9])
+        self.assertEqual(sorted(env.rados_fs_distribution(self, 'fs0')),
+                         [3, 3, 3, 3])
+        self.assertEqual(sorted(env.rados_fs_distribution(self, 'fs1')),
+                         [3, 3, 3, 4])
+        self.assertEqual(sorted(env.rados_fs_distribution(self, 'fs2')),
+                         [2, 3, 3, 3])
+        self.assertEqual(sorted(env.rados_total_distribution(self)),
+                         [9, 9, 9, 9])
+
+        owners = env.owners()
+        for directory, daemon_id in owners.items():
+            self.assertIn(directory, env.get_daemon_dirs(daemon_id))
+            self.assertIn(directory, env.daemons[daemon_id].acquired)
+        for fs_name, peers in env.topology.items():
+            _, directories, epochs = env.load_state(fs_name)
+            self.assertEqual(len(directories), sum(peers.values()))
+            self.assertEqual(len(epochs), len(directories))
+
+    def test_global_peer_writer_directory_balancer_tie_breaking(self):
+        env = self.create_env({'fs0': {'peer00': 1}})
+        env.populate()
+
+        directory = env.all_dirs[0]
+        self.assertEqual(env.owners(), {directory: 'daemon.0'})
+        rados_owners, _ = env.rados_owners_and_epochs(self)
+        self.assertEqual(rados_owners, {directory: 'daemon.0'})
+        pw_log.info('PEER_WRITER_TEST tie selected daemon.0 for %s',
+                    directory)
+
+    def test_global_peer_writer_directory_balancing_after_daemon_failure(self):
+        env = self.create_env()
+        env.populate()
+        self.assertEqual(sorted(env.total_distribution()), [9, 9, 9, 9])
+        owners_before = env.owners()
+        persisted_before = env.rados_owners_and_epochs(self)
+        acquire_counts = {daemon_id: len(daemon.acquired)
+                          for daemon_id, daemon in env.daemons.items()}
+        failed_dirs = env.get_daemon_dirs('daemon.0')
+        self.assertEqual(len(failed_dirs), 9)
+
+        env.stop_daemon('daemon.0')
+
+        self.assertEqual(env.get_daemon_dirs('daemon.0'), failed_dirs)
+        env.assert_unique_assignment(self)
+        env.assert_rados_matches_policy(self)
+        self.assertEqual(env.owners(), owners_before)
+        self.assertEqual(env.rados_owners_and_epochs(self), persisted_before)
+        self.assertEqual(env.daemons['daemon.0'].released, [])
+        self.assertEqual({daemon_id: len(daemon.acquired)
+                          for daemon_id, daemon in env.daemons.items()}, acquire_counts)
+        records = env.directory_records()
+        states = Counter(item['state'] for items in records.values() for item in items)
+        self.assertEqual(states, {'fencing': 9, 'assigned': 27})
+
+    def test_global_peer_writer_directory_balancing_after_mgr_module_restart(self):
+        env = self.create_env()
+        env.populate()
+        owners_before = env.owners()
+        acquire_counts = {daemon_id: len(daemon.acquired)
+                          for daemon_id, daemon in env.daemons.items()}
+        release_counts = {daemon_id: len(daemon.released)
+                          for daemon_id, daemon in env.daemons.items()}
+
+        env.restart_mgr_module()
+
+        self.assertEqual(env.assigned_directory_count(), 36)
+        env.assert_unique_assignment(self)
+        env.assert_rados_matches_policy(self)
+        self.assertEqual(sorted(env.total_distribution()), [9, 9, 9, 9])
+        self.assertEqual(sorted(env.rados_total_distribution(self)),
+                         [9, 9, 9, 9])
+        self.assertEqual(env.owners(), owners_before)
+        self.assertEqual({daemon_id: len(daemon.acquired)
+                          for daemon_id, daemon in env.daemons.items()},
+                         acquire_counts)
+        self.assertEqual({daemon_id: len(daemon.released)
+                          for daemon_id, daemon in env.daemons.items()},
+                         release_counts)

@@ -154,6 +154,21 @@ struct MirrorInfo {
   bool has_peers() const {
     return !peers.empty();
   }
+  bool has_peer_writer_peer(std::string_view uuid) const {
+    return peer_writer_peers.find(Peer(uuid)) != peer_writer_peers.end();
+  }
+  bool has_peer_writer_peer(std::string_view client_name,
+                            std::string_view cluster_name,
+                            std::string_view fs_name) const {
+    ClusterInfo cluster_info(client_name, cluster_name, fs_name);
+    for (auto &peer : peer_writer_peers) {
+      if (peer.remote == cluster_info) {
+        return true;
+      }
+    }
+    return false;
+  }
+  bool has_peer_writer_peers() const { return !peer_writer_peers.empty(); }
 
   void peer_add(std::string_view uuid,
                 std::string_view client_name,
@@ -164,9 +179,19 @@ struct MirrorInfo {
   void peer_remove(std::string_view uuid) {
     peers.erase(uuid);
   }
+  void peer_writer_peer_add(std::string_view uuid, std::string_view client_name,
+                            std::string_view cluster_name,
+                            std::string_view fs_name) {
+    peer_writer_peers.emplace(
+        Peer(uuid, ClusterInfo(client_name, cluster_name, fs_name)));
+  }
+  void peer_writer_peer_remove(std::string_view uuid) {
+    peer_writer_peers.erase(uuid);
+  }
 
   bool mirrored = false;
   Peers peers;
+  Peers peer_writer_peers;
 
   void dump(ceph::Formatter *f) const;
   static void generate_test_instances(std::list<MirrorInfo*>& ls);
@@ -177,7 +202,8 @@ struct MirrorInfo {
 };
 
 inline std::ostream& operator<<(std::ostream& out, const MirrorInfo &mirror_info) {
-  out << "{peers=" << mirror_info.peers << "}";
+  out << "{peers=" << mirror_info.peers
+      << ", peer_writer_peers=" << mirror_info.peer_writer_peers << "}";
   return out;
 }
 

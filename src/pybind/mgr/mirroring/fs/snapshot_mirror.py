@@ -369,7 +369,9 @@ class FSSnapshotMirror:
         return False
 
     def get_mirrored_filesystems(self):
-        return [fs['mdsmap']['fs_name'] for fs in self.fs_map['filesystems'] if fs.get('mirror_info', None)]
+        return [fs['mdsmap']['fs_name'] for fs in self.fs_map['filesystems']
+                if fs.get('mirror_info') and
+                fs['mirror_info'].get('mirrored', True)]
 
     def get_filesystem_peers(self, filesystem):
         """To be used when mirroring in enabled for the filesystem"""

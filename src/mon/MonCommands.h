@@ -489,6 +489,19 @@ COMMAND("fs mirror peer_remove "
 	"name=fs_name,type=CephString "
 	"name=uuid,type=CephString ",
 	"remove a mirror peer for a ceph filesystem", "mds", "rw")
+COMMAND("fs mirror peer_writer peer_add "
+        "name=fs_name,type=CephString "
+        "name=uuid,type=CephString "
+        "name=source_cluster_spec,type=CephString "
+        "name=source_fs_name,type=CephString",
+        "add a PeerWriter peer for a ceph filesystem", "mds", "rw")
+COMMAND("fs mirror peer_writer peer_list "
+        "name=fs_name,type=CephString",
+        "list PeerWriter peers for a ceph filesystem", "mds", "r")
+COMMAND("fs mirror peer_writer peer_remove "
+        "name=fs_name,type=CephString "
+        "name=uuid,type=CephString ",
+        "remove a PeerWriter peer for a ceph filesystem", "mds", "rw")
 COMMAND("fs rename "
 	"name=fs_name,type=CephString "
 	"name=new_fs_name,type=CephString,goodchars=" FS_NAME_GOODCHARS

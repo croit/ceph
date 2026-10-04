@@ -95,25 +95,37 @@ void Peer::print(std::ostream& out) const {
 }
 
 void MirrorInfo::encode(ceph::buffer::list &bl) const {
-  ENCODE_START(1, 1, bl);
+  ENCODE_START(2, 1, bl);
   encode(mirrored, bl);
   encode(peers, bl);
+  encode(peer_writer_peers, bl);
   ENCODE_FINISH(bl);
 }
 
 void MirrorInfo::decode(ceph::buffer::list::const_iterator &iter) {
-  DECODE_START(1, iter);
+  DECODE_START(2, iter);
   decode(mirrored, iter);
   decode(peers, iter);
+  if (struct_v >= 2) {
+    decode(peer_writer_peers, iter);
+  }
   DECODE_FINISH(iter);
 }
 
 void MirrorInfo::dump(ceph::Formatter *f) const {
+  f->dump_bool("mirrored", mirrored);
   f->open_object_section("peers");
   for (auto &peer : peers) {
     peer.dump(f);
   }
   f->close_section(); // peers
+  if (!peer_writer_peers.empty()) {
+    f->open_object_section("peer_writer_peers");
+    for (auto &peer : peer_writer_peers) {
+      peer.dump(f);
+    }
+    f->close_section(); // peer_writer_peers
+  }
 }
 
 void MirrorInfo::generate_test_instances(std::list<MirrorInfo*>& ls) {
@@ -122,10 +134,12 @@ void MirrorInfo::generate_test_instances(std::list<MirrorInfo*>& ls) {
   ls.back()->mirrored = true;
   ls.back()->peers.insert(Peer());
   ls.back()->peers.insert(Peer());
+  ls.back()->peer_writer_peers.insert(Peer());
 }
 
 void MirrorInfo::print(std::ostream& out) const {
-  out << "[peers=" << peers << "]" << std::endl;
+  out << "[peers=" << peers << ", peer_writer_peers=" << peer_writer_peers
+      << "]" << std::endl;
 }
 
 void Filesystem::dump(Formatter *f) const
@@ -134,7 +148,7 @@ void Filesystem::dump(Formatter *f) const
   mds_map.dump(f);
   f->close_section();
   f->dump_int("id", fscid);
-  if (mirror_info.is_mirrored()) {
+  if (mirror_info.is_mirrored() || mirror_info.has_peer_writer_peers()) {
     f->open_object_section("mirror_info");
     mirror_info.dump(f);
     f->close_section(); // mirror_info

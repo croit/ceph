@@ -234,6 +234,53 @@ directories are not allowed to be added for mirroring:
 Commands for checking directory mapping (to mirror daemons) and directory
 distribution are detailed in the `Mirror Daemon Status` section.
 
+Destination PeerWriter Control Plane
+------------------------------------
+
+The destination manager control plane is separate from the source
+``PeerReplayer`` directory policy. It uses the source-generated peer UUID and
+publishes only non-secret reciprocal peer configuration through the
+``fs mirror peer_writer`` Monitor command boundary. Source connection
+credentials are kept in the Monitor config-key store.
+
+The manager uses ``fs mirror peer_writer peer_add``, ``peer_remove``, and
+``peer_list`` as its internal Monitor boundary. ``peer_list`` returns a JSON
+object keyed by peer UUID; each value contains ``source_cluster_spec``,
+``source_fs_name``, and ``destination_filesystem``. The manager compares this
+record before treating a repeated add as idempotent or accepting a destination
+directory.
+
+Destination assignments are stored in the destination filesystem's metadata
+pool in the ``cephfs_mirror_writer`` object. The manager owns its versioned
+``instance_``, ``dir_map_``, and ``epoch_`` OMAP entries. The object has a
+revision key that is compared and advanced with every mutation. Assignment
+and epoch updates therefore commit atomically before the manager notifies a
+writer at ``cephfs_mirror_writer.<instance_id>``.
+
+Persisted instance entries are recovery evidence and are not treated as proof
+of liveness. A writer becomes available for placement only after replying to a
+periodic discovery notification with its process incarnation, protocol
+version, supported destination filesystems, and destination-client identity.
+Healthy assignments remain stable. New directories use deterministic
+least-loaded placement, and cooperative movement requires a versioned release
+reply that confirms that destination operations are quiesced.
+
+Live-writer release notifications are asynchronous. A missing acknowledgement
+leaves the directory ``releasing`` with its committed ownership and epoch
+unchanged; retries do not supersede an outstanding notification. Liveness
+expiry invalidates outstanding completions, marks the writer's directories
+``fencing``, and invokes ``PeerWriterPolicy._fence_instance`` outside the policy
+lock. That hook is currently a fail-closed placeholder for asynchronous MDS
+eviction, OSD blocklisting, and epoch-barrier confirmation; it cannot yet
+authorize removal or reassignment.
+
+The manager retains every ``epoch_`` entry after directory removal. A writer
+that disappears, restarts with another process incarnation, or changes its
+destination-client identity is not replaced until the old destination
+libcephfs client has been fenced. If that fence cannot be confirmed, the
+assignment remains unavailable rather than being moved on a best-effort
+basis.
+
 Bootstrap Peers
 ---------------
 

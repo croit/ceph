@@ -127,6 +127,10 @@ class Finisher:
         with self.lock:
             self.thread.queue(cbk, args)
 
+    def stop(self):
+        with self.lock:
+            self.thread.stop()
+
 class AsyncOpTracker:
     def __init__(self):
         self.ops_in_progress = 0
