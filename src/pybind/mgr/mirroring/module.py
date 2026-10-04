@@ -4,6 +4,7 @@ from .cli import MirroringCLICommand
 
 from mgr_module import MgrModule, Option, NotifyType
 
+from .fs.peer_writer import PeerWriterControlPlane
 from .fs.snapshot_mirror import FSSnapshotMirror
 
 class Module(MgrModule):
@@ -14,9 +15,15 @@ class Module(MgrModule):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.fs_snapshot_mirror = FSSnapshotMirror(self)
+        self.peer_writer = PeerWriterControlPlane(self, self.fs_snapshot_mirror)
 
     def notify(self, notify_type: NotifyType, notify_id):
         self.fs_snapshot_mirror.notify(notify_type)
+        self.peer_writer.notify(notify_type)
+
+    def shutdown(self):
+        self.peer_writer.shutdown()
+        super().shutdown()
 
     @MirroringCLICommand.Write('fs snapshot mirror enable')
     def snapshot_mirror_enable(self,
@@ -72,6 +79,79 @@ class Module(MgrModule):
                                               token: str):
         """Import a bootstrap token"""
         return self.fs_snapshot_mirror.peer_bootstrap_import(fs_name, token)
+
+    @MirroringCLICommand.Write('fs snapshot mirror peer_writer peer_add')
+    def snapshot_mirror_peer_writer_peer_add(
+            self,
+            destination_fs_name: str,
+            peer_uuid: str,
+            source_cluster_spec: str,
+            source_fs_name: str,
+            source_mon_host: Optional[str] = None,
+            cephx_key: Optional[str] = None):
+        """Add a reciprocal PeerWriter relationship"""
+        conf = {}
+        if source_mon_host is not None:
+            conf['mon_host'] = source_mon_host
+        if cephx_key is not None:
+            conf['key'] = cephx_key
+        return self.peer_writer.peer_add(destination_fs_name, peer_uuid,
+                                         source_cluster_spec, source_fs_name,
+                                         conf)
+
+    @MirroringCLICommand.Write(
+        'fs snapshot mirror peer_writer peer_bootstrap import')
+    def snapshot_mirror_peer_writer_peer_bootstrap_import(
+            self,
+            destination_fs_name: str,
+            token: str):
+        """Import a reciprocal PeerWriter bootstrap token"""
+        return self.peer_writer.peer_bootstrap_import(destination_fs_name,
+                                                      token)
+
+    @MirroringCLICommand.Write('fs snapshot mirror peer_writer peer_remove')
+    def snapshot_mirror_peer_writer_peer_remove(
+            self,
+            destination_fs_name: str,
+            peer_uuid: str):
+        """Remove a reciprocal PeerWriter relationship"""
+        return self.peer_writer.peer_remove(destination_fs_name, peer_uuid)
+
+    @MirroringCLICommand.Write('fs snapshot mirror peer_writer add')
+    def snapshot_mirror_peer_writer_add(
+            self,
+            destination_fs_name: str,
+            peer_uuid: str,
+            path: str):
+        """Add a destination directory for PeerWriter"""
+        return self.peer_writer.add_directory(destination_fs_name, peer_uuid,
+                                              path)
+
+    @MirroringCLICommand.Write('fs snapshot mirror peer_writer remove')
+    def snapshot_mirror_peer_writer_remove(
+            self,
+            destination_fs_name: str,
+            peer_uuid: str,
+            path: str):
+        """Remove a destination directory from PeerWriter"""
+        return self.peer_writer.remove_directory(destination_fs_name,
+                                                 peer_uuid, path)
+
+    @MirroringCLICommand.Read('fs snapshot mirror peer_writer ls')
+    def snapshot_mirror_peer_writer_ls(
+            self,
+            destination_fs_name: str):
+        """List destination directories tracked by PeerWriter"""
+        return self.peer_writer.list_directories(destination_fs_name)
+
+    @MirroringCLICommand.Read('fs snapshot mirror peer_writer status')
+    def snapshot_mirror_peer_writer_status(
+            self,
+            destination_fs_name: str,
+            peer_uuid: str,
+            path: str):
+        """Show a PeerWriter destination-directory assignment"""
+        return self.peer_writer.status(destination_fs_name, peer_uuid, path)
 
     @MirroringCLICommand.Write('fs snapshot mirror add')
     def snapshot_mirror_add_dir(self,

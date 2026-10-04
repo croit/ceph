@@ -1272,6 +1272,35 @@ bool MDSMonitor::preprocess_command(MonOpRequestRef op)
         r = 0;
       }
     }
+  } else if (prefix == "fs mirror peer_writer peer_list") {
+    string fs_name;
+    cmd_getval(cmdmap, "fs_name", fs_name);
+    auto *fsp = fsmap.get_filesystem(fs_name);
+    if (fsp == nullptr) {
+      ss << "filesystem '" << fs_name << "' not found";
+      r = -ENOENT;
+    } else {
+      if (!f) {
+        f.reset(Formatter::create("json"));
+      }
+      if (f) {
+        f->open_object_section("");
+        for (const auto &peer : fsp->get_mirror_info().peer_writer_peers) {
+          const auto &source = peer.remote;
+          f->open_object_section(peer.uuid.c_str());
+          f->dump_string("source_cluster_spec",
+                         source.client_name + "@" + source.cluster_name);
+          f->dump_string("source_client_name", source.client_name);
+          f->dump_string("source_cluster_name", source.cluster_name);
+          f->dump_string("source_fs_name", source.fs_name);
+          f->dump_string("destination_filesystem", fs_name);
+          f->close_section();
+        }
+        f->close_section();
+        f->flush(ds);
+      }
+      r = 0;
+    }
   } else if (prefix == "fs ls") {
     if (f) {
       f->open_array_section("filesystems");

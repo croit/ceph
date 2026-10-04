@@ -1878,6 +1878,126 @@ public:
   }
 };
 
+class MirrorHandlerAddPeerWriterPeer : public FileSystemCommandHandler {
+public:
+  MirrorHandlerAddPeerWriterPeer()
+      : FileSystemCommandHandler("fs mirror peer_writer peer_add") {}
+
+  boost::optional<pair<string, string>>
+  extract_source_cluster_conf(const string &spec) {
+    auto pos = spec.find("@");
+    if (pos == string_view::npos) {
+      return boost::optional<pair<string, string>>();
+    }
+
+    auto client = spec.substr(0, pos);
+    auto cluster = spec.substr(pos + 1);
+
+    return make_pair(client, cluster);
+  }
+
+  bool peer_add(FSMap &fsmap, const Filesystem &fs, const cmdmap_t &cmdmap,
+                ostream &ss) {
+    string peer_uuid;
+    string source_spec;
+    string source_fs_name;
+    cmd_getval(cmdmap, "uuid", peer_uuid);
+    cmd_getval(cmdmap, "source_cluster_spec", source_spec);
+    cmd_getval(cmdmap, "source_fs_name", source_fs_name);
+
+    auto source_conf = extract_source_cluster_conf(source_spec);
+    if (!source_conf) {
+      ss << "invalid source cluster spec -- should be <client>@<cluster>";
+      return false;
+    }
+
+    if (fs.get_mirror_info().has_peer_writer_peer(peer_uuid)) {
+      ss << "PeerWriter peer already exists";
+      return true;
+    }
+    if (fs.get_mirror_info().has_peer_writer_peer(
+            (*source_conf).first, (*source_conf).second, source_fs_name)) {
+      ss << "PeerWriter peer already exists";
+      return true;
+    }
+
+    auto f = [peer_uuid, source_conf, source_fs_name](auto &&fs) {
+      fs.get_mirror_info().peer_writer_peer_add(peer_uuid, (*source_conf).first,
+                                                (*source_conf).second,
+                                                source_fs_name);
+    };
+    fsmap.modify_filesystem(fs.get_fscid(), std::move(f));
+    return true;
+  }
+
+  int handle(Monitor *mon, FSMap &fsmap, MonOpRequestRef op,
+             const cmdmap_t &cmdmap, ostream &ss) override {
+    string fs_name;
+    if (!cmd_getval(cmdmap, "fs_name", fs_name) || fs_name.empty()) {
+      ss << "Missing filesystem name";
+      return -EINVAL;
+    }
+
+    auto *fsp = fsmap.get_filesystem(fs_name);
+    if (fsp == nullptr) {
+      ss << "Filesystem '" << fs_name << "' not found";
+      return -ENOENT;
+    }
+
+    auto res = peer_add(fsmap, *fsp, cmdmap, ss);
+    if (!res) {
+      return -EINVAL;
+    }
+
+    return 0;
+  }
+};
+
+class MirrorHandlerRemovePeerWriterPeer : public FileSystemCommandHandler {
+public:
+  MirrorHandlerRemovePeerWriterPeer()
+      : FileSystemCommandHandler("fs mirror peer_writer peer_remove") {}
+
+  bool peer_remove(FSMap &fsmap, const Filesystem &fs, const cmdmap_t &cmdmap,
+                   ostream &ss) {
+    string peer_uuid;
+    cmd_getval(cmdmap, "uuid", peer_uuid);
+
+    if (!fs.get_mirror_info().has_peer_writer_peer(peer_uuid)) {
+      ss << "cannot find PeerWriter peer with uuid: " << peer_uuid;
+      return true;
+    }
+
+    auto f = [peer_uuid](auto &&fs) {
+      fs.get_mirror_info().peer_writer_peer_remove(peer_uuid);
+    };
+    fsmap.modify_filesystem(fs.get_fscid(), std::move(f));
+    return true;
+  }
+
+  int handle(Monitor *mon, FSMap &fsmap, MonOpRequestRef op,
+             const cmdmap_t &cmdmap, ostream &ss) override {
+    string fs_name;
+    if (!cmd_getval(cmdmap, "fs_name", fs_name) || fs_name.empty()) {
+      ss << "Missing filesystem name";
+      return -EINVAL;
+    }
+
+    auto *fsp = fsmap.get_filesystem(fs_name);
+    if (fsp == nullptr) {
+      ss << "Filesystem '" << fs_name << "' not found";
+      return -ENOENT;
+    }
+
+    auto res = peer_remove(fsmap, *fsp, cmdmap, ss);
+    if (!res) {
+      return -EINVAL;
+    }
+
+    return 0;
+  }
+};
+
 list<std::shared_ptr<FileSystemCommandHandler> >
 FileSystemCommandHandler::load(Paxos *paxos)
 {
@@ -1903,6 +2023,8 @@ FileSystemCommandHandler::load(Paxos *paxos)
   handlers.push_back(std::make_shared<MirrorHandlerDisable>());
   handlers.push_back(std::make_shared<MirrorHandlerAddPeer>());
   handlers.push_back(std::make_shared<MirrorHandlerRemovePeer>());
+  handlers.push_back(std::make_shared<MirrorHandlerAddPeerWriterPeer>());
+  handlers.push_back(std::make_shared<MirrorHandlerRemovePeerWriterPeer>());
 
   return handlers;
 }
