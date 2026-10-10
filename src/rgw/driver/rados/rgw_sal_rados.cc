@@ -2305,6 +2305,7 @@ int RadosObject::delete_object(const DoutPrefixProvider* dpp,
   RGWRados::Object::Delete del_op(&del_target);
 
   del_op.params.bucket_owner = bucket->get_info().owner;
+  del_op.params.null_verid = (get_instance() == "null");
   del_op.params.versioning_status = (flags & FLAG_PREVENT_VERSIONING)
                                     ? 0 : bucket->get_info().versioning_status();
 
