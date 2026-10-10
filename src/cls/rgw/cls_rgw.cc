@@ -2284,6 +2284,22 @@ static int rgw_bucket_unlink_instance(cls_method_context_t hctx, bufferlist *in,
   const uint64_t candidate_epoch = op.olh_epoch ? op.olh_epoch : now_epoch;
   const uint64_t log_epoch = now_epoch;
 
+  // A NULL instance is mutable. A newer replacement can commit between the
+  // receiver's marker preflight and this unlink. Check under the index object's
+  // lock before removing any entry; a newer numbered head is not this target.
+  if (dest_key.instance.empty() && op.olh_epoch &&
+      (obj.get_dir_entry().versioned_epoch > op.olh_epoch ||
+       (olh_found && olh.exists() && olh.get_entry().key == dest_key &&
+        olh.get_epoch() > op.olh_epoch))) {
+    if (!olh_found) {
+      return -ECANCELED;
+    }
+    // Acknowledge the raw OLH pending tag without altering the newer target.
+    olh.update_log(CLS_RGW_OLH_OP_STALE, op.op_tag, dest_key,
+                   obj.is_delete_marker(), log_epoch);
+    return olh.write();
+  }
+
   if (!olh_found) {
     bool instance_only = false;
     cls_rgw_obj_key key(dest_key.name);
