@@ -8859,6 +8859,33 @@ int RGWRados::bi_get_instance(const DoutPrefixProvider *dpp, const RGWBucketInfo
   return 0;
 }
 
+int RGWRados::bi_get_delete_marker(const DoutPrefixProvider *dpp,
+                                   const RGWBucketInfo &bucket_info,
+                                   const rgw_obj &obj,
+                                   rgw_bucket_dir_entry *dirent) {
+  rgw_obj index_obj = obj;
+  if (obj.key.have_null_instance()) {
+    // The existing instance-index encoder appends the supplied instance after
+    // name\0i. NULL delete markers use the separate name\0i\0d record.
+    // This is an index-read selector only; never use it as a deletion identity.
+    index_obj.key.instance.assign("\0d", 2);
+  }
+  int ret = bi_get_instance(dpp, bucket_info, index_obj, dirent);
+  if (ret < 0) {
+    return ret;
+  }
+  const std::string instance =
+      obj.key.have_null_instance() ? "" : obj.key.instance;
+  if (!dirent->is_delete_marker() ||
+      dirent->key.name != obj.key.get_index_key_name() ||
+      dirent->key.instance != instance) {
+    ldpp_dout(dpp, 0) << "ERROR: invalid delete-marker index entry for " << obj
+                      << dendl;
+    return -EIO;
+  }
+  return 0;
+}
+
 int RGWRados::bi_get_olh(const DoutPrefixProvider *dpp, const RGWBucketInfo& bucket_info, const rgw_obj& obj,
                          rgw_bucket_olh_entry *olh)
 {

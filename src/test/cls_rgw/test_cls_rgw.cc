@@ -1018,6 +1018,320 @@ TEST_F(cls_rgw, olh_unlink_noncurrent_delete_marker) {
   EXPECT_FALSE(result.is_truncated);
 }
 
+static void test_olh_stale_unlink_preserves_null_variant(IoCtx &ioctx,
+                                                         bool delete_marker) {
+  string oid = delete_marker ? "olh-stale-unlink-null-marker"
+                             : "olh-stale-unlink-null-data";
+  ASSERT_EQ(0, init_olh_test_index(ioctx, oid));
+  cls_rgw_obj_key null_key("obj");
+  cls_rgw_obj_key explicit_null("obj", "null");
+  cls_rgw_obj_key numbered("obj", "old");
+  const string instance_idx = string("\x80"
+                                     "1000_",
+                                     6) +
+                              null_key.name + string("\0i", 2);
+  const BIIndexType instance_type =
+      delete_marker ? BIIndexType::Instance : BIIndexType::Plain;
+  const cls_rgw_obj_key instance_selector =
+      delete_marker ? cls_rgw_obj_key(null_key.name, std::string("\0d", 2))
+                    : cls_rgw_obj_key(instance_idx);
+  rgw_bucket_dir_entry_meta meta;
+  meta.mtime = ceph::real_time{ceph::timespan(1530000000123456789ULL)};
+  bufferlist tag;
+  tag.append(olh_test_tag);
+  const auto link_null = [&](uint64_t epoch) {
+    ASSERT_EQ(0, cls_rgw_bucket_link_olh(ioctx, oid, null_key, tag,
+                                         delete_marker, "link-null", &meta,
+                                         epoch, ceph::real_time{}, true, false,
+                                         rgw_zone_set{}));
+  };
+
+  ASSERT_EQ(0, put_olh_test_instance(ioctx, oid, numbered));
+  ASSERT_EQ(0, link_olh_test_instance(ioctx, oid, numbered, false, 50,
+                                      "link-numbered"));
+  if (!delete_marker) {
+    ASSERT_EQ(0, put_olh_test_instance(ioctx, oid, null_key, meta.mtime));
+  }
+  // Commit a newer version in the same NULL slot before replaying its unlink.
+  ASSERT_NO_FATAL_FAILURE(link_null(100));
+  ASSERT_NO_FATAL_FAILURE(link_null(200));
+  rgw_bucket_dir_entry stored;
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, instance_type, instance_selector,
+                                 stored));
+  EXPECT_EQ(null_key, stored.key);
+  EXPECT_EQ(200u, stored.versioned_epoch);
+  EXPECT_TRUE(stored.is_current());
+  EXPECT_EQ(delete_marker, stored.is_delete_marker());
+  EXPECT_EQ(!delete_marker, stored.exists);
+  EXPECT_EQ(meta.mtime, stored.meta.mtime);
+  bufferlist original_instance;
+  encode(stored, original_instance);
+  rgw_bucket_olh_entry olh;
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key, olh));
+  EXPECT_EQ(null_key, olh.key);
+  EXPECT_EQ(200u, olh.epoch);
+  EXPECT_TRUE(olh.exists);
+  EXPECT_EQ(delete_marker, olh.delete_marker);
+  EXPECT_FALSE(olh.pending_removal);
+  map<int, rgw_cls_list_ret> listing;
+  list_olh_test_versions(ioctx, oid, null_key.name, 10, listing);
+  ASSERT_EQ(1u, listing.size());
+  ASSERT_EQ(2u, listing.begin()->second.dir.m.size());
+  EXPECT_EQ(null_key, listing.begin()->second.dir.m.begin()->second.key);
+  EXPECT_TRUE(listing.begin()->second.dir.m.begin()->second.is_current());
+  EXPECT_EQ(delete_marker,
+            listing.begin()->second.dir.m.begin()->second.is_delete_marker());
+  EXPECT_EQ(meta.mtime,
+            listing.begin()->second.dir.m.begin()->second.meta.mtime);
+
+  unsigned stale_unlink_seq = 0;
+  const auto check_stale_unlink = [&](const cls_rgw_obj_key &key,
+                                      uint64_t epoch) {
+    SCOPED_TRACE(key.instance);
+    SCOPED_TRACE(epoch);
+    const string op_tag = "stale-unlink-null-" + to_string(++stale_unlink_seq);
+    SCOPED_TRACE(op_tag);
+    rgw_cls_bi_entry instance_before;
+    ASSERT_EQ(0, cls_rgw_bi_get(ioctx, oid, instance_type, instance_selector,
+                                &instance_before));
+    rgw_bucket_olh_entry olh_before;
+    ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key,
+                                   olh_before));
+    map<int, rgw_cls_list_ret> before;
+    list_olh_test_versions(ioctx, oid, null_key.name, 10, before);
+    ASSERT_EQ(1u, before.size());
+    bufferlist expected_listing;
+    encode(before.begin()->second.dir.m, expected_listing);
+
+    ASSERT_EQ(0, cls_rgw_bucket_unlink_instance(ioctx, oid, key, op_tag,
+                                                olh_test_tag, epoch, false,
+                                                rgw_zone_set{}));
+    rgw_cls_bi_entry instance_after;
+    ASSERT_EQ(0, cls_rgw_bi_get(ioctx, oid, instance_type, instance_selector,
+                                &instance_after));
+    EXPECT_EQ(instance_before.data.to_str(), instance_after.data.to_str());
+    rgw_bucket_olh_entry olh_after;
+    ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key,
+                                   olh_after));
+    EXPECT_EQ(olh_before.key, olh_after.key);
+    EXPECT_EQ(olh_before.delete_marker, olh_after.delete_marker);
+    EXPECT_EQ(olh_before.epoch, olh_after.epoch);
+    EXPECT_EQ(olh_before.tag, olh_after.tag);
+    EXPECT_EQ(olh_before.exists, olh_after.exists);
+    EXPECT_EQ(olh_before.pending_removal, olh_after.pending_removal);
+
+    // Acknowledge this op_tag without queueing removal or changing the head.
+    // Removing just that acknowledgment must recover every earlier log byte.
+    auto earlier_log = olh_after.pending_log;
+    ASSERT_FALSE(earlier_log.empty());
+    auto newest = earlier_log.rbegin();
+    ASSERT_FALSE(newest->second.empty());
+    const auto ack = newest->second.back();
+    EXPECT_EQ(CLS_RGW_OLH_OP_STALE, ack.op);
+    EXPECT_EQ(op_tag, ack.op_tag);
+    EXPECT_EQ(null_key, ack.key);
+    EXPECT_TRUE(ack.key.instance.empty());
+    EXPECT_EQ(delete_marker, ack.delete_marker);
+    EXPECT_EQ(newest->first, ack.epoch);
+    EXPECT_GT(ack.epoch, epoch);
+    EXPECT_GT(ack.epoch, olh_before.epoch);
+    if (!olh_before.pending_log.empty()) {
+      EXPECT_GE(ack.epoch, olh_before.pending_log.rbegin()->first);
+    }
+    newest->second.pop_back();
+    if (newest->second.empty()) {
+      earlier_log.erase(newest->first);
+    }
+    bufferlist expected_log, actual_log;
+    encode(olh_before.pending_log, expected_log);
+    encode(earlier_log, actual_log);
+    EXPECT_EQ(expected_log.to_str(), actual_log.to_str());
+    map<int, rgw_cls_list_ret> after;
+    list_olh_test_versions(ioctx, oid, null_key.name, 10, after);
+    ASSERT_EQ(1u, after.size());
+    bufferlist actual_listing;
+    encode(after.begin()->second.dir.m, actual_listing);
+    EXPECT_EQ(expected_listing.to_str(), actual_listing.to_str());
+  };
+
+  // Both spellings address the same mutable NULL slot; neither may remove
+  // the newer data/marker, its listing, or its current OLH.
+  ASSERT_NO_FATAL_FAILURE(check_stale_unlink(null_key, 100));
+  ASSERT_NO_FATAL_FAILURE(check_stale_unlink(explicit_null, 100));
+
+  // A numbered target is immutable and may still be removed even when both
+  // its own epoch and the current NULL head are newer than the unlink.
+  ASSERT_EQ(0, cls_rgw_bucket_unlink_instance(ioctx, oid, numbered,
+                                              "unlink-numbered", olh_test_tag,
+                                              25, false, rgw_zone_set{}));
+  listing.clear();
+  list_olh_test_versions(ioctx, oid, null_key.name, 10, listing);
+  ASSERT_EQ(1u, listing.size());
+  ASSERT_EQ(1u, listing.begin()->second.dir.m.size());
+  EXPECT_EQ(null_key, listing.begin()->second.dir.m.begin()->second.key);
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, instance_type, instance_selector,
+                                 stored));
+  bufferlist actual_instance;
+  encode(stored, actual_instance);
+  EXPECT_EQ(original_instance.to_str(), actual_instance.to_str());
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key, olh));
+  EXPECT_EQ(null_key, olh.key);
+  EXPECT_EQ(200u, olh.epoch);
+  EXPECT_TRUE(olh.exists);
+  EXPECT_EQ(delete_marker, olh.delete_marker);
+  EXPECT_FALSE(olh.pending_removal);
+
+  // Isolate the OLH guard: the instance epoch only equals the incoming
+  // unlink, but the same NULL key is committed as the newer current head.
+  olh.epoch = 300;
+  ASSERT_EQ(0, put_bi_test_entry(ioctx, oid, BIIndexType::OLH,
+                                 olh_test_index_key(null_key.name), olh));
+  ASSERT_NO_FATAL_FAILURE(check_stale_unlink(explicit_null, 200));
+
+  // A fresh unlink must still remove the listing and clear the current OLH.
+  ASSERT_EQ(0, cls_rgw_bucket_unlink_instance(ioctx, oid, null_key,
+                                              "fresh-unlink-null", olh_test_tag,
+                                              300, false, rgw_zone_set{}));
+  listing.clear();
+  list_olh_test_versions(ioctx, oid, null_key.name, 10, listing);
+  ASSERT_EQ(1u, listing.size());
+  EXPECT_TRUE(listing.begin()->second.dir.m.empty());
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key, olh));
+  EXPECT_EQ(null_key, olh.key);
+  EXPECT_EQ(300u, olh.epoch);
+  EXPECT_FALSE(olh.exists);
+  EXPECT_FALSE(olh.delete_marker);
+  EXPECT_TRUE(olh.pending_removal);
+  ASSERT_FALSE(olh.pending_log.empty());
+  const auto &fresh_log = olh.pending_log.rbegin()->second;
+  ASSERT_GE(fresh_log.size(), 2u);
+  EXPECT_EQ(CLS_RGW_OLH_OP_UNLINK_OLH, fresh_log[fresh_log.size() - 2].op);
+  EXPECT_EQ("fresh-unlink-null", fresh_log[fresh_log.size() - 2].op_tag);
+  EXPECT_EQ(delete_marker ? CLS_RGW_OLH_OP_STALE
+                          : CLS_RGW_OLH_OP_REMOVE_INSTANCE,
+            fresh_log.back().op);
+  EXPECT_EQ("fresh-unlink-null", fresh_log.back().op_tag);
+  EXPECT_EQ(null_key, fresh_log.back().key);
+  EXPECT_EQ(delete_marker, fresh_log.back().delete_marker);
+  rgw_cls_bi_entry raw;
+  if (delete_marker) {
+    EXPECT_EQ(-ENOENT, cls_rgw_bi_get(ioctx, oid, instance_type,
+                                      instance_selector, &raw));
+  } else {
+    // Data remains until the queued REMOVE_INSTANCE is applied.
+    ASSERT_EQ(
+        0, cls_rgw_bi_get(ioctx, oid, instance_type, instance_selector, &raw));
+    EXPECT_EQ(original_instance.to_str(), raw.data.to_str());
+  }
+
+  cls_rgw_obj_key new_head("obj", "new-head");
+  ASSERT_EQ(0, put_olh_test_instance(ioctx, oid, new_head));
+  ASSERT_EQ(0, link_olh_test_instance(ioctx, oid, new_head, false, 400,
+                                      "link-new-head"));
+  ASSERT_NO_FATAL_FAILURE(link_null(200));
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, instance_type, instance_selector,
+                                 stored));
+  EXPECT_EQ(200u, stored.versioned_epoch);
+  EXPECT_FALSE(stored.is_current());
+  EXPECT_EQ(delete_marker, stored.is_delete_marker());
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key, olh));
+  EXPECT_EQ(new_head, olh.key);
+  EXPECT_EQ(400u, olh.epoch);
+  listing.clear();
+  list_olh_test_versions(ioctx, oid, null_key.name, 10, listing);
+  ASSERT_EQ(1u, listing.size());
+  ASSERT_EQ(2u, listing.begin()->second.dir.m.size());
+  EXPECT_EQ(new_head, listing.begin()->second.dir.m.begin()->second.key);
+  EXPECT_EQ(null_key, listing.begin()->second.dir.m.rbegin()->second.key);
+  EXPECT_FALSE(listing.begin()->second.dir.m.rbegin()->second.is_current());
+
+  // Isolate the instance guard under a numbered head, then accept an unlink
+  // of that older NULL target at its own epoch despite the newer head.
+  ASSERT_NO_FATAL_FAILURE(check_stale_unlink(explicit_null, 100));
+  ASSERT_EQ(0, cls_rgw_bucket_unlink_instance(ioctx, oid, null_key,
+                                              "unlink-old-null", olh_test_tag,
+                                              200, false, rgw_zone_set{}));
+  listing.clear();
+  list_olh_test_versions(ioctx, oid, null_key.name, 10, listing);
+  ASSERT_EQ(1u, listing.size());
+  ASSERT_EQ(1u, listing.begin()->second.dir.m.size());
+  EXPECT_EQ(new_head, listing.begin()->second.dir.m.begin()->second.key);
+  EXPECT_TRUE(listing.begin()->second.dir.m.begin()->second.is_current());
+  ASSERT_EQ(0, get_bi_test_entry(ioctx, oid, BIIndexType::OLH, null_key, olh));
+  EXPECT_EQ(new_head, olh.key);
+  EXPECT_EQ(400u, olh.epoch);
+  EXPECT_TRUE(olh.exists);
+  EXPECT_FALSE(olh.delete_marker);
+  EXPECT_FALSE(olh.pending_removal);
+}
+
+TEST_F(cls_rgw, olh_stale_unlink_preserves_newer_null_data) {
+  ASSERT_NO_FATAL_FAILURE(
+      test_olh_stale_unlink_preserves_null_variant(ioctx, false));
+}
+
+TEST_F(cls_rgw, olh_stale_unlink_preserves_newer_null_delete_marker) {
+  ASSERT_NO_FATAL_FAILURE(
+      test_olh_stale_unlink_preserves_null_variant(ioctx, true));
+}
+
+TEST_F(cls_rgw, bi_get_null_delete_marker_binary_selector) {
+  string oid = "bi-get-null-delete-marker";
+  ASSERT_EQ(0, init_olh_test_index(ioctx, oid));
+  cls_rgw_obj_key key("obj");
+  rgw_bucket_dir_entry_meta meta;
+  meta.mtime = ceph::real_time{ceph::timespan(1530000000123456789ULL)};
+  meta.owner = "marker-owner";
+  bufferlist tag;
+  tag.append(olh_test_tag);
+  ASSERT_EQ(0, cls_rgw_bucket_link_olh(
+                   ioctx, oid, key, tag, true, "link-null-marker", &meta, 200,
+                   ceph::real_time{}, true, false, rgw_zone_set{}));
+
+  // The selector is the existing binary index suffix, not a version id.
+  cls_rgw_obj_key selector(key.name, std::string("\0d", 2));
+  rgw_cls_bi_entry raw;
+  ASSERT_EQ(0,
+            cls_rgw_bi_get(ioctx, oid, BIIndexType::Instance, selector, &raw));
+  EXPECT_EQ(BIIndexType::Instance, raw.type);
+  const string expected_idx = string("\x80"
+                                     "1000_",
+                                     6) +
+                              key.name + string("\0i\0d", 4);
+  EXPECT_EQ(expected_idx, raw.idx);
+  rgw_bucket_dir_entry marker;
+  auto p = raw.data.cbegin();
+  decode(marker, p);
+  EXPECT_EQ(key, marker.key);
+  EXPECT_TRUE(marker.key.instance.empty());
+  EXPECT_TRUE(marker.is_delete_marker());
+  EXPECT_TRUE(marker.is_current());
+  EXPECT_FALSE(marker.exists);
+  EXPECT_EQ(200u, marker.versioned_epoch);
+  EXPECT_EQ(meta.mtime, marker.meta.mtime);
+  EXPECT_EQ(meta.owner, marker.meta.owner);
+  bufferlist expected_meta, actual_meta;
+  encode(meta, expected_meta);
+  encode(marker.meta, actual_meta);
+  EXPECT_EQ(expected_meta.to_str(), actual_meta.to_str());
+
+  // BI get treats the ordinary spelling literally; it is not normalized.
+  EXPECT_EQ(-ENOENT, cls_rgw_bi_get(ioctx, oid, BIIndexType::Instance,
+                                    cls_rgw_obj_key(key.name, "null"), &raw));
+
+  // An empty raw selector reads the plain version placeholder. The binary
+  // selector above is required to retrieve the actual NULL marker metadata.
+  ASSERT_EQ(0, cls_rgw_bi_get(ioctx, oid, BIIndexType::Instance, key, &raw));
+  EXPECT_EQ(BIIndexType::Instance, raw.type);
+  EXPECT_EQ(key.name, raw.idx);
+  rgw_bucket_dir_entry placeholder;
+  p = raw.data.cbegin();
+  decode(placeholder, p);
+  EXPECT_EQ(key, placeholder.key);
+  EXPECT_TRUE(placeholder.flags & rgw_bucket_dir_entry::FLAG_VER_MARKER);
+  EXPECT_FALSE(placeholder.is_delete_marker());
+}
+
 TEST_F(cls_rgw, olh_stale_ops_use_local_log_epochs) {
   string oid = "olh-stale-log-epochs";
   ASSERT_EQ(0, init_olh_test_index(ioctx, oid));

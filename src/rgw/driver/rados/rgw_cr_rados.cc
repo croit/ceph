@@ -886,17 +886,44 @@ int RGWAsyncRemoveObj::_send_request(const DoutPrefixProvider *dpp)
 
   obj->set_atomic();
 
-  RGWObjState *state;
+  RGWObjState *state = nullptr;
+  const bool null_verid = obj->get_instance() == "null";
 
   int ret = obj->get_obj_state(dpp, &state, null_yield);
-  if (ret < 0) {
+  // An explicit NULL instance can have only an OLH head and no readable data.
+  // Let the index-backed delete resolve that instance, retaining the loaded
+  // state's timestamp and attributes for the existing preflight checks.
+  const bool null_instance_without_data = (ret == 0 || ret == -ENOENT) &&
+                                          versioned && null_verid && state &&
+                                          state->is_olh && !state->exists;
+  if (ret < 0 && !null_instance_without_data) {
     ldpp_dout(dpp, 20) << __func__ << "(): get_obj_state() obj=" << obj << " returned ret=" << ret << dendl;
     return ret;
   }
 
+  auto object_mtime = state->mtime;
+  if (null_instance_without_data) {
+    // The replica can create its raw OLH head after the logical marker was
+    // created. Compare the marker's index metadata, not that local head time.
+    rgw_bucket_dir_entry marker;
+    const rgw_obj marker_obj(bucket->get_info().bucket, obj->get_key());
+    ret = store->getRados()->bi_get_delete_marker(dpp, bucket->get_info(),
+                                                  marker_obj, &marker);
+    if (ret < 0 && ret != -ENOENT) {
+      return ret;
+    }
+    if (ret == 0) {
+      object_mtime = marker.meta.mtime;
+    }
+    // If the marker is already absent, retain the ordinary data/absence path.
+    // The index-side NULL epoch check protects a concurrent replacement.
+  }
+
   /* has there been any racing object write? */
-  if (del_if_older && (state->mtime > timestamp)) {
-    ldpp_dout(dpp, 20) << __func__ << "(): skipping object removal obj=" << obj << " (obj mtime=" << state->mtime << ", request timestamp=" << timestamp << ")" << dendl;
+  if (del_if_older && (object_mtime > timestamp)) {
+    ldpp_dout(dpp, 20) << __func__ << "(): skipping object removal obj=" << obj
+                       << " (obj mtime=" << object_mtime
+                       << ", request timestamp=" << timestamp << ")" << dendl;
     return 0;
   }
 
@@ -932,7 +959,7 @@ int RGWAsyncRemoveObj::_send_request(const DoutPrefixProvider *dpp)
   del_op->params.mtime = timestamp;
   del_op->params.high_precision_time = true;
   del_op->params.zones_trace = &zones_trace;
-  del_op->params.null_verid = false;
+  del_op->params.null_verid = null_verid;
 
   ret = del_op->delete_obj(dpp, null_yield, true);
   if (ret < 0) {
