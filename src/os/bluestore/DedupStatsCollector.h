@@ -15,6 +15,7 @@
 #include "common/ceph_mutex.h"
 #include "common/ceph_time.h"
 #include "common/hobject.h"
+#include "include/encoding.h"
 #include "os/dedup_types.h"
 
 class CephContext;
@@ -28,36 +29,61 @@ extern const std::string PREFIX_DEDUP_CSUM; // = "D";
  *
  * A digest is started by a read at offset 0 and is complete once the reads
  * reached the object size. Reads of another object, non-consecutive reads
- * or an object size change abandon the digest in progress, hence it might
- * be lost but is never built from wrong data, except for the case below.
+ * or an object modification or recreation (detected via onode's
+ * data_version and nid) abandon the digest in progress, hence it might be
+ * lost but is never built from wrong data.
  *
- * Relies on deep scrub behavior, as scrub's own data digest does:
- * - a single scrub per PG at a time, processing PG's objects one by one,
- *   i.e. all the chunks of an object are read before the next object,
- *   hence a single builder per collection suffices. Otherwise digests
- *   would be lost;
- * - writes to the objects being scrubbed are blocked, hence an object
- *   isn't modified between its chunk reads. Otherwise a same size
- *   overwrite in between would result in a wrong digest.
+ * Relies on deep scrub processing PG's objects one by one, i.e. reading all
+ * the chunks of an object before the next object, hence a single builder per
+ * collection suffices. Otherwise digests would be lost.
  */
 class DedupDigestBuilder
 {
   ceph::mutex lock = ceph::make_mutex("DedupDigestBuilder::lock");
   ghobject_t oid;
   uint64_t size = 0;
+  uint64_t nid = 0;          // onode's nid the digest is built for
+  uint64_t data_version = 0; // onode's data_version the digest is built for
   uint64_t next = 0; // offset the next read is expected at
   std::unique_ptr<ceph::crypto::MD5> md5; // null if no digest in progress
 
 public:
   /// whether a read of the object at the offset might contribute to
   /// a digest, i.e. starts a new one or continues the one in progress
-  bool accepts(const ghobject_t& _oid, uint64_t offset);
+  bool accepts(const ghobject_t& _oid, uint64_t _nid, uint64_t _data_version,
+               uint64_t offset);
 
-  /// feeds data read from the object of 'size' bytes at the offset,
-  /// returns the digest once the object is complete
-  std::optional<std::string> feed(const ghobject_t& _oid, uint64_t size,
+  /// feeds data read from the object of 'size' bytes, 'nid' and
+  /// 'data_version' at the offset, returns the digest once the object is
+  /// complete
+  std::optional<std::string> feed(const ghobject_t& _oid, uint64_t _size,
+                                  uint64_t _nid, uint64_t _data_version,
                                   uint64_t offset, const bufferlist& bl);
 };
+
+/// Dedup info record's value. The object's state the digest has been taken
+/// for is identified by <nid, data_version> of its onode.
+struct dedup_record_value_t {
+  ghobject_t oid;            ///< the object the digest has been taken for
+  uint64_t nid = 0;          ///< object's onode nid
+  uint64_t data_version = 0; ///< object's onode data_version
+
+  void encode(ceph::buffer::list& bl) const {
+    ENCODE_START(1, 1, bl);
+    encode(oid, bl);
+    encode(nid, bl);
+    encode(data_version, bl);
+    ENCODE_FINISH(bl);
+  }
+  void decode(ceph::buffer::list::const_iterator& p) {
+    DECODE_START(1, p);
+    decode(oid, p);
+    decode(nid, p);
+    decode(data_version, p);
+    DECODE_FINISH(p);
+  }
+};
+WRITE_CLASS_ENCODER(dedup_record_value_t)
 
 class DedupStatsCollector
 {
@@ -93,6 +119,8 @@ public:
     KeyValueDB& kv,
     int64_t pool,
     const ghobject_t& oid,
+    uint64_t nid,
+    uint64_t data_version,
     const std::string& digest);
 
   // Lists records whose digests have digest_msb_bits most significant bits

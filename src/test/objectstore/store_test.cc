@@ -14803,8 +14803,30 @@ TEST_P(StoreTestReformatting, CollectCsumChunkedTest) {
   };
   using recs_t = std::vector<std::pair<std::string, uint32_t>>;
 
+  // record values: <oid, <nid, data_version>>
+  auto record_values = [&]() {
+    std::vector<std::pair<ghobject_t, std::pair<uint64_t, uint64_t>>> res;
+    auto it = bstore->get_kv()->get_iterator(PREFIX_DEDUP_CSUM);
+    for (it->lower_bound(std::string()); it->valid(); it->next()) {
+      dedup_record_value_t v;
+      auto bl = it->value();
+      auto p = bl.cbegin();
+      decode(v, p);
+      res.emplace_back(v.oid, std::make_pair(v.nid, v.data_version));
+    }
+    return res;
+  };
+  auto data_version = [&](const ghobject_t& o) {
+    uint64_t nid = 0, v = 0;
+    EXPECT_EQ(0, bstore->get_object_data_version(ch, o, &nid, &v));
+    return std::make_pair(nid, v);
+  };
+
   // consecutive chunk reads covering the whole object
   scrub_whole(obj, len);
+  ASSERT_EQ((std::vector<std::pair<ghobject_t, std::pair<uint64_t, uint64_t>>>{
+	      {obj, data_version(obj)}}),
+	    record_values());
   ASSERT_EQ(recs_t({rec(bl, obj)}), records());
 
   // a gap
@@ -14845,10 +14867,72 @@ TEST_P(StoreTestReformatting, CollectCsumChunkedTest) {
   scrub_read(obj, stride, 2 * M);
   ASSERT_EQ(recs_t(), records());
 
+  // object overwritten in between keeping its size
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, obj, 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  scrub_read(obj, 0, stride);
+  bufferlist patch;
+  patch.append(std::string(4096, '#'));
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, obj, 2 * stride, patch.length(), patch);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  scrub_read(obj, stride, stride);
+  scrub_read(obj, 2 * stride, len - 2 * stride);
+  ASSERT_EQ(recs_t(), records());
+  // full rescrub records the new content
+  bufferlist bl_new;
+  bl_new.substr_of(bl, 0, 2 * stride);
+  bl_new.append(patch);
+  {
+    bufferlist tail;
+    tail.substr_of(bl, 2 * stride + patch.length(),
+		   len - 2 * stride - patch.length());
+    bl_new.append(tail);
+  }
+  scrub_whole(obj, len);
+  ASSERT_EQ(recs_t({rec(bl_new, obj)}), records());
+
+  // object recreated in between with the same size and number of
+  // modifications, i.e. the same data_version but another nid
+  ghobject_t objr(hobject_t(sobject_t("Recreated", CEPH_NOSNAP)));
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, objr, 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto state0 = data_version(objr);
+  scrub_read(objr, 0, stride);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, objr);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, objr, 0, bl_new.length(), bl_new);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  ASSERT_EQ(state0.second, data_version(objr).second);
+  ASSERT_NE(state0.first, data_version(objr).first);
+  scrub_read(objr, stride, stride);
+  scrub_read(objr, 2 * stride, len - 2 * stride);
+  ASSERT_EQ(recs_t(), records());
+
   {
     ObjectStore::Transaction t;
     t.remove(cid, obj);
     t.remove(cid, obj2);
+    t.remove(cid, objr);
     t.remove(cid, empty);
     t.remove_collection(cid);
     r = queue_transaction(store, ch, std::move(t));

@@ -125,23 +125,29 @@ void DedupStatsCollector::get_dedup_range(int64_t pool, uint64_t digest_msb,
   end += '\xFF';
 }
 
-bool DedupDigestBuilder::accepts(const ghobject_t& _oid, uint64_t offset)
+bool DedupDigestBuilder::accepts(const ghobject_t& _oid, uint64_t _nid,
+  uint64_t _data_version, uint64_t offset)
 {
   std::lock_guard l(lock);
-  return offset == 0 || (md5 && oid == _oid && next == offset);
+  return offset == 0 ||
+    (md5 && oid == _oid && nid == _nid && data_version == _data_version &&
+     next == offset);
 }
 
 std::optional<std::string> DedupDigestBuilder::feed(
-  const ghobject_t& _oid, uint64_t _size,
-  uint64_t offset, const bufferlist& bl)
+  const ghobject_t& _oid, uint64_t _size, uint64_t _nid,
+  uint64_t _data_version, uint64_t offset, const bufferlist& bl)
 {
   std::lock_guard l(lock);
   if (offset == 0) {
     oid = _oid;
     size = _size;
+    nid = _nid;
+    data_version = _data_version;
     next = 0;
     md5 = std::make_unique<ceph::crypto::MD5>();
-  } else if (!md5 || oid != _oid || size != _size || next != offset) {
+  } else if (!md5 || oid != _oid || size != _size || nid != _nid ||
+             data_version != _data_version || next != offset) {
     md5.reset(); // not a continuation, abandon the digest in progress
     return std::nullopt;
   }
@@ -166,6 +172,8 @@ void DedupStatsCollector::record_candidate(
   KeyValueDB& kv,
   int64_t pool,
   const ghobject_t& oid,
+  uint64_t nid,
+  uint64_t data_version,
   const std::string& digest)
 {
   ceph_assert(cct);
@@ -178,6 +186,8 @@ void DedupStatsCollector::record_candidate(
   dout(10) << __func__ << " "
     << " pool: " << pool
     << " oid: " << oid
+    << " nid: " << nid
+    << " data_version: " << data_version
     << " csum: " << bin2hex_str(digest)
     << " ts: " << std::chrono::duration_cast<std::chrono::nanoseconds>(ts.time_since_epoch())
     << " key: " << key
@@ -186,7 +196,7 @@ void DedupStatsCollector::record_candidate(
   auto txn = kv.get_transaction();
 
   bufferlist tmp_bl;
-  encode(oid, tmp_bl); //FIXME: make in a more extensible manner
+  encode(dedup_record_value_t{oid, nid, data_version}, tmp_bl);
 
   txn->set(PREFIX_DEDUP_CSUM, key, tmp_bl);
   int r = kv.submit_transaction(txn); // Don't care about flushing this data immediately,

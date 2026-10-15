@@ -211,7 +211,8 @@ bool OnodeChecksumCollectEngine::validate(OnodeReformatContext& ctx)
     // is built from consecutive reads. Empty objects aren't recorded.
     auto* c = static_cast<BlueStore::Collection*>(ctx.ch.get());
     will_handle = ctx.length > 0 && ctx.o->onode.size > 0 &&
-      c->dedup_digest_builder->accepts(ctx.o->oid, ctx.offset);
+      c->dedup_digest_builder->accepts(ctx.o->oid, ctx.o->onode.nid,
+                                       ctx.o->onode.data_version, ctx.offset);
     ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"
       << (will_handle ? " enabled " : " skipped ")
       << ctx.offset << "~" << ctx.length << " of 0~" << ctx.o->onode.size
@@ -230,16 +231,19 @@ bool OnodeChecksumCollectEngine::execute(OnodeReformatContext& ctx,
   // calculation and recording are deferred until the lock is released.
   ctx.defer(
     [cct = ctx.store.cct, kv, pool = c->pool(), oid = ctx.o->oid,
-     size = ctx.o->onode.size, offset = ctx.offset,
+     size = ctx.o->onode.size, nid = ctx.o->onode.nid,
+     data_version = ctx.o->onode.data_version,
+     offset = ctx.offset,
      builder = c->dedup_digest_builder,
      bl = ctx.bl,  // shares the read buffers, no data copy
      delay = ctx.store.cct->_conf->bluestore_debug_collect_csum_delay] {
       if (delay > 0) {
         std::this_thread::sleep_for(ceph::make_timespan(delay));
       }
-      auto digest = builder->feed(oid, size, offset, bl);
+      auto digest = builder->feed(oid, size, nid, data_version, offset, bl);
       if (digest) {
-        DedupStatsCollector::record_candidate(cct, *kv, pool, oid, *digest);
+        DedupStatsCollector::record_candidate(cct, *kv, pool, oid,
+                                              nid, data_version, *digest);
       }
     });
   return false; // let other engines work too, FIXME: what happens if rewrite occurs? Shouldn't we omit mtime change then?
