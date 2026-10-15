@@ -7,9 +7,11 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <shared_mutex>
 
+#include "common/ceph_crypto.h"
 #include "common/ceph_mutex.h"
 #include "common/ceph_time.h"
 #include "common/hobject.h"
@@ -19,6 +21,43 @@ class CephContext;
 class KeyValueDB;
 
 extern const std::string PREFIX_DEDUP_CSUM; // = "D";
+
+/**
+ * Builds an object's content digest from consecutive reads of the object,
+ * e.g. made by deep scrub in osd_deep_scrub_stride chunks.
+ *
+ * A digest is started by a read at offset 0 and is complete once the reads
+ * reached the object size. Reads of another object, non-consecutive reads
+ * or an object size change abandon the digest in progress, hence it might
+ * be lost but is never built from wrong data, except for the case below.
+ *
+ * Relies on deep scrub behavior, as scrub's own data digest does:
+ * - a single scrub per PG at a time, processing PG's objects one by one,
+ *   i.e. all the chunks of an object are read before the next object,
+ *   hence a single builder per collection suffices. Otherwise digests
+ *   would be lost;
+ * - writes to the objects being scrubbed are blocked, hence an object
+ *   isn't modified between its chunk reads. Otherwise a same size
+ *   overwrite in between would result in a wrong digest.
+ */
+class DedupDigestBuilder
+{
+  ceph::mutex lock = ceph::make_mutex("DedupDigestBuilder::lock");
+  ghobject_t oid;
+  uint64_t size = 0;
+  uint64_t next = 0; // offset the next read is expected at
+  std::unique_ptr<ceph::crypto::MD5> md5; // null if no digest in progress
+
+public:
+  /// whether a read of the object at the offset might contribute to
+  /// a digest, i.e. starts a new one or continues the one in progress
+  bool accepts(const ghobject_t& _oid, uint64_t offset);
+
+  /// feeds data read from the object of 'size' bytes at the offset,
+  /// returns the digest once the object is complete
+  std::optional<std::string> feed(const ghobject_t& _oid, uint64_t size,
+                                  uint64_t offset, const bufferlist& bl);
+};
 
 class DedupStatsCollector
 {
@@ -54,7 +93,7 @@ public:
     KeyValueDB& kv,
     int64_t pool,
     const ghobject_t& oid,
-    const bufferlist& bl);
+    const std::string& digest);
 
   // Lists records whose digests have digest_msb_bits most significant bits
   // equal to digest_msb, i.e. digest shard (digest_msb) out of

@@ -14574,6 +14574,137 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   }
 }
 
+// Deep scrub reads large objects in osd_deep_scrub_stride chunks, dedup
+// info should be collected from consecutive chunk reads of an object.
+TEST_P(StoreTestReformatting, CollectCsumChunkedTest) {
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  ghobject_t obj2(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+  ghobject_t empty(hobject_t(sobject_t("Empty", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "collect_csum");
+  store->set_collection_opts(ch, popts);
+
+  const uint64_t M = 1024 * 1024;
+  const uint64_t len = 10 * M;
+  const uint64_t stride = 4 * M;
+  bufferlist bl, bl2;
+  for (uint64_t i = 0; i < len / 4096; i++) {
+    bl.append(std::string(4096, char('a' + i % 26)));
+  }
+  bl2.append(std::string(M, 'z'));
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.write(cid, obj, 0, bl.length(), bl);
+    t.write(cid, obj2, 0, bl2.length(), bl2);
+    t.touch(cid, empty);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto scrub_read = [&](const ghobject_t& o, uint64_t off, uint64_t l,
+			uint32_t flags = CEPH_OSD_OP_FLAG_SCRUB |
+					 CEPH_OSD_OP_FLAG_PRIMARY) {
+    bufferlist rbl;
+    int r = store->read(ch, o, off, l, rbl, flags);
+    ASSERT_GE(r, 0);
+  };
+  auto scrub_whole = [&](const ghobject_t& o, uint64_t size) {
+    for (uint64_t off = 0; off < size; off += stride) {
+      scrub_read(o, off, std::min(stride, size - off));
+    }
+  };
+  // <digest, object hash> of all the records
+  auto records = [&]() {
+    std::vector<std::pair<std::string, uint32_t>> res;
+    std::vector<dedup_candidate_t> ls;
+    std::string next;
+    bool completed = false;
+    while (!completed) {
+      int r = bstore->dedup_candidate_list(cid.pool(), 0, 0,
+	CEPH_CRYPTO_MD5_DIGESTSIZE * 8,
+	ceph::real_clock::time_point(), ceph::real_clock::time_point(),
+	1000, 0, 0.0, ls, &next, &completed);
+      EXPECT_GE(r, 0);
+    }
+    for (auto& e : ls) {
+      res.emplace_back(e.digest, e.oid_hash);
+    }
+    bstore->clear_dedup_info(cid.pool(), false);
+    return res;
+  };
+  auto rec = [](const bufferlist& bl, const ghobject_t& o) {
+    ceph::crypto::MD5 h;
+    for (auto& p : bl.buffers()) {
+      h.Update((const unsigned char*)p.c_str(), p.length());
+    }
+    std::string d(CEPH_CRYPTO_MD5_DIGESTSIZE, 0);
+    h.Final((unsigned char*)d.data());
+    return std::make_pair(d, o.hobj.get_bitwise_key_u32());
+  };
+  using recs_t = std::vector<std::pair<std::string, uint32_t>>;
+
+  // consecutive chunk reads covering the whole object
+  scrub_whole(obj, len);
+  ASSERT_EQ(recs_t({rec(bl, obj)}), records());
+
+  // a gap
+  scrub_read(obj, 0, stride);
+  scrub_read(obj, 2 * stride, len - 2 * stride);
+  ASSERT_EQ(recs_t(), records());
+
+  // another object is read in between
+  scrub_read(obj, 0, stride);
+  scrub_whole(obj2, bl2.length());
+  scrub_read(obj, stride, stride);
+  scrub_read(obj, 2 * stride, len - 2 * stride);
+  ASSERT_EQ(recs_t({rec(bl2, obj2)}), records());
+
+  // restarted from the beginning, e.g. after scrub preemption
+  scrub_read(obj, 0, stride);
+  scrub_whole(obj, len);
+  ASSERT_EQ(recs_t({rec(bl, obj)}), records());
+
+  // reads by non-primary
+  for (uint64_t off = 0; off < len; off += stride) {
+    scrub_read(obj, off, std::min(stride, len - off), CEPH_OSD_OP_FLAG_SCRUB);
+  }
+  ASSERT_EQ(recs_t(), records());
+
+  // empty objects aren't recorded, deep scrub reads 1 byte of them
+  scrub_read(empty, 0, 1);
+  ASSERT_EQ(recs_t(), records());
+
+  // object size changed in between
+  scrub_read(obj, 0, stride);
+  {
+    ObjectStore::Transaction t;
+    t.truncate(cid, obj, 6 * M);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  scrub_read(obj, stride, 2 * M);
+  ASSERT_EQ(recs_t(), records());
+
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove(cid, obj2);
+    t.remove(cid, empty);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Dedup info collection doesn't modify objects, hence shouldn't hold
 // the collection lock: other reads and writes to the collection should
 // proceed while it's in progress.

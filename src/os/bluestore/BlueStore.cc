@@ -5315,6 +5315,7 @@ BlueStore::Collection::Collection(BlueStore *store_, OnodeCacheShard *oc, Buffer
     cache(bc),
     exists(true),
     onode_space(oc),
+    dedup_digest_builder(std::make_shared<DedupDigestBuilder>()),
     commit_queue(nullptr)
 {
 }

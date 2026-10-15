@@ -207,17 +207,15 @@ bool OnodeChecksumCollectEngine::validate(OnodeReformatContext& ctx)
   bool will_handle = false;
   uint64_t want_flags = CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY;
   if ((ctx.op_flags & want_flags) == want_flags) {
-    will_handle = ctx.offset == 0 && ctx.length == ctx.o->onode.size;
-    if (!will_handle) {
-      ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"
-	<< " skipped due to incomplete object read "
-	<< ctx.offset << "~" << ctx.length << " vs. 0~" << ctx.o->onode.size
-	<< dendl;
-    } else {
-      ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"
-	<< " enabled "
-	<< dendl;
-    }
+    // Deep scrub might read an object in multiple chunks, hence the digest
+    // is built from consecutive reads. Empty objects aren't recorded.
+    auto* c = static_cast<BlueStore::Collection*>(ctx.ch.get());
+    will_handle = ctx.length > 0 && ctx.o->onode.size > 0 &&
+      c->dedup_digest_builder->accepts(ctx.o->oid, ctx.offset);
+    ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"
+      << (will_handle ? " enabled " : " skipped ")
+      << ctx.offset << "~" << ctx.length << " of 0~" << ctx.o->onode.size
+      << dendl;
   }
   return will_handle;
 }
@@ -227,16 +225,22 @@ bool OnodeChecksumCollectEngine::execute(OnodeReformatContext& ctx,
 {
   auto kv = ctx.store.get_kv();
   ceph_assert(kv);
+  auto* c = static_cast<BlueStore::Collection*>(ctx.ch.get());
   // Capture everything needed while under collection lock, digest
   // calculation and recording are deferred until the lock is released.
   ctx.defer(
-    [cct = ctx.store.cct, kv, pool = ctx.o->c->pool(), oid = ctx.o->oid,
+    [cct = ctx.store.cct, kv, pool = c->pool(), oid = ctx.o->oid,
+     size = ctx.o->onode.size, offset = ctx.offset,
+     builder = c->dedup_digest_builder,
      bl = ctx.bl,  // shares the read buffers, no data copy
      delay = ctx.store.cct->_conf->bluestore_debug_collect_csum_delay] {
       if (delay > 0) {
         std::this_thread::sleep_for(ceph::make_timespan(delay));
       }
-      DedupStatsCollector::record_candidate(cct, *kv, pool, oid, bl);
+      auto digest = builder->feed(oid, size, offset, bl);
+      if (digest) {
+        DedupStatsCollector::record_candidate(cct, *kv, pool, oid, *digest);
+      }
     });
   return false; // let other engines work too, FIXME: what happens if rewrite occurs? Shouldn't we omit mtime change then?
 };

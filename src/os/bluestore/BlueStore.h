@@ -76,6 +76,7 @@ class SimpleBitmap;
 class OnodeReformatContext;
 class OnodeReformatEngine;
 class DedupStatsCollector;
+class DedupDigestBuilder;
 using reformat_engines_t =
   std::array<std::shared_ptr<OnodeReformatEngine>, MAX_REFORMAT_ENGINES>;
 
@@ -1796,6 +1797,8 @@ public:
     // scrub reads need exclusive lock. Accessed with no lock held to
     // choose the lock mode.
     std::atomic<bool> has_modifying_reformat_engines = false;
+    // builds dedup info digests from deep scrub reads
+    std::shared_ptr<DedupDigestBuilder> dedup_digest_builder;
 
     ContextQueue *commit_queue;
     std::unique_ptr<Estimator> estimator;

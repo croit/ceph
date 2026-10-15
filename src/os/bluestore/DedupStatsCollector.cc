@@ -125,20 +125,50 @@ void DedupStatsCollector::get_dedup_range(int64_t pool, uint64_t digest_msb,
   end += '\xFF';
 }
 
+bool DedupDigestBuilder::accepts(const ghobject_t& _oid, uint64_t offset)
+{
+  std::lock_guard l(lock);
+  return offset == 0 || (md5 && oid == _oid && next == offset);
+}
+
+std::optional<std::string> DedupDigestBuilder::feed(
+  const ghobject_t& _oid, uint64_t _size,
+  uint64_t offset, const bufferlist& bl)
+{
+  std::lock_guard l(lock);
+  if (offset == 0) {
+    oid = _oid;
+    size = _size;
+    next = 0;
+    md5 = std::make_unique<ceph::crypto::MD5>();
+  } else if (!md5 || oid != _oid || size != _size || next != offset) {
+    md5.reset(); // not a continuation, abandon the digest in progress
+    return std::nullopt;
+  }
+  for (auto& p : bl.buffers()) {
+    md5->Update((const unsigned char*)p.c_str(), p.length());
+  }
+  next += bl.length();
+  if (next < size) {
+    if (bl.length() == 0) {
+      md5.reset(); // unexpected end of data
+    }
+    return std::nullopt;
+  }
+  std::string digest(CEPH_CRYPTO_MD5_DIGESTSIZE, 0);
+  md5->Final((unsigned char*)digest.data());
+  md5.reset();
+  return digest;
+}
+
 void DedupStatsCollector::record_candidate(
   CephContext* cct,
   KeyValueDB& kv,
   int64_t pool,
   const ghobject_t& oid,
-  const bufferlist& bl)
+  const std::string& digest)
 {
   ceph_assert(cct);
-  ceph::crypto::MD5 h;
-  for (auto& p : bl.buffers()) {
-    h.Update((const unsigned char*)p.c_str(), p.length());
-  }
-  std::string digest(CEPH_CRYPTO_MD5_DIGESTSIZE, 0);
-  h.Final((unsigned char*)digest.data());
 
   // wall clock as records are persistent, i.e. survive reboots
   auto ts = ceph::real_clock::now();
