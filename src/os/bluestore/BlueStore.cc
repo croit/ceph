@@ -13122,8 +13122,16 @@ void BlueStore::_update_reformat_engines(Collection* c)
     } else if (args.starts_with("defragment")) {
       e = DEFRAGMENT_ENGINE;
       engine = new OnodeReformatDefragmentEngine(args);
+    } else {
+      // The option isn't validated on setting hence might contain
+      // anything, e.g. a typo or an engine unknown to this release.
+      if (!args.empty()) {
+        derr << __func__ << " ignoring unknown deep scrub reformat engine '"
+             << args << "' for " << c->cid << dendl;
+      }
+      continue;
     }
-    ceph_assert(e < MAX_REFORMAT_ENGINES);
+    ceph_assert(e >= 0 && e < MAX_REFORMAT_ENGINES);
     new_engines[e].reset(engine);
   }
   std::swap(c->reformat_engines, new_engines);

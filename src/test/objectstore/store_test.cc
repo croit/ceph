@@ -14574,6 +14574,67 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   }
 }
 
+// Unknown (e.g. misspelled) engines in DEEP_SCRUB_REFORMAT pool option
+// should be ignored without affecting known ones.
+TEST_P(StoreTestReformatting, UnknownReformatEngineTest) {
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+
+  // unknown engines only
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "collect_cksum; foo ,,; ");
+  store->set_collection_opts(ch, popts);
+
+  // unknown ones along with a known one
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "bar;collect_csum, baz");
+  store->set_collection_opts(ch, popts);
+
+  bufferlist bl;
+  bl.append(std::string(64 * 1024, 'a'));
+  {
+    C_SaferCond c;
+    ObjectStore::Transaction t;
+    t.write(cid, obj, 0, bl.length(), bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.register_on_complete(&c);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+    c.wait();
+  }
+  bufferlist rbl;
+  r = store->read(ch, obj, 0, bl.length(), rbl,
+		  CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY);
+  ASSERT_EQ(r, (int)bl.length());
+  ASSERT_TRUE(bl_eq(bl, rbl));
+
+  // collect_csum engine is still active
+  uint64_t entries = 0;
+  bstore->estimate_dedup_info(cid.pool(), &entries);
+  ASSERT_EQ(entries, 1u);
+
+  bstore->clear_dedup_info(cid.pool(), false);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Vary write_v2 mode
 INSTANTIATE_TEST_SUITE_P(
   BlueStore,
