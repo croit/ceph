@@ -13135,6 +13135,11 @@ void BlueStore::_update_reformat_engines(Collection* c)
     new_engines[e].reset(engine);
   }
   std::swap(c->reformat_engines, new_engines);
+  bool modifying = false;
+  for (auto& e : c->reformat_engines) {
+    modifying = modifying || (e && e->modifies_object());
+  }
+  c->has_modifying_reformat_engines = modifying;
 }
 
 // Executes reformat engines, under collection lock.
@@ -13192,12 +13197,19 @@ int BlueStore::read(
   bl.clear();
   int r;
   {
-    // we need a shared lock to accesss
-    // reformat_engines from collection for validation,
-    // but once we want to apply reformatting modifying the object
-    // we need unique lock
-    std::shared_lock slock(c->lock);
+    // We need a shared lock to access reformat_engines from collection
+    // for validation, but reformatting modifying the object needs unique
+    // lock. Choose the lock mode in advance rather than upgrading
+    // the lock later as the latter isn't atomic. Reformatting is applied
+    // to scrub reads only.
+    std::shared_lock slock(c->lock, std::defer_lock);
     std::unique_lock ulock(c->lock, std::defer_lock);
+    if ((op_flags & CEPH_OSD_OP_FLAG_SCRUB) &&
+        c->has_modifying_reformat_engines) {
+      ulock.lock();
+    } else {
+      slock.lock();
+    }
 
     auto start1 = mono_clock::now();
     OnodeRef o = c->get_onode(oid, false);
@@ -13208,14 +13220,11 @@ int BlueStore::read(
       "", l_bluestore_slow_read_onode_meta_count);
 
     read_context_t read_ctx(*this, c_, o, offset, length, bl, op_flags);
-    OnodeReformatContext reformat_ctx(read_ctx, c->reformat_engines);
-    if (o && o->exists && reformat_ctx.needs_exclusive()) {
-      slock.unlock();
-      ulock.lock();
-    }
-
-    // either collection or onode could be removed while switching locks above,
-    // hence checking once again
+    // engines modifying the object are enabled only if unique lock is
+    // held, collection settings might have changed since the lock mode
+    // was chosen
+    OnodeReformatContext reformat_ctx(read_ctx, c->reformat_engines,
+      ulock.owns_lock());
     if (c->exists && o && o->exists) {
       if (offset == length && offset == 0)
 	length = o->onode.size;

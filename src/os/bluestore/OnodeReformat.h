@@ -70,7 +70,6 @@ class OnodeReformatContext : public BlueStore::read_context_t {
 private:
 
   size_t enabled_engines_count = 0;
-  size_t modifying_engines_count = 0; // enabled ones modifying the object
   reformat_engines_t engines;
   std::vector<std::function<void()>> deferred;
 
@@ -81,17 +80,16 @@ private:
   PExtentVectorSlicer* prealloc_slicer = nullptr; // pointer to the one from wctx if configured
 public:
 
+  /// 'exclusive' indicates the collection is locked exclusively, engines
+  /// modifying the object are enabled only then
   OnodeReformatContext(const BlueStore::read_context_t& _rctx,
-    const reformat_engines_t& _engines);
+    const reformat_engines_t& _engines, bool exclusive);
   ~OnodeReformatContext();
 
   bool maybe_allocate(size_t need, size_t min_alloc_size,
     std::function<bool(int64_t, size_t)> acceptor);
 
   bool is_enabled() const { return enabled_engines_count > 0; }
-  /// whether enabled engines might modify the object, hence the read
-  /// needs exclusive access to the collection
-  bool needs_exclusive() const { return modifying_engines_count > 0; }
   bool is_applied() const { return to_be_applied; }
   BlueStore::WriteContext& get_write_context() { return wctx; }
   span_stat_t& access_span_stats() {

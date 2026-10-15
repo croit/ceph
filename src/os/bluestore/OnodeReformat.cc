@@ -248,7 +248,8 @@ bool OnodeChecksumCollectEngine::execute(OnodeReformatContext& ctx,
 #define dout_prefix *_dout << "OnodeReformatContext "
 
 OnodeReformatContext::OnodeReformatContext(const BlueStore::read_context_t& _ctx,
-					   const reformat_engines_t& _engines)
+					   const reformat_engines_t& _engines,
+					   bool exclusive)
   : read_context_t(_ctx)
 {
   // Nothing to reformat if the object doesn't exist, moreover engines
@@ -258,10 +259,10 @@ OnodeReformatContext::OnodeReformatContext(const BlueStore::read_context_t& _ctx
   }
   // Choose the engines that should be offered to execution
   for (size_t i = 0; i < _engines.size(); i++) {
-    if (_engines[i] && _engines[i]->validate(*this)) {
+    if (_engines[i] && (exclusive || !_engines[i]->modifies_object()) &&
+        _engines[i]->validate(*this)) {
       engines[i] = _engines[i];
       enabled_engines_count++;
-      modifying_engines_count += engines[i]->modifies_object();
     }
   }
 }

@@ -1792,6 +1792,10 @@ public:
     std::optional<int64_t> comp_max_blob_size;
     std::optional<double> compression_req_ratio;
     reformat_engines_t reformat_engines;
+    // whether reformat_engines include ones modifying the object, hence
+    // scrub reads need exclusive lock. Accessed with no lock held to
+    // choose the lock mode.
+    std::atomic<bool> has_modifying_reformat_engines = false;
 
     ContextQueue *commit_queue;
     std::unique_ptr<Estimator> estimator;
