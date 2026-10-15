@@ -5842,6 +5842,13 @@ options:
   level: dev
   default: false
   with_legacy: true
+- name: bluestore_debug_collect_csum_delay
+  type: float
+  level: dev
+  desc: Delay (in seconds) injected when recording dedup info for an object
+    by collect_csum deep scrub reformat engine, for testing
+  default: 0
+  with_legacy: true
 - name: bluestore_debug_random_read_err
   type: float
   level: dev

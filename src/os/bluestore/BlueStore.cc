@@ -13137,7 +13137,10 @@ void BlueStore::_update_reformat_engines(Collection* c)
   std::swap(c->reformat_engines, new_engines);
 }
 
-void BlueStore::_maybe_do_reformat_onode(OnodeReformatContext& reformat_ctx,
+// Executes reformat engines, under collection lock.
+// Returns the time spent.
+ceph::timespan BlueStore::_maybe_do_reformat_onode(
+  OnodeReformatContext& reformat_ctx,
   Collection* c, OnodeRef& o,
   uint64_t offset, size_t length,
   const bufferlist& bl,
@@ -13159,15 +13162,13 @@ void BlueStore::_maybe_do_reformat_onode(OnodeReformatContext& reformat_ctx,
     if (reformat_ctx.is_applied()) {
       _txc_exec_reformat_write(c, o, offset, length, bl, wctx);
     }
-    log_latency(__func__,
-      l_bluestore_reformat_lat,
-      mono_clock::now() - start2,
-      cct->_conf->bluestore_log_op_age);
-  } else {
-    dout(15) << __func__ << " skipping reformat:"
-     << reformat_ctx.is_enabled() << " "
-     << dendl;
+    reformat_ctx.release_preallocated();
+    return mono_clock::now() - start2;
   }
+  dout(15) << __func__ << " skipping reformat:"
+   << reformat_ctx.is_enabled() << " "
+   << dendl;
+  return ceph::timespan::zero();
 }
 
 int BlueStore::read(
@@ -13193,8 +13194,8 @@ int BlueStore::read(
   {
     // we need a shared lock to accesss
     // reformat_engines from collection for validation,
-    // but once we want to apply reformatting we need
-    // unique lock
+    // but once we want to apply reformatting modifying the object
+    // we need unique lock
     std::shared_lock slock(c->lock);
     std::unique_lock ulock(c->lock, std::defer_lock);
 
@@ -13208,7 +13209,7 @@ int BlueStore::read(
 
     read_context_t read_ctx(*this, c_, o, offset, length, bl, op_flags);
     OnodeReformatContext reformat_ctx(read_ctx, c->reformat_engines);
-    if (o && o->exists && reformat_ctx.is_enabled()) {
+    if (o && o->exists && reformat_ctx.needs_exclusive()) {
       slock.unlock();
       ulock.lock();
     }
@@ -13236,7 +13237,25 @@ int BlueStore::read(
 	  cct->_conf->bluestore_log_op_age);
       }
       if (r >= 0) {
-	_maybe_do_reformat_onode(reformat_ctx, c, o, offset, length, bl, op_flags);
+	auto reformat_lat = _maybe_do_reformat_onode(reformat_ctx, c, o,
+	  offset, length, bl, op_flags);
+	if (reformat_ctx.is_enabled()) {
+	  // Deferred work of the engines (e.g. dedup info recording) doesn't
+	  // need the collection lock, release it beforehand
+	  if (ulock.owns_lock()) {
+	    ulock.unlock();
+	  }
+	  if (slock.owns_lock()) {
+	    slock.unlock();
+	  }
+	  auto start3 = mono_clock::now();
+	  reformat_ctx.run_deferred();
+	  reformat_lat += mono_clock::now() - start3;
+	  log_latency("_maybe_do_reformat_onode",
+	    l_bluestore_reformat_lat,
+	    reformat_lat,
+	    cct->_conf->bluestore_log_op_age);
+	}
       }
     } else {
       r = -ENOENT;

@@ -2,6 +2,7 @@
 // vim: ts=8 sw=2 sts=2 expandtab
 
 #include <random>
+#include <thread>
 #include "common/ceph_context.h"
 #include "common/dout.h"
 
@@ -224,13 +225,19 @@ bool OnodeChecksumCollectEngine::validate(OnodeReformatContext& ctx)
 bool OnodeChecksumCollectEngine::execute(OnodeReformatContext& ctx,
   PerfCounters& logger)
 {
-  ceph_assert(ctx.store.get_kv());
-  DedupStatsCollector::record_candidate(
-    ctx.store.cct,
-    *ctx.store.get_kv(),
-    ctx.o->c->pool(),
-    ctx.o->oid,
-    ctx.bl);
+  auto kv = ctx.store.get_kv();
+  ceph_assert(kv);
+  // Capture everything needed while under collection lock, digest
+  // calculation and recording are deferred until the lock is released.
+  ctx.defer(
+    [cct = ctx.store.cct, kv, pool = ctx.o->c->pool(), oid = ctx.o->oid,
+     bl = ctx.bl,  // shares the read buffers, no data copy
+     delay = ctx.store.cct->_conf->bluestore_debug_collect_csum_delay] {
+      if (delay > 0) {
+        std::this_thread::sleep_for(ceph::make_timespan(delay));
+      }
+      DedupStatsCollector::record_candidate(cct, *kv, pool, oid, bl);
+    });
   return false; // let other engines work too, FIXME: what happens if rewrite occurs? Shouldn't we omit mtime change then?
 };
 
@@ -254,6 +261,7 @@ OnodeReformatContext::OnodeReformatContext(const BlueStore::read_context_t& _ctx
     if (_engines[i] && _engines[i]->validate(*this)) {
       engines[i] = _engines[i];
       enabled_engines_count++;
+      modifying_engines_count += engines[i]->modifies_object();
     }
   }
 }
@@ -294,21 +302,42 @@ bool OnodeReformatContext::maybe_allocate(size_t need, size_t min_alloc_size,
 void OnodeReformatContext::exec_engines(
   PerfCounters& logger)
 {
-  // Enumerate all the validated engines and try to execute them
-  // in their priority order until the first success indicated
+  // Enumerate all the validated engines modifying the object and try to
+  // execute them in their priority order until the first success indicated
   for (auto& e : engines) {
-    if (e.get() && e->execute(*this, logger)) {
+    if (e.get() && e->modifies_object() && e->execute(*this, logger)) {
       to_be_applied = true;
       break;
     }
   }
+  // Engines not modifying the object are always executed
+  for (auto& e : engines) {
+    if (e.get() && !e->modifies_object()) {
+      e->execute(*this, logger);
+    }
+  }
 }
-void OnodeReformatContext::clear()
+
+void OnodeReformatContext::run_deferred()
+{
+  auto fns = std::move(deferred);
+  deferred.clear();
+  for (auto& f : fns) {
+    f();
+  }
+}
+void OnodeReformatContext::release_preallocated()
 {
   PExtentVector to_release;
   if (prealloc_slicer && alloc && !prealloc_slicer->end() && prealloc_slicer->slice(to_release) > 0) {
     alloc->release(to_release);
   }
+}
+
+void OnodeReformatContext::clear()
+{
+  release_preallocated();
+  deferred.clear();
   for (auto& e : engines) {
     e.reset();
   }

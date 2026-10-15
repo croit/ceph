@@ -14574,6 +14574,109 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   }
 }
 
+// Dedup info collection doesn't modify objects, hence shouldn't hold
+// the collection lock: other reads and writes to the collection should
+// proceed while it's in progress.
+TEST_P(StoreTestReformatting, CollectCsumUnlockedTest) {
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  const double delay = 2.0;
+  SetVal(g_conf(), "bluestore_debug_collect_csum_delay",
+	 std::to_string(delay).c_str());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  ghobject_t obj2(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "collect_csum");
+  store->set_collection_opts(ch, popts);
+  bufferlist bl;
+  bl.append(std::string(64 * 1024, 'a'));
+  {
+    C_SaferCond c;
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.write(cid, obj, 0, bl.length(), bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.write(cid, obj2, 0, bl.length(), bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.register_on_complete(&c);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+    c.wait();
+  }
+
+  // primary scrub read of obj, collecting dedup info, takes 'delay' longer
+  std::atomic<bool> scrub_started = false;
+  double scrub_time = 0;
+  std::thread scrub([&] {
+    bufferlist rbl;
+    scrub_started = true;
+    auto t0 = ceph::mono_clock::now();
+    int r = store->read(ch, obj, 0, bl.length(), rbl,
+			CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY);
+    scrub_time = std::chrono::duration<double>(
+      ceph::mono_clock::now() - t0).count();
+    EXPECT_EQ(r, (int)bl.length());
+  });
+  while (!scrub_started) {
+    std::this_thread::yield();
+  }
+  // let the scrub read reach dedup info collection
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  // regular read and write to the same collection, issued concurrently,
+  // aren't blocked
+  double read_time = 0;
+  double write_time = 0;
+  std::thread reader([&] {
+    bufferlist rbl;
+    auto t0 = ceph::mono_clock::now();
+    int r = store->read(ch, obj2, 0, bl.length(), rbl);
+    read_time = std::chrono::duration<double>(
+      ceph::mono_clock::now() - t0).count();
+    EXPECT_EQ(r, (int)bl.length());
+  });
+  std::thread writer([&] {
+    auto t0 = ceph::mono_clock::now();
+    C_SaferCond c;
+    ObjectStore::Transaction t;
+    t.write(cid, obj2, 0, bl.length(), bl);
+    t.register_on_complete(&c);
+    int r = queue_transaction(store, ch, std::move(t));
+    EXPECT_EQ(r, 0);
+    c.wait();
+    write_time = std::chrono::duration<double>(
+      ceph::mono_clock::now() - t0).count();
+  });
+  reader.join();
+  writer.join();
+  scrub.join();
+  cerr << "scrub " << scrub_time << "s, concurrent read " << read_time
+       << "s, write " << write_time << "s" << std::endl;
+  EXPECT_GE(scrub_time, delay);
+  EXPECT_LT(read_time, delay / 2);
+  EXPECT_LT(write_time, delay / 2);
+
+  // dedup info has been recorded nevertheless
+  uint64_t entries = 0;
+  bstore->estimate_dedup_info(cid.pool(), &entries);
+  ASSERT_EQ(entries, 1u);
+
+  bstore->clear_dedup_info(cid.pool(), false);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove(cid, obj2);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Recompression engine shouldn't crash and should skip the object if
 // compression is enabled but the compressor isn't available, e.g. as its
 // plugin failed to load.

@@ -15,6 +15,14 @@ public:
   OnodeReformatEngine(std::string_view args) {
   }
   virtual ~OnodeReformatEngine() {}
+  /// Whether the engine might rewrite the object, hence the read needs
+  /// exclusive access to the collection. Engines which don't are executed
+  /// under shared collection lock and shouldn't perform lengthy operations
+  /// in execute(): such work should be deferred via
+  /// OnodeReformatContext::defer() to run once the lock has been released.
+  virtual bool modifies_object() const {
+    return true;
+  }
   virtual bool validate(OnodeReformatContext& ctx);
   virtual bool execute(OnodeReformatContext& ctx,
     PerfCounters& _logger) = 0;
@@ -49,6 +57,9 @@ public:
     : OnodeReformatEngine(args)
   {
   }
+  bool modifies_object() const override {
+    return false; // only records dedup info
+  }
   bool validate(OnodeReformatContext& ctx) override;
   bool execute(OnodeReformatContext& ctx,
     PerfCounters& _logger) override;
@@ -59,7 +70,9 @@ class OnodeReformatContext : public BlueStore::read_context_t {
 private:
 
   size_t enabled_engines_count = 0;
+  size_t modifying_engines_count = 0; // enabled ones modifying the object
   reformat_engines_t engines;
+  std::vector<std::function<void()>> deferred;
 
   bool to_be_applied = false;
   BlueStore::WriteContext wctx;
@@ -76,6 +89,9 @@ public:
     std::function<bool(int64_t, size_t)> acceptor);
 
   bool is_enabled() const { return enabled_engines_count > 0; }
+  /// whether enabled engines might modify the object, hence the read
+  /// needs exclusive access to the collection
+  bool needs_exclusive() const { return modifying_engines_count > 0; }
   bool is_applied() const { return to_be_applied; }
   BlueStore::WriteContext& get_write_context() { return wctx; }
   span_stat_t& access_span_stats() {
@@ -85,7 +101,20 @@ public:
     return span_stat;
   }
 
+  /// executes enabled engines, to be called under collection lock:
+  /// the ones modifying the object until the first one indicating success,
+  /// then all the others
   void exec_engines(PerfCounters& _logger);
+  /// defers work to be done once the collection lock is released.
+  /// Such work must not access onode, collection or this context, hence
+  /// should capture everything it needs.
+  void defer(std::function<void()>&& f) {
+    deferred.emplace_back(std::move(f));
+  }
+  /// runs deferred work, to be called with no collection lock held
+  void run_deferred();
+  /// releases resources preallocated by the engines modifying the object
+  void release_preallocated();
   void clear();
 };
 

@@ -4115,7 +4115,7 @@ private:
     WriteContext *wctx);
 
   void _update_reformat_engines(Collection* c);
-  void _maybe_do_reformat_onode(OnodeReformatContext& ctx,
+  ceph::timespan _maybe_do_reformat_onode(OnodeReformatContext& ctx,
     Collection* c,
     OnodeRef& o,
     uint64_t offset,
