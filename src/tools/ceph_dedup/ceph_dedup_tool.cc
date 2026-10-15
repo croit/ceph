@@ -15,6 +15,7 @@
 
 #include "common.h"
 #include "common/Clock.h" // for ceph_clock_now()
+#include <iomanip>
 #include "log/Log.h"
 
 #include <boost/optional.hpp>
@@ -100,6 +101,8 @@ po::options_description make_usage() {
     ("help,h", ": produce help message")
     ("op estimate --pool <POOL> --chunk-size <CHUNK_SIZE> --chunk-algorithm <ALGO> --fingerprint-algorithm <FP_ALGO>", 
      ": estimate how many chunks are redundant")
+    ("op search-dups --pool <POOL> [--dedup-shards <SHARDS>] [--newer-than <SECONDS>] [--prune-older-than <SECONDS>]",
+      ": search for duplicate objects using content digests collected by OSDs during deep scrub")
     ("op chunk-scrub --chunk-pool <POOL>",
      ": perform chunk scrub")
     ("op chunk-get-ref --chunk-pool <POOL> --object <OID> --target-ref <OID> --target-ref-pool-id <POOL_ID>",
@@ -117,7 +120,7 @@ po::options_description make_usage() {
     ;
   po::options_description op_desc("Opational arguments");
   op_desc.add_options()
-    ("op", po::value<std::string>(), ": estimate|chunk-scrub|chunk-get-ref|chunk-put-ref|chunk-repair|dump-chunk-refs|chunk-dedup|object-dedup")
+    ("op", po::value<std::string>(), ": estimate|search-dups|chunk-scrub|chunk-get-ref|chunk-put-ref|chunk-repair|dump-chunk-refs|chunk-dedup|object-dedup")
     ("target-ref", po::value<std::string>(), ": set target object")
     ("target-ref-pool-id", po::value<uint64_t>(), ": set target pool id")
     ("object", po::value<std::string>(), ": set object name")
@@ -135,6 +138,9 @@ po::options_description make_usage() {
     ("source-off", po::value<uint64_t>(), ": set source offset")
     ("source-length", po::value<uint64_t>(), ": set source length")
     ("dedup-cdc-chunk-size", po::value<unsigned int>(), ": set dedup chunk size for cdc")
+    ("dedup-shards", po::value<unsigned>()->default_value(16), ": number of digest shards to split duplicates search into, must be a power of 2")
+    ("newer-than", po::value<uint32_t>()->default_value(0), ": ignore digests collected more than given amount of seconds ago")
+    ("prune-older-than", po::value<uint32_t>()->default_value(0), ": remove digests collected more than given amount of seconds ago")
     ("snap", ": deduplciate snapshotted object")
     ("debug", ": enable debug")
     ("pgid", ": set pgid")
@@ -197,6 +203,7 @@ public:
   uint64_t get_total_objects() { return total_objects; }
   void set_debug(const bool debug_) { debug = debug_; }
   friend class EstimateDedupRatio;
+  friend class SearchForDuplicates;
   friend class ChunkScrub;
 };
 
@@ -226,6 +233,40 @@ public:
     return NULL;
   }
   void estimate_dedup_ratio();
+};
+
+
+class SearchForDuplicates : public CrawlerThread
+{
+  unsigned shard_count;
+  uint32_t newer_than;
+  uint32_t prune_older_than;
+  uint64_t examined_records = 0;
+  uint64_t duplicate_groups = 0;
+  uint64_t duplicate_objects = 0;
+  bool failed = false;
+
+  void process_shard(unsigned shard);
+
+public:
+  SearchForDuplicates(
+    IoCtx& io_ctx, int n, int m, int32_t report_period,
+    unsigned shard_count, uint32_t newer_than, uint32_t prune_older_than) :
+    CrawlerThread(io_ctx, n, m, ObjectCursor(), ObjectCursor(), report_period, 0, 0),
+    shard_count(shard_count),
+    newer_than(newer_than),
+    prune_older_than(prune_older_than) {
+  }
+
+  void* entry() {
+    exec();
+    return NULL;
+  }
+  void exec();
+  uint64_t get_examined_records() const { return examined_records; }
+  uint64_t get_duplicate_groups() const { return duplicate_groups; }
+  uint64_t get_duplicate_objects() const { return duplicate_objects; }
+  bool has_failed() const { return failed; }
 };
 
 class ChunkScrub: public CrawlerThread
@@ -381,6 +422,101 @@ void EstimateDedupRatio::estimate_dedup_ratio()
 	}
 	++i.second.total_objects;
       }
+    }
+  }
+}
+
+static std::string to_hex(const std::string& s)
+{
+  static constexpr char digits[] = "0123456789abcdef";
+  std::string res;
+  res.reserve(s.size() * 2);
+  for (unsigned char c : s) {
+    res.push_back(digits[c >> 4]);
+    res.push_back(digits[c & 0xf]);
+  }
+  return res;
+}
+
+void SearchForDuplicates::process_shard(unsigned shard)
+{
+  DedupItemCursor c;
+  int r = io_ctx.dedup_candidate_list_slice(shard, shard_count, &c);
+  if (r < 0) {
+    std::lock_guard l{glock};
+    std::cerr << "error dedup_candidate_list_slice: " << cpp_strerror(r)
+	      << std::endl;
+    failed = true;
+    m_stop = true;
+    return;
+  }
+  // digest -> distinct objects (identified by their hashes for now) along
+  // with the OSD keeping the record. The same object might be reported
+  // multiple times, e.g. by different OSDs after primary change or after
+  // repeated deep scrubs.
+  std::map<std::string, std::map<uint32_t, int>> by_digest;
+  while (!io_ctx.dedup_candidate_list_is_end(c) && !m_stop) {
+    std::vector<DedupItem> result;
+    // query up to 4 OSDs in parallel, 1000 records from each
+    r = io_ctx.dedup_candidate_list(c, 4, 1000, &result,
+				    newer_than, prune_older_than);
+    if (r < 0) {
+      std::lock_guard l{glock};
+      std::cerr << "error dedup_candidate_list for " << c << ": "
+		<< cpp_strerror(r) << std::endl;
+      failed = true;
+      m_stop = true;
+      return;
+    }
+    for (auto& i : result) {
+      if (debug) {
+	std::cout << " osd." << i.osd << " " << to_hex(i.digest)
+		  << " hash " << std::hex << std::setw(8) << std::setfill('0')
+		  << i.hash << std::dec << " timestamp " << i.timestamp
+		  << " age " << i.age << std::endl;
+      }
+      by_digest[i.digest].emplace(i.hash, i.osd);
+      ++examined_records;
+    }
+  }
+  if (m_stop) {
+    return;
+  }
+  std::lock_guard l{glock};
+  for (auto& [digest, objs] : by_digest) {
+    if (objs.size() < 2) {
+      continue;
+    }
+    ++duplicate_groups;
+    duplicate_objects += objs.size() - 1;
+    std::cout << to_hex(digest) << " " << objs.size() << ":";
+    for (auto& [hash, osd] : objs) {
+      std::cout << " " << std::hex << std::setw(8) << std::setfill('0')
+		<< hash << std::dec << "@osd." << osd;
+    }
+    std::cout << std::endl;
+  }
+}
+
+void SearchForDuplicates::exec()
+{
+  utime_t start = ceph_clock_now();
+  utime_t next_report;
+  if (report_period) {
+    next_report = start;
+    next_report += report_period;
+  }
+  // thread n handles shards n, n + m, n + 2m, ...
+  for (unsigned shard = n; shard < shard_count && !m_stop; shard += m) {
+    process_shard(shard);
+    utime_t now = ceph_clock_now();
+    if (next_report != utime_t() && now > next_report) {
+      std::cerr << (int)(now - start) << "s : thread " << n
+		<< " processed shard " << shard << "/" << shard_count
+		<< ", " << examined_records << " records so far..."
+		<< std::endl;
+      next_report = now;
+      next_report += report_period;
     }
   }
 }
@@ -659,6 +795,88 @@ int estimate_dedup_ratio(const po::variables_map &opts)
   print_dedup_estimate(std::cout, chunk_algo);
 
  out:
+  return (ret < 0) ? 1 : 0;
+}
+
+int search_dups(const po::variables_map& opts)
+{
+  Rados rados;
+  IoCtx io_ctx;
+  std::string pool_name;
+  unsigned max_thread = get_opts_max_thread(opts);
+  uint32_t report_period = get_opts_report_period(opts);
+  unsigned shard_count = opts["dedup-shards"].as<unsigned>();
+  uint32_t newer_than = opts["newer-than"].as<uint32_t>();
+  uint32_t prune_older_than = opts["prune-older-than"].as<uint32_t>();
+  uint64_t examined_records = 0;
+  uint64_t duplicate_groups = 0;
+  uint64_t duplicate_objects = 0;
+  int ret;
+  bool debug = opts.count("debug");
+
+  if (shard_count == 0 || (shard_count & (shard_count - 1)) != 0) {
+    std::cerr << "dedup-shards should be a power of 2" << std::endl;
+    return 1;
+  }
+  pool_name = get_opts_pool_name(opts);
+  if (pool_name.empty()) {
+    std::cerr << "pool_name was not specified!" << std::endl;
+    return 1;
+  }
+
+  ret = rados.init_with_context(g_ceph_context);
+  if (ret < 0) {
+    std::cerr << "couldn't initialize rados: " << cpp_strerror(ret) << std::endl;
+    goto out;
+  }
+  ret = rados.connect();
+  if (ret) {
+    std::cerr << "couldn't connect to cluster: " << cpp_strerror(ret) << std::endl;
+    ret = -1;
+    goto out;
+  }
+  ret = rados.ioctx_create(pool_name.c_str(), io_ctx);
+  if (ret < 0) {
+    std::cerr << "error opening pool "
+      << pool_name << ": "
+      << cpp_strerror(ret) << std::endl;
+    goto out;
+  }
+
+  glock.lock();
+  for (unsigned i = 0; i < max_thread; i++) {
+    std::unique_ptr<CrawlerThread> ptr(
+      new SearchForDuplicates(io_ctx, i, max_thread,
+	report_period, shard_count, newer_than, prune_older_than));
+    ptr->set_debug(debug);
+    ptr->create("search_thread");
+    estimate_threads.push_back(std::move(ptr));
+  }
+  glock.unlock();
+
+  for (auto& p : estimate_threads) {
+    p->join();
+    auto sd = static_cast<SearchForDuplicates*>(p.get());
+    examined_records += sd->get_examined_records();
+    duplicate_groups += sd->get_duplicate_groups();
+    duplicate_objects += sd->get_duplicate_objects();
+    if (sd->has_failed()) {
+      ret = -1;
+    }
+  }
+
+  {
+    auto f = Formatter::create_unique("json-pretty");
+    f->open_object_section("summary");
+    f->dump_unsigned("examined_records", examined_records);
+    f->dump_unsigned("duplicate_groups", duplicate_groups);
+    f->dump_unsigned("duplicate_objects", duplicate_objects);
+    f->close_section();
+    f->flush(std::cerr);
+    std::cerr << std::endl;
+  }
+
+out:
   return (ret < 0) ? 1 : 0;
 }
 
@@ -1117,6 +1335,8 @@ int main(int argc, const char **argv)
   int ret = 0;
   if (op_name == "estimate") {
     ret = estimate_dedup_ratio(opts);
+  } else if (op_name == "search-dups") {
+    ret = search_dups(opts);
   } else if (op_name == "chunk-scrub" ||
 	     op_name == "chunk-get-ref" ||
 	     op_name == "chunk-put-ref" ||
