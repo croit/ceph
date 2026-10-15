@@ -15,7 +15,10 @@
 
 #include "common.h"
 #include "common/Clock.h" // for ceph_clock_now()
+#include "common/ceph_json.h"
 #include <iomanip>
+#include "include/rados.h"
+#include "osd/osd_types.h"
 #include "log/Log.h"
 
 #include <boost/optional.hpp>
@@ -101,7 +104,7 @@ po::options_description make_usage() {
     ("help,h", ": produce help message")
     ("op estimate --pool <POOL> --chunk-size <CHUNK_SIZE> --chunk-algorithm <ALGO> --fingerprint-algorithm <FP_ALGO>", 
      ": estimate how many chunks are redundant")
-    ("op search-dups --pool <POOL> [--dedup-shards <SHARDS>] [--newer-than <SECONDS>] [--prune-older-than <SECONDS>]",
+    ("op search-dups --pool <POOL> [--dedup-shards <SHARDS>] [--newer-than <SECONDS> | --since-last-scrub] [--prune-older-than <SECONDS>]",
       ": search for duplicate objects using content digests collected by OSDs during deep scrub")
     ("op chunk-scrub --chunk-pool <POOL>",
      ": perform chunk scrub")
@@ -141,6 +144,7 @@ po::options_description make_usage() {
     ("dedup-shards", po::value<unsigned>()->default_value(16), ": number of digest shards to split duplicates search into, must be a power of 2")
     ("newer-than", po::value<uint32_t>()->default_value(0), ": ignore digests collected more than given amount of seconds ago")
     ("prune-older-than", po::value<uint32_t>()->default_value(0), ": remove digests collected more than given amount of seconds ago")
+    ("since-last-scrub", ": use only digests collected by the last deep scrub of every PG")
     ("snap", ": deduplciate snapshotted object")
     ("debug", ": enable debug")
     ("pgid", ": set pgid")
@@ -236,12 +240,30 @@ public:
 };
 
 
+// Per-PG cut-off times (wall clock, seconds) to filter out dedup records
+// made before the last deep scrub of the PG.
+struct dedup_pg_cutoffs_t {
+  // allowed clock skew between the client and OSDs
+  static constexpr double CLOCK_SKEW_MARGIN = 2.0; // seconds
+
+  unsigned pg_num = 0;
+  unsigned pg_num_mask = 0;
+  std::vector<double> cutoff; // per PG seed
+
+  bool is_stale(uint32_t hash, double made_at) const {
+    unsigned ps = ceph_stable_mod(hash, pg_num, pg_num_mask);
+    return ps < cutoff.size() && made_at < cutoff[ps] - CLOCK_SKEW_MARGIN;
+  }
+};
+
 class SearchForDuplicates : public CrawlerThread
 {
   unsigned shard_count;
   uint32_t newer_than;
   uint32_t prune_older_than;
+  const dedup_pg_cutoffs_t* pg_cutoffs;
   uint64_t examined_records = 0;
+  uint64_t stale_records = 0;
   uint64_t duplicate_groups = 0;
   uint64_t duplicate_objects = 0;
   bool failed = false;
@@ -251,11 +273,13 @@ class SearchForDuplicates : public CrawlerThread
 public:
   SearchForDuplicates(
     IoCtx& io_ctx, int n, int m, int32_t report_period,
-    unsigned shard_count, uint32_t newer_than, uint32_t prune_older_than) :
+    unsigned shard_count, uint32_t newer_than, uint32_t prune_older_than,
+    const dedup_pg_cutoffs_t* pg_cutoffs) :
     CrawlerThread(io_ctx, n, m, ObjectCursor(), ObjectCursor(), report_period, 0, 0),
     shard_count(shard_count),
     newer_than(newer_than),
-    prune_older_than(prune_older_than) {
+    prune_older_than(prune_older_than),
+    pg_cutoffs(pg_cutoffs) {
   }
 
   void* entry() {
@@ -264,6 +288,7 @@ public:
   }
   void exec();
   uint64_t get_examined_records() const { return examined_records; }
+  uint64_t get_stale_records() const { return stale_records; }
   uint64_t get_duplicate_groups() const { return duplicate_groups; }
   uint64_t get_duplicate_objects() const { return duplicate_objects; }
   bool has_failed() const { return failed; }
@@ -468,15 +493,21 @@ void SearchForDuplicates::process_shard(unsigned shard)
       m_stop = true;
       return;
     }
+    double now = (double)ceph_clock_now();
     for (auto& i : result) {
       if (debug) {
+	std::lock_guard l{glock};
 	std::cout << " osd." << i.osd << " " << to_hex(i.digest)
 		  << " hash " << std::hex << std::setw(8) << std::setfill('0')
 		  << i.hash << std::dec << " timestamp " << i.timestamp
 		  << " age " << i.age << std::endl;
       }
-      by_digest[i.digest].emplace(i.hash, i.osd);
       ++examined_records;
+      if (pg_cutoffs && pg_cutoffs->is_stale(i.hash, now - i.age)) {
+	++stale_records;
+	continue;
+      }
+      by_digest[i.digest].emplace(i.hash, i.osd);
     }
   }
   if (m_stop) {
@@ -798,6 +829,83 @@ int estimate_dedup_ratio(const po::variables_map &opts)
   return (ret < 0) ? 1 : 0;
 }
 
+// Build per-PG cut-offs from PGs' last deep scrub start times and
+// return the oldest one via 'oldest'. Returns the number of PGs having
+// the start time or a negative error code.
+static int get_pg_cutoffs(Rados& rados, const std::string& pool_name,
+			  dedup_pg_cutoffs_t* res, double* oldest)
+{
+  bufferlist outbl;
+  std::string outs;
+  int r = rados.mon_command(
+    "{\"prefix\": \"osd pool get\", \"pool\": \"" + pool_name +
+    "\", \"var\": \"pg_num\", \"format\": \"json\"}",
+    {}, &outbl, &outs);
+  if (r < 0) {
+    std::cerr << "failed to get pg_num: " << cpp_strerror(r) << " " << outs
+	      << std::endl;
+    return r;
+  }
+  JSONParser parser;
+  if (!parser.parse(outbl.c_str(), outbl.length())) {
+    std::cerr << "failed to parse pg_num" << std::endl;
+    return -EINVAL;
+  }
+  JSONDecoder::decode_json("pg_num", res->pg_num, &parser, true);
+  res->pg_num_mask = (1ull << cbits(res->pg_num - 1)) - 1;
+  res->cutoff.assign(res->pg_num, 0.0);
+
+  outbl.clear();
+  r = rados.mgr_command(
+    "{\"prefix\": \"pg ls-by-pool\", \"poolstr\": \"" + pool_name +
+    "\", \"format\": \"json\"}",
+    {}, &outbl, &outs);
+  if (r < 0) {
+    std::cerr << "failed to get PG stats (mgr read caps required): "
+	      << cpp_strerror(r) << " " << outs << std::endl;
+    return r;
+  }
+  JSONParser stats;
+  if (!stats.parse(outbl.c_str(), outbl.length())) {
+    std::cerr << "failed to parse PG stats" << std::endl;
+    return -EINVAL;
+  }
+  JSONObj* pgs = stats.is_array() ? &stats : stats.find_obj("pg_stats");
+  if (!pgs) {
+    std::cerr << "no PG stats available" << std::endl;
+    return -ENOENT;
+  }
+  int with_stamp = 0;
+  std::string oldest_pg;
+  *oldest = 0.0;
+  for (auto it = pgs->find_first(); !it.end(); ++it) {
+    std::string pgid_str, start_str;
+    JSONDecoder::decode_json("pgid", pgid_str, *it);
+    JSONDecoder::decode_json("last_deep_scrub_start_stamp", start_str, *it);
+    pg_t pgid;
+    utime_t start;
+    if (!pgid.parse(pgid_str.c_str()) || pgid.ps() >= res->pg_num ||
+	!start.parse(start_str) || start.is_zero()) {
+      // PGs lacking the start time (e.g. stats aren't available yet for
+      // PGs being created or split) have no dedup records
+      continue;
+    }
+    ++with_stamp;
+    res->cutoff[pgid.ps()] = (double)start;
+    if (oldest_pg.empty() || (double)start < *oldest) {
+      *oldest = (double)start;
+      oldest_pg = pgid_str;
+    }
+  }
+  if (with_stamp) {
+    utime_t t;
+    t.set_from_double(*oldest);
+    std::cerr << "since last scrub: oldest deep scrub start " << t
+	      << " (pg " << oldest_pg << ")" << std::endl;
+  }
+  return with_stamp;
+}
+
 int search_dups(const po::variables_map& opts)
 {
   Rados rados;
@@ -808,12 +916,20 @@ int search_dups(const po::variables_map& opts)
   unsigned shard_count = opts["dedup-shards"].as<unsigned>();
   uint32_t newer_than = opts["newer-than"].as<uint32_t>();
   uint32_t prune_older_than = opts["prune-older-than"].as<uint32_t>();
+  bool since_last_scrub = opts.count("since-last-scrub");
+  dedup_pg_cutoffs_t pg_cutoffs;
   uint64_t examined_records = 0;
+  uint64_t stale_records = 0;
   uint64_t duplicate_groups = 0;
   uint64_t duplicate_objects = 0;
   int ret;
   bool debug = opts.count("debug");
 
+  if (since_last_scrub && newer_than) {
+    std::cerr << "--since-last-scrub and --newer-than are mutually exclusive"
+	      << std::endl;
+    return 1;
+  }
   if (shard_count == 0 || (shard_count & (shard_count - 1)) != 0) {
     std::cerr << "dedup-shards should be a power of 2" << std::endl;
     return 1;
@@ -843,11 +959,29 @@ int search_dups(const po::variables_map& opts)
     goto out;
   }
 
+  if (since_last_scrub) {
+    double oldest = 0.0;
+    ret = get_pg_cutoffs(rados, pool_name, &pg_cutoffs, &oldest);
+    if (ret < 0) {
+      goto out;
+    }
+    if (ret == 0) {
+      std::cerr << "no PGs with last deep scrub start time, nothing to list"
+		<< std::endl;
+      goto out;
+    }
+    // let OSDs filter out what's definitely older than any PG's last scrub
+    double age = (double)ceph_clock_now() - oldest +
+      dedup_pg_cutoffs_t::CLOCK_SKEW_MARGIN;
+    newer_than = std::max<uint32_t>(1, std::ceil(age));
+  }
+
   glock.lock();
   for (unsigned i = 0; i < max_thread; i++) {
     std::unique_ptr<CrawlerThread> ptr(
       new SearchForDuplicates(io_ctx, i, max_thread,
-	report_period, shard_count, newer_than, prune_older_than));
+	report_period, shard_count, newer_than, prune_older_than,
+	since_last_scrub ? &pg_cutoffs : nullptr));
     ptr->set_debug(debug);
     ptr->create("search_thread");
     estimate_threads.push_back(std::move(ptr));
@@ -858,6 +992,7 @@ int search_dups(const po::variables_map& opts)
     p->join();
     auto sd = static_cast<SearchForDuplicates*>(p.get());
     examined_records += sd->get_examined_records();
+    stale_records += sd->get_stale_records();
     duplicate_groups += sd->get_duplicate_groups();
     duplicate_objects += sd->get_duplicate_objects();
     if (sd->has_failed()) {
@@ -869,6 +1004,9 @@ int search_dups(const po::variables_map& opts)
     auto f = Formatter::create_unique("json-pretty");
     f->open_object_section("summary");
     f->dump_unsigned("examined_records", examined_records);
+    if (since_last_scrub) {
+      f->dump_unsigned("stale_records", stale_records);
+    }
     f->dump_unsigned("duplicate_groups", duplicate_groups);
     f->dump_unsigned("duplicate_objects", duplicate_objects);
     f->close_section();
