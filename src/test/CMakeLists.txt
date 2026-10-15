@@ -12,6 +12,7 @@ add_library(unit-main OBJECT unit.cc)
 target_include_directories(unit-main PRIVATE
   $<TARGET_PROPERTY:GTest::GTest,INTERFACE_INCLUDE_DIRECTORIES>)
 
+add_subdirectory(ceph_dedup)
 add_subdirectory(common)
 add_subdirectory(compressor)
 add_subdirectory(crush)
