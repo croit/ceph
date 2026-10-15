@@ -7959,18 +7959,18 @@ void OSD::process_dedup_list(ceph::ref_t<MOSDDedupList> m)
     // no reply, the client will resend once the OSD is back
     return;
   }
-  auto now = ceph::mono_clock::now();
+  auto now = ceph::real_clock::now();
   auto time_ago = [&](uint32_t secs) {
     auto span = std::chrono::seconds(secs);
     return now.time_since_epoch() > span ?
-      now - span : ceph::mono_clock::time_point();
+      now - span : ceph::real_clock::time_point();
   };
   // take everything when no restriction is provided
   auto retrieve_after = m->newer_than > 0 ?
-    time_ago(m->newer_than) : ceph::mono_clock::time_point();
+    time_ago(m->newer_than) : ceph::real_clock::time_point();
   // remove nothing when no restriction is provided
   auto remove_before = m->prune_older_than > 0 ?
-    time_ago(m->prune_older_than) : ceph::mono_clock::time_point();
+    time_ago(m->prune_older_than) : ceph::real_clock::time_point();
 
   osd_dedup_list_result_t result;
   result.next = m->after;
@@ -7991,7 +7991,7 @@ void OSD::process_dedup_list(ceph::ref_t<MOSDDedupList> m)
   if (r == -EINTR || r >= 0) {
     // -EINTR: interrupted due to time restriction, more to retrieve
     r = 0;
-    auto ns = [](const ceph::mono_clock::time_point& t) {
+    auto ns = [](const ceph::real_clock::time_point& t) {
       return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
 	t.time_since_epoch()).count();
     };

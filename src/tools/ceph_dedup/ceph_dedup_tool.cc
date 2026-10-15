@@ -244,7 +244,9 @@ public:
 // Per-PG cut-off times (wall clock, seconds) to filter out dedup records
 // made before the last deep scrub of the PG.
 struct dedup_pg_cutoffs_t {
-  // allowed clock skew between the client and OSDs
+  // allowed clock skew between OSDs: records are timestamped by the OSD
+  // keeping them while PG's start time comes from the PG's primary, which
+  // might be another OSD after primary change
   static constexpr double CLOCK_SKEW_MARGIN = 2.0; // seconds
 
   unsigned pg_num = 0;
@@ -500,7 +502,6 @@ void SearchForDuplicates::process_shard(unsigned shard)
       m_stop = true;
       return;
     }
-    double now = (double)ceph_clock_now();
     for (auto& b : batches) {
       // the last digest delivered, even if filtered out below
       std::string last_digest =
@@ -516,7 +517,7 @@ void SearchForDuplicates::process_shard(unsigned shard)
 		      << " age " << i.age << std::endl;
 	  }
 	  ++examined_records;
-	  if (pg_cutoffs && pg_cutoffs->is_stale(i.hash, now - i.age)) {
+	  if (pg_cutoffs && pg_cutoffs->is_stale(i.hash, i.timestamp / 1e9)) {
 	    ++stale_records;
 	    return true;
 	  }

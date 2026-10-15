@@ -13,7 +13,7 @@
 // i.e. fields of its DB key except the pool
 struct dedup_candidate_t {
   std::string digest;              // raw content digest
-  ceph::mono_clock::time_point ts; // the time the record has been made at
+  ceph::real_clock::time_point ts; // the time the record has been made at
   uint32_t oid_hash = 0;           // object's hash in bitwise key form
 };
 

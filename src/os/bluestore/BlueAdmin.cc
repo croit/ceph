@@ -553,18 +553,18 @@ int BlueStore::SocketHook::call(
       ss << "Invalid cursor:" << after << std::endl;
       return -EINVAL;
     }
-    auto now = ceph::mono_clock::now();
+    auto now = ceph::real_clock::now();
     auto time_ago = [&](int64_t secs) {
       auto span = std::chrono::seconds(secs);
       return now.time_since_epoch() > span ?
-        now - span : ceph::mono_clock::time_point();
+        now - span : ceph::real_clock::time_point();
     };
     // take everything when no restriction is provided
     auto retrieve_after = newer_than > 0 ?
-      time_ago(newer_than) : ceph::mono_clock::time_point();
+      time_ago(newer_than) : ceph::real_clock::time_point();
     // remove nothing when no restriction is provided
     auto remove_before = prune_older_than > 0 ?
-      time_ago(prune_older_than) : ceph::mono_clock::time_point();
+      time_ago(prune_older_than) : ceph::real_clock::time_point();
 
     std::vector<dedup_candidate_t> ls;
     bool completed = false;

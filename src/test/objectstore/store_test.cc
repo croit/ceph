@@ -14363,7 +14363,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
 
   store->set_collection_opts(ch, popts);
 
-  auto ts0 = ceph::mono_clock::now();
+  auto ts0 = ceph::real_clock::now();
 
   cerr << "Creating collection " << cid << std::endl;
   {
@@ -14388,8 +14388,8 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   expected_bl.append(std::string(len, 'a'));
   expected_bl3.append(std::string(len3, 'a'));
 
-  auto list_dedup_candidates = [&](ceph::mono_clock::time_point take_after,
-				    ceph::mono_clock::time_point remove_prior,
+  auto list_dedup_candidates = [&](ceph::real_clock::time_point take_after,
+				    ceph::real_clock::time_point remove_prior,
 				    int max,
 				    std::vector<dedup_candidate_t>& ls) {
     std::string next;
@@ -14479,7 +14479,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   std::vector<dedup_candidate_t> ls;
   r = list_dedup_candidates(
     ts0,
-    ceph::mono_clock::time_point(),
+    ceph::real_clock::time_point(),
     1,
     ls);
   ASSERT_EQ(r, 4);
@@ -14509,10 +14509,10 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
     cerr << "Current dedup info size = " << sz <<"bytes, " << entries << " records" << std::endl;
   }
 
-  auto ts = ceph::mono_clock::now();
+  auto ts = ceph::real_clock::now();
   r = list_dedup_candidates(
     ts,
-    ceph::mono_clock::time_point(),
+    ceph::real_clock::time_point(),
     1,
     ls);
   ASSERT_EQ(r, 0);
@@ -14535,7 +14535,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   // entries (1 vs. original 4)
   r = list_dedup_candidates(
     ts0,
-    mono_clock::now(),
+    ceph::real_clock::now(),
     1,
     ls);
   ASSERT_EQ(r, 2);
@@ -14556,7 +14556,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   // Now the list should be empty
   r = list_dedup_candidates(
     ts0,
-    mono_clock::now(),
+    ceph::real_clock::now(),
     1,
     ls);
   ASSERT_EQ(r, 0);

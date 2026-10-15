@@ -35,11 +35,11 @@ class DedupStatsCollector
   static std::string get_dedup_entry_key(
     int64_t pool,
     const ghobject_t& oid, const std::string& digest,
-    const mono_clock::time_point& ts);
+    const ceph::real_clock::time_point& ts);
   static void get_key_dedup_entry(
     const char* p, int64_t& pool,
     std::string& digest, size_t digest_len,
-    ceph::mono_clock::time_point& ts,
+    ceph::real_clock::time_point& ts,
     uint32_t& oid_hash);
   static void get_dedup_range(
     int64_t pool, uint64_t digest_msb,
@@ -72,8 +72,8 @@ public:
     uint64_t digest_msb,
     size_t digest_msb_bits,
     size_t all_digest_bits,
-    const ceph::mono_clock::time_point& retrieve_after_btime,
-    const ceph::mono_clock::time_point& remove_before_btime,
+    const ceph::real_clock::time_point& retrieve_after_btime,
+    const ceph::real_clock::time_point& remove_before_btime,
     int max_return,
     int max_deletion,
     double max_duration,

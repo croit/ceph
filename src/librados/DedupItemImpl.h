@@ -22,7 +22,7 @@ namespace librados {
 struct DedupItemImpl {
   std::string digest;     // raw content digest
   uint32_t hash = 0;      // object hash
-  uint64_t timestamp = 0; // when the record has been made, ns, OSD's clock
+  uint64_t timestamp = 0; // when the record has been made, ns since epoch
   double age = 0.0;       // seconds since the record has been made
   int osd = -1;         // OSD the record has been retrieved from
 

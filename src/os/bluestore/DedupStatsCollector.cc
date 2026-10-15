@@ -75,7 +75,7 @@ void DedupStatsCollector::get_dedup_pool_range(
 std::string DedupStatsCollector::get_dedup_entry_key(
   int64_t pool,
   const ghobject_t& oid, const std::string& digest,
-  const mono_clock::time_point& ts)
+  const ceph::real_clock::time_point& ts)
 {
   std::string key;
   key.reserve(128); //FIXME: fix max len
@@ -93,7 +93,7 @@ std::string DedupStatsCollector::get_dedup_entry_key(
 
 void DedupStatsCollector::get_key_dedup_entry(const char* p, int64_t& pool,
   std::string& digest, size_t digest_len,
-  ceph::mono_clock::time_point& ts,
+  ceph::real_clock::time_point& ts,
   uint32_t& oid_hash)
 {
   p = _key_decode_u64(p, (uint64_t*)&pool);
@@ -105,7 +105,7 @@ void DedupStatsCollector::get_key_dedup_entry(const char* p, int64_t& pool,
 
   uint64_t ns;
   p = _key_decode_u64(p, &ns) + 1; //+1 for ':' delimiter
-  ts = ceph::mono_clock::time_point(std::chrono::nanoseconds(ns));
+  ts = ceph::real_clock::time_point(std::chrono::nanoseconds(ns));
 
   uint32_t v;
   p = _key_decode_u32(p, &v);
@@ -140,7 +140,8 @@ void DedupStatsCollector::record_candidate(
   std::string digest(CEPH_CRYPTO_MD5_DIGESTSIZE, 0);
   h.Final((unsigned char*)digest.data());
 
-  auto ts = mono_clock::now();
+  // wall clock as records are persistent, i.e. survive reboots
+  auto ts = ceph::real_clock::now();
 
   auto key = get_dedup_entry_key(pool, oid, digest, ts);
 
@@ -177,8 +178,8 @@ int DedupStatsCollector::list_candidates(
   uint64_t digest_msb,
   size_t digest_msb_bits,
   size_t digest_all_bits,
-  const ceph::mono_clock::time_point& retrieve_after_btime,
-  const ceph::mono_clock::time_point& remove_before_btime,
+  const ceph::real_clock::time_point& retrieve_after_btime,
+  const ceph::real_clock::time_point& remove_before_btime,
   int max_return,
   int max_deletion,
   double max_duration,
@@ -223,7 +224,7 @@ int DedupStatsCollector::list_candidates(
   while (it->valid() && count < max_return && !interrupted && !stopped) {
     int64_t pool = 0;
     std::string digest;
-    mono_clock::time_point ts;
+    ceph::real_clock::time_point ts;
     uint32_t oid_hash = 0;
 
     get_key_dedup_entry(it->key().data(), pool,

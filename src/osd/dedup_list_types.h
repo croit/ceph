@@ -15,7 +15,7 @@
 // Not versioned on its own, see osd_dedup_list_result_t.
 struct osd_dedup_list_entry_t {
   std::string digest;     // raw content digest
-  uint64_t timestamp = 0; // when the record has been made, ns, OSD's clock
+  uint64_t timestamp = 0; // when the record has been made, ns since epoch
   uint32_t oid_hash = 0;  // object's hash in bitwise key form
 
   void encode(ceph::buffer::list& bl) const {
@@ -37,7 +37,7 @@ WRITE_CLASS_ENCODER(osd_dedup_list_entry_t)
 struct osd_dedup_list_result_t {
   bool completed = false; // nothing more to list beyond 'next'
   std::string next;       // opaque cursor to continue listing from
-  uint64_t now = 0;       // OSD's current time, same clock as timestamps
+  uint64_t now = 0;       // OSD's current time, ns since epoch
   std::vector<osd_dedup_list_entry_t> entries;
 
   void encode(ceph::buffer::list& bl) const {
