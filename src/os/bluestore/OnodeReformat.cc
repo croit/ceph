@@ -244,6 +244,11 @@ OnodeReformatContext::OnodeReformatContext(const BlueStore::read_context_t& _ctx
 					   const reformat_engines_t& _engines)
   : read_context_t(_ctx)
 {
+  // Nothing to reformat if the object doesn't exist, moreover engines
+  // are allowed to access the onode when validating.
+  if (!_ctx.o || !_ctx.o->exists) {
+    return;
+  }
   // Choose the engines that should be offered to execution
   for (size_t i = 0; i < _engines.size(); i++) {
     if (_engines[i] && _engines[i]->validate(*this)) {

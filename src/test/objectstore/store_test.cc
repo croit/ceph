@@ -14647,6 +14647,55 @@ TEST_P(StoreTestReformatting, RecompressNoCompressorTest) {
   }
 }
 
+// Scrub reads of missing objects should fail with ENOENT rather than crash
+// when reformat engines are enabled.
+TEST_P(StoreTestReformatting, ReformatMissingObjectTest) {
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  ghobject_t missing(hobject_t(sobject_t("Missing", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT,
+	    "collect_csum, recompress, defragment");
+  store->set_collection_opts(ch, popts);
+  bufferlist bl;
+  bl.append(std::string(64 * 1024, 'a'));
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.write(cid, obj, 0, bl.length(), bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  for (uint32_t flags : {
+	 uint32_t(CEPH_OSD_OP_FLAG_SCRUB),
+	 uint32_t(CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY)}) {
+    for (auto [off, len] : {std::pair<uint64_t, size_t>{0, 0},
+			    {0, 64 * 1024}, {4096, 4096}}) {
+      bufferlist rbl;
+      r = store->read(ch, missing, off, len, rbl, flags);
+      ASSERT_EQ(-ENOENT, r) << "flags " << flags << " " << off << "~" << len;
+    }
+  }
+  uint64_t entries = 0;
+  bstore->estimate_dedup_info(cid.pool(), &entries);
+  ASSERT_EQ(entries, 0u);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Unknown (e.g. misspelled) engines in DEEP_SCRUB_REFORMAT pool option
 // should be ignored without affecting known ones.
 TEST_P(StoreTestReformatting, UnknownReformatEngineTest) {
