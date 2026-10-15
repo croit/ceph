@@ -12,10 +12,11 @@
 
 #include "common/ceph_mutex.h"
 #include "common/ceph_time.h"
+#include "common/hobject.h"
+#include "os/dedup_types.h"
 
 class CephContext;
 class KeyValueDB;
-struct ghobject_t;
 
 extern const std::string PREFIX_DEDUP_CSUM; // = "D";
 
@@ -39,7 +40,7 @@ class DedupStatsCollector
     const char* p, int64_t& pool,
     std::string& digest, size_t digest_len,
     ceph::mono_clock::time_point& ts,
-    uint32_t oid_hash);
+    uint32_t& oid_hash);
   static void get_dedup_range(
     int64_t pool, uint64_t digest_msb,
     size_t msb_bits, size_t all_bits,
@@ -55,10 +56,16 @@ public:
     const ghobject_t& oid,
     const bufferlist& bl);
 
+  // Lists records whose digests have digest_msb_bits most significant bits
+  // equal to digest_msb, i.e. digest shard (digest_msb) out of
+  // (1 << digest_msb_bits) total shards.
   // returns:
-  // >0 - amount of retrieved entries, more entries to be retrieved
-  //  0 - interrupted, more entries to be retrieved,
-  // -1 - end of list, no more entries
+  // >0 - amount of retrieved entries
+  //  0 - end of list, no more entries
+  // -EINTR - interrupted due to max_duration, more entries to be retrieved
+  // -ECANCELED - collector is stopped
+  // Optional pcompleted is set to true when there are no more entries
+  // beyond *pnext.
   int list_candidates(
     KeyValueDB& db,
     int64_t pool,
@@ -70,8 +77,9 @@ public:
     int max_return,
     int max_deletion,
     double max_duration,
-    std::vector<std::string>& ls,
-    std::string* pnext);
+    std::vector<dedup_candidate_t>& ls,
+    std::string* pnext,
+    bool* pcompleted = nullptr);
 
   int clear_all_candidates(
     KeyValueDB& db,

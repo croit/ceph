@@ -52,7 +52,7 @@ std::pair<std::string, std::string> range_from_msb(
   size_t shift_bits = p2nphase(bits_to_use, size_t(8));
 
   _key_encode_any_int(digest_msb << shift_bits, (bits_to_use + shift_bits) >> 3, &start);
-  _key_encode_any_int((digest_msb << shift_bits) + (1 << shift_bits) - 1,
+  _key_encode_any_int((digest_msb << shift_bits) + (1ull << shift_bits) - 1,
     (bits_to_use + shift_bits) >> 3, &end);
 
   start.append((total_bits - bits_to_use) >> 3, '\0');
@@ -94,7 +94,7 @@ std::string DedupStatsCollector::get_dedup_entry_key(
 void DedupStatsCollector::get_key_dedup_entry(const char* p, int64_t& pool,
   std::string& digest, size_t digest_len,
   ceph::mono_clock::time_point& ts,
-  uint32_t oid_hash)
+  uint32_t& oid_hash)
 {
   p = _key_decode_u64(p, (uint64_t*)&pool);
   pool -= 0x8000000000000000ull;
@@ -117,7 +117,8 @@ void DedupStatsCollector::get_dedup_range(int64_t pool, uint64_t digest_msb,
   std::string& start, std::string& end)
 {
   _key_encode_u64(pool + 0x8000000000000000ull, &start);
-  _key_encode_u64(pool + 0x8000000000000000ull, &end);
+  start += ':';
+  end = start;
   auto range = range_from_msb(digest_msb, msb_bits, all_bits);
   start += range.first;
   end += range.second;
@@ -181,10 +182,14 @@ int DedupStatsCollector::list_candidates(
   int max_return,
   int max_deletion,
   double max_duration,
-  std::vector<std::string>& ls,
-  std::string* pnext)
+  std::vector<dedup_candidate_t>& ls,
+  std::string* pnext,
+  bool* pcompleted)
 {
   auto start_time = mono_clock::now();
+  if (pcompleted) {
+    *pcompleted = false;
+  }
   std::shared_lock l(coll_lock);
   if (stopped) {
     return -ECANCELED;
@@ -226,7 +231,10 @@ int DedupStatsCollector::list_candidates(
       ts, oid_hash);
     if (ts >= retrieve_after_btime) {
       dout(25) << __func__ << " taking " << pretty_binary_string(it->key()) << dendl;
-      ls.emplace_back(it->key());
+      dedup_candidate_t& e = ls.emplace_back();
+      e.digest = std::move(digest);
+      e.ts = ts;
+      e.oid_hash = oid_hash;
       ++count;
     }
     else if (ts < remove_before_btime) {
@@ -262,6 +270,9 @@ int DedupStatsCollector::list_candidates(
   }
   if (stopped)
     return -ECANCELED;
+  if (pcompleted) {
+    *pcompleted = !it->valid();
+  }
   return count > 0 ? count :
     (interrupted ? -EINTR : 0);
 }

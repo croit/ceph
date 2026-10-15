@@ -14529,8 +14529,9 @@ int BlueStore::dedup_candidate_list(
   int max_return,
   int max_deletion,
   double max_duration,
-  std::vector<std::string>& ls,
-  std::string* pnext)
+  std::vector<dedup_candidate_t>& ls,
+  std::string* pnext,
+  bool* pcompleted)
 {
   auto start_time = mono_clock::now();
   auto log_latency = make_scope_guard(
@@ -14565,7 +14566,8 @@ int BlueStore::dedup_candidate_list(
     max_deletion,
     max_duration,
     ls,
-    pnext);
+    pnext,
+    pcompleted);
 }
 
 int BlueStore::clear_dedup_info(int64_t pool, bool async_compact)

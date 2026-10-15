@@ -6,6 +6,7 @@
 
 #include <string>
 #include "include/byteorder.h"
+#include "include/ceph_assert.h"
 
 // some key encoding helpers
 template<typename T>
@@ -73,17 +74,14 @@ inline static const char *_key_decode_u64(const char *key, uint64_t *pu) {
   return key + 8;
 }
 
+// Encode n least significant bytes of u in big-endian (i.e. lexicographically
+// sortable) order.
 template<typename T>
 inline static void _key_encode_any_int(uint64_t u, size_t n, T* key) {
-  uint64_t bu;
-#ifdef CEPH_BIG_ENDIAN
-  bu = swab(u);
-#elif defined(CEPH_LITTLE_ENDIAN)
-  bu = u;
-#else
-# error wtf
-#endif
-  key->append((char*)&bu, n);
+  ceph_assert(n <= sizeof(u));
+  for (size_t i = n; i > 0; --i) {
+    key->push_back(char((u >> ((i - 1) * 8)) & 0xff));
+  }
 }
 
 #endif

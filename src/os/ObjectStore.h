@@ -27,6 +27,7 @@
 #include "common/TrackedOp.h"
 #include "common/WorkQueue.h"
 #include "os/Transaction.h"
+#include "os/dedup_types.h"
 
 #include <errno.h>
 #include <sys/stat.h>
@@ -703,6 +704,35 @@ public:
                                      std::vector<ghobject_t> *ls,
                                      ghobject_t *next) {
     return collection_list(c, start, end, max, ls, next);
+  }
+
+  /**
+   * List deduplication info records collected for a pool.
+   *
+   * Only records for the digest shard are returned, i.e. ones whose
+   * digest_msb_bits most significant digest bits are equal to digest_msb.
+   * Records made before retrieve_after_btime are skipped, records made
+   * before remove_before_btime are removed.
+   *
+   * @param pnext [in/out] position to continue listing after
+   * @param pcompleted [out] set to true when nothing more to list
+   * @return >0 amount of retrieved entries, 0 when end of list is reached,
+   *         -EINTR if interrupted due to max_duration restriction,
+   *         -EOPNOTSUPP if not supported, other negative error otherwise
+   */
+  virtual int dedup_candidate_list(int64_t pool,
+                                   uint64_t digest_msb,
+                                   size_t digest_msb_bits,
+                                   size_t digest_all_bits,
+                                   const ceph::mono_clock::time_point& retrieve_after_btime,
+                                   const ceph::mono_clock::time_point& remove_before_btime,
+                                   int max_return,
+                                   int max_deletion,
+                                   double max_duration,
+                                   std::vector<dedup_candidate_t>& ls,
+                                   std::string* pnext,
+                                   bool* pcompleted = nullptr) {
+    return -EOPNOTSUPP;
   }
 
   /// OMAP

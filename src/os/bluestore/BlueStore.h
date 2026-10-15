@@ -3615,10 +3615,15 @@ public:
                              std::vector<ghobject_t> *ls,
                              ghobject_t *next) override;
 
+  // Lists dedup info records for the specified digest shard:
+  // digest_msb_bits most significant bits of the digest equal to digest_msb.
   // returns:
-  // >0 - amount of retrieved entries, more entries to be retrieved
-  //  0 - interrupted, more entries to be retrieved,
-  // -1 - end of list, no more entries
+  // >0 - amount of retrieved entries
+  //  0 - end of list, no more entries
+  // -EINTR - interrupted due to max_duration, more entries to be retrieved
+  // -ECANCELED - store is being unmounted
+  // Optional pcompleted is set to true when there are no more entries
+  // beyond *pnext.
   int dedup_candidate_list(int64_t pool,
                             uint64_t digest_msb,
 			    size_t digest_msb_bits,
@@ -3628,8 +3633,9 @@ public:
                             int max_return,
                             int max_deletion,
                             double max_duration,
-			    std::vector<std::string>& ls,
-			    std::string* pnext);
+			    std::vector<dedup_candidate_t>& ls,
+			    std::string* pnext,
+			    bool* pcompleted = nullptr) override;
   int clear_dedup_info(int64_t pool, bool async_compact);
   int64_t estimate_dedup_info(int64_t pool, uint64_t* entry_count);
 

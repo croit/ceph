@@ -6,6 +6,8 @@
 #include "common/errno.h"
 #include "common/pretty_binary.h"
 #include "os/bluestore/BlueStore.h"
+#include "os/bluestore/DedupStatsCollector.h"
+#include "common/ceph_crypto.h"
 #include "common/debug.h"
 #include <asm-generic/errno-base.h>
 #include <iostream>
@@ -20,6 +22,32 @@
 using ceph::bufferlist;
 using ceph::Formatter;
 using ceph::common::cmd_getval;
+
+std::string bin2hex_str(const std::string& s); // DedupStatsCollector.cc
+
+static bool hex2bin_str(const std::string& s, std::string* out)
+{
+  auto nibble = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  if (s.size() % 2) {
+    return false;
+  }
+  out->clear();
+  out->reserve(s.size() / 2);
+  for (size_t i = 0; i < s.size(); i += 2) {
+    int hi = nibble(s[i]);
+    int lo = nibble(s[i + 1]);
+    if (hi < 0 || lo < 0) {
+      return false;
+    }
+    out->push_back(char((hi << 4) | lo));
+  }
+  return true;
+}
 
 static void dump_avg_latency(Formatter *f, const char *name, const BlueStore::CacheStatsSnapshot::tavg_t& tavg) {
   uint64_t sum_ns = std::get<0>(tavg);
@@ -193,6 +221,24 @@ BlueStore::SocketHook::SocketHook(BlueStore& store)
       "name=pool,type=CephInt,req=true",
       this,
       "clear accumulated deduplication info, per pool");
+    ceph_assert(r == 0);
+    r = admin_socket->register_command(
+      "bluestore dedup list "
+      "name=pool,type=CephInt,req=true "
+      "name=shard,type=CephInt,range=0,req=false "
+      "name=shard_bits,type=CephInt,range=0|32,req=false "
+      "name=after,type=CephString,req=false "
+      "name=max,type=CephInt,range=1,req=false "
+      "name=newer_than,type=CephInt,range=0,req=false "
+      "name=prune_older_than,type=CephInt,range=0,req=false "
+      "name=max_duration,type=CephFloat,range=0.0,req=false",
+      this,
+      "list accumulated deduplication info for a pool, "
+      "limited to the digest shard specified by shard_bits most significant "
+      "digest bits being equal to shard. 'after' is an opaque cursor "
+      "returned as 'next' by the previous call. Optionally lists records "
+      "made within the last 'newer_than' seconds only and removes ones "
+      "older than 'prune_older_than' seconds.");
     ceph_assert(r == 0);
   }
 }
@@ -469,6 +515,101 @@ int BlueStore::SocketHook::call(
         r = -EIO;
       }
     }
+    return r;
+  } else if (command == "bluestore dedup list") {
+    int64_t pool = -1;
+    int64_t shard = 0;
+    int64_t shard_bits = 0;
+    std::string after;
+    int64_t max = 1000;
+    int64_t newer_than = 0;       // seconds
+    int64_t prune_older_than = 0; // seconds
+    double max_duration = 1.0;
+    cmd_getval(cmdmap, "pool", pool);
+    cmd_getval(cmdmap, "shard", shard);
+    cmd_getval(cmdmap, "shard_bits", shard_bits);
+    cmd_getval(cmdmap, "after", after);
+    cmd_getval(cmdmap, "max", max);
+    cmd_getval(cmdmap, "newer_than", newer_than);
+    cmd_getval(cmdmap, "prune_older_than", prune_older_than);
+    cmd_getval(cmdmap, "max_duration", max_duration);
+
+    std::string next;
+    if (pool < 0) {
+      ss << "Invalid pool id:" << pool << std::endl;
+      return -EINVAL;
+    }
+    if (shard_bits < 0 || shard_bits > 32 ||
+        shard < 0 || (uint64_t)shard >= (1ull << shard_bits)) {
+      ss << "Invalid shard " << shard << " for shard_bits " << shard_bits
+         << std::endl;
+      return -EINVAL;
+    }
+    if (max <= 0 || max > std::numeric_limits<int>::max()) {
+      ss << "Invalid max:" << max << std::endl;
+      return -EINVAL;
+    }
+    if (!hex2bin_str(after, &next)) {
+      ss << "Invalid cursor:" << after << std::endl;
+      return -EINVAL;
+    }
+    auto now = ceph::mono_clock::now();
+    auto time_ago = [&](int64_t secs) {
+      auto span = std::chrono::seconds(secs);
+      return now.time_since_epoch() > span ?
+        now - span : ceph::mono_clock::time_point();
+    };
+    // take everything when no restriction is provided
+    auto retrieve_after = newer_than > 0 ?
+      time_ago(newer_than) : ceph::mono_clock::time_point();
+    // remove nothing when no restriction is provided
+    auto remove_before = prune_older_than > 0 ?
+      time_ago(prune_older_than) : ceph::mono_clock::time_point();
+
+    std::vector<dedup_candidate_t> ls;
+    bool completed = false;
+    r = store.dedup_candidate_list(
+      pool,
+      shard,
+      shard_bits,
+      CEPH_CRYPTO_MD5_DIGESTSIZE * 8,
+      retrieve_after,
+      remove_before,
+      max,
+      0, // no deletion count restriction
+      max_duration,
+      ls,
+      &next,
+      &completed);
+    if (r == -EINTR) {
+      // interrupted due to time restriction, more to retrieve
+      r = 0;
+    } else if (r < 0) {
+      ss << "Execution error:" << cpp_strerror(r) << std::endl;
+      return r;
+    } else {
+      r = 0;
+    }
+    f->open_object_section("deduplication list");
+    f->dump_unsigned("pool", pool);
+    f->dump_unsigned("shard", shard);
+    f->dump_unsigned("shard_bits", shard_bits);
+    f->dump_bool("completed", completed);
+    f->dump_string("next", bin2hex_str(next));
+    f->open_array_section("entries");
+    for (auto& e : ls) {
+      f->open_object_section("entry");
+      f->dump_string("digest", bin2hex_str(e.digest));
+      f->dump_unsigned("hash", hobject_t::_reverse_bits(e.oid_hash));
+      f->dump_unsigned("timestamp",
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          e.ts.time_since_epoch()).count());
+      f->dump_float("age",
+        std::chrono::duration<double>(now - e.ts).count());
+      f->close_section();
+    }
+    f->close_section();
+    f->close_section();
     return r;
   } else if (command == "bluestore dedup clear") {
     int64_t pool = -1;

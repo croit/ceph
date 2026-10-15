@@ -14334,6 +14334,7 @@ TEST_P(StoreTestReformatting, LazyCompressionTest) {
 }
 
 #include "common/ceph_crypto.h"
+#include "os/bluestore/DedupStatsCollector.h"
 TEST_P(StoreTestReformatting, CollectCsumTest) {
 
   // enforce 'ssd' settings to avoid deferred writes
@@ -14390,7 +14391,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   auto list_dedup_candidates = [&](ceph::mono_clock::time_point take_after,
 				    ceph::mono_clock::time_point remove_prior,
 				    int max,
-				    std::vector<std::string>& ls) {
+				    std::vector<dedup_candidate_t>& ls) {
     std::string next;
     r = 0;
     ls.clear();
@@ -14398,6 +14399,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
     r = 0;
     for (size_t i = 0; i < 32; i++) {
       int delta;
+      size_t shard_start = ls.size();
       do {
 	delta = bstore->dedup_candidate_list(cid.pool(),
 	  i,
@@ -14413,6 +14415,12 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
 	r += delta >= 0 ? delta : 0;
       } while ((delta > 0) || (delta == -EINTR));
       next.clear();
+      // every entry listed should belong to the shard requested,
+      // i.e. digest's 5 most significant bits should be equal to i
+      for (size_t j = shard_start; j < ls.size(); j++) {
+	EXPECT_EQ(CEPH_CRYPTO_MD5_DIGESTSIZE, ls[j].digest.size());
+	EXPECT_EQ(i, size_t((unsigned char)ls[j].digest[0] >> 3));
+      }
     }
     return r;
   };
@@ -14468,7 +14476,7 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   cerr << "Collecting csum for obj3..." << std::endl;
   ASSERT_TRUE(test_read(obj3, len3, expected_bl3));
 
-  std::vector<std::string> ls;
+  std::vector<dedup_candidate_t> ls;
   r = list_dedup_candidates(
     ts0,
     ceph::mono_clock::time_point(),
@@ -14476,6 +14484,25 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
     ls);
   ASSERT_EQ(r, 4);
   ASSERT_EQ(ls.size(), 4);
+  {
+    // obj and obj2 have the same content hence share the digest,
+    // obj has been recorded twice.
+    std::map<std::string, std::vector<uint32_t>> by_digest;
+    for (auto& e : ls) {
+      by_digest[e.digest].push_back(e.oid_hash);
+    }
+    auto h = [](const ghobject_t& o) { return o.hobj.get_bitwise_key_u32(); };
+    ASSERT_EQ(by_digest.size(), 2);
+    for (auto& [digest, hashes] : by_digest) {
+      if (hashes.size() == 1) {
+	ASSERT_EQ(hashes[0], h(obj3));
+      } else {
+	ASSERT_EQ(hashes.size(), 3);
+	ASSERT_EQ(std::count(hashes.begin(), hashes.end(), h(obj)), 2);
+	ASSERT_EQ(std::count(hashes.begin(), hashes.end(), h(obj2)), 1);
+      }
+    }
+  }
   {
     uint64_t entries = 0;
     auto sz = bstore->estimate_dedup_info(cid.pool(), &entries);
