@@ -16,6 +16,7 @@
 #include "common.h"
 #include "common/Clock.h" // for ceph_clock_now()
 #include "common/ceph_json.h"
+#include "dedup_merge.h"
 #include <iomanip>
 #include "include/rados.h"
 #include "osd/osd_types.h"
@@ -269,6 +270,8 @@ class SearchForDuplicates : public CrawlerThread
   bool failed = false;
 
   void process_shard(unsigned shard);
+  void report_groups(
+    std::vector<std::pair<std::string, DedupKWayMerger::objects_t>>& groups);
 
 public:
   SearchForDuplicates(
@@ -475,15 +478,19 @@ void SearchForDuplicates::process_shard(unsigned shard)
     m_stop = true;
     return;
   }
-  // digest -> distinct objects (identified by their hashes for now) along
-  // with the OSD keeping the record. The same object might be reported
-  // multiple times, e.g. by different OSDs after primary change or after
-  // repeated deep scrubs.
-  std::map<std::string, std::map<uint32_t, int>> by_digest;
+  // Every OSD provides its records sorted by digest, hence merge them
+  // as they come and report duplicate groups once they are complete.
+  DedupKWayMerger merger(c.get_osds());
+  // groups completed by a single merge step: digest, <hash, osd>
+  std::vector<std::pair<std::string, DedupKWayMerger::objects_t>> groups;
+  auto on_dup = [&groups](const std::string& digest,
+			  const DedupKWayMerger::objects_t& objs) {
+    groups.emplace_back(digest, objs);
+  };
   while (!io_ctx.dedup_candidate_list_is_end(c) && !m_stop) {
-    std::vector<DedupItem> result;
+    std::vector<DedupItemBatch> batches;
     // query up to 4 OSDs in parallel, 1000 records from each
-    r = io_ctx.dedup_candidate_list(c, 4, 1000, &result,
+    r = io_ctx.dedup_candidate_list(c, 4, 1000, &batches,
 				    newer_than, prune_older_than);
     if (r < 0) {
       std::lock_guard l{glock};
@@ -494,30 +501,49 @@ void SearchForDuplicates::process_shard(unsigned shard)
       return;
     }
     double now = (double)ceph_clock_now();
-    for (auto& i : result) {
-      if (debug) {
-	std::lock_guard l{glock};
-	std::cout << " osd." << i.osd << " " << to_hex(i.digest)
-		  << " hash " << std::hex << std::setw(8) << std::setfill('0')
-		  << i.hash << std::dec << " timestamp " << i.timestamp
-		  << " age " << i.age << std::endl;
-      }
-      ++examined_records;
-      if (pg_cutoffs && pg_cutoffs->is_stale(i.hash, now - i.age)) {
-	++stale_records;
-	continue;
-      }
-      by_digest[i.digest].emplace(i.hash, i.osd);
+    for (auto& b : batches) {
+      // the last digest delivered, even if filtered out below
+      std::string last_digest =
+	b.items.empty() ? std::string() : b.items.back().digest;
+      auto e = std::remove_if(b.items.begin(), b.items.end(),
+	[&](const DedupItem& i) {
+	  if (debug) {
+	    std::lock_guard l{glock};
+	    std::cout << " osd." << i.osd << " " << to_hex(i.digest)
+		      << " hash " << std::hex << std::setw(8)
+		      << std::setfill('0') << i.hash << std::dec
+		      << " timestamp " << i.timestamp
+		      << " age " << i.age << std::endl;
+	  }
+	  ++examined_records;
+	  if (pg_cutoffs && pg_cutoffs->is_stale(i.hash, now - i.age)) {
+	    ++stale_records;
+	    return true;
+	  }
+	  return false;
+	});
+      b.items.erase(e, b.items.end());
+      merger.add_batch(b.osd, std::move(b.items), b.completed, last_digest);
     }
+    merger.emit(on_dup);
+    report_groups(groups);
   }
   if (m_stop) {
     return;
   }
+  merger.emit(on_dup);
+  report_groups(groups);
+  ceph_assert(merger.done());
+}
+
+void SearchForDuplicates::report_groups(
+  std::vector<std::pair<std::string, DedupKWayMerger::objects_t>>& groups)
+{
+  if (groups.empty()) {
+    return;
+  }
   std::lock_guard l{glock};
-  for (auto& [digest, objs] : by_digest) {
-    if (objs.size() < 2) {
-      continue;
-    }
+  for (auto& [digest, objs] : groups) {
     ++duplicate_groups;
     duplicate_objects += objs.size() - 1;
     std::cout << to_hex(digest) << " " << objs.size() << ":";
@@ -527,6 +553,7 @@ void SearchForDuplicates::process_shard(unsigned shard)
     }
     std::cout << std::endl;
   }
+  groups.clear();
 }
 
 void SearchForDuplicates::exec()
