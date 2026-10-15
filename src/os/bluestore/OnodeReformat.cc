@@ -209,8 +209,11 @@ bool OnodeChecksumCollectEngine::validate(OnodeReformatContext& ctx)
   if ((ctx.op_flags & want_flags) == want_flags) {
     // Deep scrub might read an object in multiple chunks, hence the digest
     // is built from consecutive reads. Empty objects aren't recorded.
+    // EC shard objects aren't recorded either as their content is just
+    // a part of the object's content (or parity), not the object's one.
     auto* c = static_cast<BlueStore::Collection*>(ctx.ch.get());
-    will_handle = ctx.length > 0 && ctx.o->onode.size > 0 &&
+    will_handle = ctx.o->oid.shard_id == shard_id_t::NO_SHARD &&
+      ctx.length > 0 && ctx.o->onode.size > 0 &&
       c->dedup_digest_builder->accepts(ctx.o->oid, ctx.o->onode.nid,
                                        ctx.o->onode.data_version, ctx.offset);
     ldout(ctx.store.cct, 15) << "collect_csum '" << args << "'"

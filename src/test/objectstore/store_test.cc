@@ -14940,6 +14940,71 @@ TEST_P(StoreTestReformatting, CollectCsumChunkedTest) {
   }
 }
 
+// EC shard objects aren't recorded as their content isn't the object's one
+TEST_P(StoreTestReformatting, CollectCsumECShardTest) {
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+  // shard and no-shard (replicated) objects in the same collection
+  ghobject_t shard_obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)),
+		       ghobject_t::NO_GEN, shard_id_t(0));
+  ghobject_t obj(hobject_t(sobject_t("Object 2", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "collect_csum");
+  store->set_collection_opts(ch, popts);
+
+  const uint64_t M = 1024 * 1024;
+  const uint64_t len = 6 * M;
+  const uint64_t stride = 4 * M;
+  bufferlist bl;
+  bl.append(std::string(len, 'e'));
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.write(cid, shard_obj, 0, bl.length(), bl);
+    t.write(cid, obj, 0, bl.length(), bl);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  auto entries = [&]() {
+    uint64_t n = 0;
+    bstore->estimate_dedup_info(cid.pool(), &n);
+    return n;
+  };
+  // EC deep scrub reads in stride chunks till a short read
+  auto scrub = [&](const ghobject_t& o) {
+    for (uint64_t off = 0; ; off += stride) {
+      bufferlist rbl;
+      int r = store->read(ch, o, off, stride, rbl,
+			  CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY);
+      ASSERT_GE(r, 0);
+      if (r < (int)stride) {
+	break;
+      }
+    }
+  };
+  scrub(shard_obj);
+  ASSERT_EQ(entries(), 0u);
+  // replicated object is recorded
+  scrub(obj);
+  ASSERT_EQ(entries(), 1u);
+
+  bstore->clear_dedup_info(cid.pool(), false);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, shard_obj);
+    t.remove(cid, obj);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Dedup info collection doesn't modify objects, hence shouldn't hold
 // the collection lock: other reads and writes to the collection should
 // proceed while it's in progress.
