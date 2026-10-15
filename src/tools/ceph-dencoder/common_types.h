@@ -506,6 +506,10 @@ MESSAGE(MOSDRepScrub)
 #include "messages/MOSDScrub2.h"
 MESSAGE(MOSDScrub2)
 
+#include "messages/MOSDDedupList.h"
+MESSAGE(MOSDDedupList)
+MESSAGE(MOSDDedupListReply)
+
 #include "messages/MOSDForceRecovery.h"
 MESSAGE(MOSDForceRecovery)
 

@@ -157,6 +157,9 @@
 #define MSG_OSD_PG_LEASE        133
 #define MSG_OSD_PG_LEASE_ACK    134
 
+#define MSG_OSD_DEDUP_LIST       137
+#define MSG_OSD_DEDUP_LIST_REPLY 138
+
 // *** MDS ***
 
 #define MSG_MDS_BEACON             100  // to monitor

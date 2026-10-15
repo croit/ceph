@@ -437,6 +437,18 @@ options:
   - osd_scrub_chunk_max
   with_legacy: false
 # sleep between [deep]scrub ops
+- name: osd_dedup_list_max_duration
+  type: float
+  level: advanced
+  desc: Max time (in seconds) a single deduplication info listing request may
+    spend iterating over the records before returning a partial result
+  long_desc: Deduplication info listing requests are processed sequentially by
+    a dedicated OSD thread. This bounds the time a single request may occupy it.
+    0 means no restriction.
+  default: 1
+  min: 0
+  flags:
+  - runtime
 - name: osd_scrub_sleep
   type: float
   level: advanced

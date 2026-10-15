@@ -109,6 +109,8 @@
 #include "messages/MOSDAlive.h"
 
 #include "messages/MOSDScrub2.h"
+#include "messages/MOSDDedupList.h"
+#include "common/ceph_crypto.h"
 
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
@@ -2449,6 +2451,7 @@ OSD::OSD(CephContext *cct_,
     &osd_op_tp),
   last_pg_create_epoch(0),
   boot_finisher(cct),
+  dedup_list_finisher(cct, "dedup_list", "osd_dedup_list"),
   up_thru_wanted(0),
   requested_full_first(0),
   requested_full_last(0),
@@ -3682,6 +3685,7 @@ int OSD::init()
   service.sleep_timer.init();
 
   boot_finisher.start();
+  dedup_list_finisher.start();
 
   {
     string val;
@@ -4743,10 +4747,12 @@ int OSD::shutdown()
   service.agent_stop();
 
   boot_finisher.wait_for_empty();
+  dedup_list_finisher.wait_for_empty();
 
   osd_lock.lock();
 
   boot_finisher.stop();
+  dedup_list_finisher.stop();
   reset_heartbeat_peers(true);
 
   tick_timer.shutdown();
@@ -7706,6 +7712,9 @@ void OSD::ms_fast_dispatch(Message *m)
   case MSG_OSD_SCRUB2:
     handle_fast_scrub(static_cast<MOSDScrub2*>(m));
     return;
+  case MSG_OSD_DEDUP_LIST:
+    handle_fast_dedup_list(static_cast<MOSDDedupList*>(m));
+    return;
   case MSG_OSD_PG_CREATE2:
     return handle_fast_pg_create(static_cast<MOSDPGCreate2*>(m));
   case MSG_OSD_PG_NOTIFY:
@@ -7892,6 +7901,116 @@ void OSD::handle_fast_scrub(MOSDScrub2 *m)
 	  PeeringState::RequestScrub(m->deep, m->repair))));
   }
   m->put();
+}
+
+void OSD::handle_fast_dedup_list(MOSDDedupList *m)
+{
+  dout(10) << __func__ << " " << *m << dendl;
+  auto mref = ceph::ref_t<MOSDDedupList>(m, false); // consume the ref
+  auto reply = [&mref](int r) {
+    mref->get_connection()->send_message2(
+      make_message<MOSDDedupListReply>(mref->get_tid(), r,
+				       osd_dedup_list_result_t()));
+  };
+
+  auto session = ceph::ref_cast<Session>(m->get_connection()->get_priv());
+  if (!session) {
+    reply(-EACCES);
+    return;
+  }
+  if (m->fsid != monc->get_fsid()) {
+    dout(0) << __func__ << " fsid " << m->fsid << " != " << monc->get_fsid()
+	    << dendl;
+    reply(-EINVAL);
+    return;
+  }
+  if (m->shard_bits > 32 || m->shard >= (1ull << m->shard_bits) ||
+      m->max == 0 || m->max > (uint32_t)std::numeric_limits<int>::max()) {
+    reply(-EINVAL);
+    return;
+  }
+  auto osdmap = get_osdmap();
+  const pg_pool_t* pi = osdmap->get_pg_pool(m->pool);
+  if (!pi) {
+    reply(-ENOENT);
+    return;
+  }
+  // Records refer to objects in all the pool's namespaces hence
+  // pool-wide read caps are required. Pruning removes records
+  // and hence requires write caps as well.
+  if (!session->caps.is_capable(osdmap->get_pool_name(m->pool), "",
+				pi->application_metadata, "",
+				true, m->prune_older_than > 0, {},
+				session->get_peer_socket_addr())) {
+    dout(10) << __func__ << " " << *m << " not permitted, caps "
+	     << session->caps << dendl;
+    reply(-EPERM);
+    return;
+  }
+  dedup_list_finisher.queue(
+    new LambdaContext([this, mref = std::move(mref)](int) mutable {
+      process_dedup_list(std::move(mref));
+    }));
+}
+
+void OSD::process_dedup_list(ceph::ref_t<MOSDDedupList> m)
+{
+  if (is_stopping()) {
+    // no reply, the client will resend once the OSD is back
+    return;
+  }
+  auto now = ceph::mono_clock::now();
+  auto time_ago = [&](uint32_t secs) {
+    auto span = std::chrono::seconds(secs);
+    return now.time_since_epoch() > span ?
+      now - span : ceph::mono_clock::time_point();
+  };
+  // take everything when no restriction is provided
+  auto retrieve_after = m->newer_than > 0 ?
+    time_ago(m->newer_than) : ceph::mono_clock::time_point();
+  // remove nothing when no restriction is provided
+  auto remove_before = m->prune_older_than > 0 ?
+    time_ago(m->prune_older_than) : ceph::mono_clock::time_point();
+
+  osd_dedup_list_result_t result;
+  result.next = m->after;
+  std::vector<dedup_candidate_t> ls;
+  int r = store->dedup_candidate_list(
+    m->pool,
+    m->shard,
+    m->shard_bits,
+    CEPH_CRYPTO_MD5_DIGESTSIZE * 8,
+    retrieve_after,
+    remove_before,
+    m->max,
+    0, // no deletion count restriction
+    cct->_conf.get_val<double>("osd_dedup_list_max_duration"),
+    ls,
+    &result.next,
+    &result.completed);
+  if (r == -EINTR || r >= 0) {
+    // -EINTR: interrupted due to time restriction, more to retrieve
+    r = 0;
+    auto ns = [](const ceph::mono_clock::time_point& t) {
+      return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+	t.time_since_epoch()).count();
+    };
+    result.now = ns(now);
+    result.entries.reserve(ls.size());
+    for (auto& e : ls) {
+      auto& re = result.entries.emplace_back();
+      re.digest = std::move(e.digest);
+      re.timestamp = ns(e.ts);
+      re.oid_hash = e.oid_hash;
+    }
+  } else {
+    result = osd_dedup_list_result_t();
+  }
+  dout(20) << __func__ << " " << *m << " r " << r
+	   << " entries " << result.entries.size()
+	   << " completed " << result.completed << dendl;
+  m->get_connection()->send_message2(
+    make_message<MOSDDedupListReply>(m->get_tid(), r, std::move(result)));
 }
 
 std::optional<PGLockWrapper> OSDService::get_locked_pg(spg_t pgid)

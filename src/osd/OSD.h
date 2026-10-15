@@ -2008,6 +2008,8 @@ protected:
   ceph::mutex mon_report_lock = ceph::make_mutex("OSD::mon_report_lock");
   utime_t last_mon_report;
   Finisher boot_finisher;
+  // processes deduplication info listing requests sequentially
+  Finisher dedup_list_finisher;
 
   // -- boot --
   void start_boot();
@@ -2113,6 +2115,7 @@ private:
     case CEPH_MSG_OSD_OP:
     case CEPH_MSG_OSD_BACKOFF:
     case MSG_OSD_SCRUB2:
+    case MSG_OSD_DEDUP_LIST:
     case MSG_OSD_FORCE_RECOVERY:
     case MSG_MON_COMMAND:
     case MSG_OSD_PG_CREATE2:
@@ -2212,6 +2215,8 @@ private:
 			uuid_d& cluster_fsid, uuid_d& osd_fsid, int whoami, std::string& osdspec_affinity);
 
   void handle_fast_scrub(class MOSDScrub2 *m);
+  void handle_fast_dedup_list(class MOSDDedupList *m);
+  void process_dedup_list(ceph::ref_t<class MOSDDedupList> m);
   void handle_osd_ping(class MOSDPing *m);
 
   size_t get_num_cache_shards();
