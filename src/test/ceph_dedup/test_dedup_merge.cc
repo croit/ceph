@@ -12,7 +12,8 @@
  *
  * Similar to ceph-dedup-tool every thread processes its own subset of
  * digest shards. Every shard is processed by taking the next batch from
- * up to 4 not completed generators in a round-robin manner until all the
+ * up to 4 not completed generators, chosen in a round-robin manner or by
+ * the k-way merger (see CEPH_DEDUP_BENCH_MERGERS), until all the
  * generators are exhausted. Threads loop over their shards until the
  * benchmark time expires.
  *
@@ -26,9 +27,12 @@
  *  CEPH_DEDUP_BENCH_GRID_FACTOR - digest grid size relative to items per
  *                                 shard, controls duplicates rate, def. 4
  *  CEPH_DEDUP_BENCH_MERGERS     - comma separated mergers to benchmark:
- *                                 map (DedupShardMerger, the one used by
- *                                 ceph-dedup-tool), kway (DedupKWayMerger),
- *                                 def. map,kway
+ *                                 map (DedupShardMerger), kway
+ *                                 (DedupKWayMerger fetching round-robin),
+ *                                 kway_lf (DedupKWayMerger fetching from
+ *                                 the lowest frontier OSDs first, as
+ *                                 ceph-dedup-tool does),
+ *                                 def. map,kway,kway_lf
  *
  * Besides throughput every iteration reports CPU consumption (user + system,
  * via getrusage) and resident memory (sampled every 100 ms): the baseline
@@ -87,10 +91,10 @@ std::vector<std::string> env_mergers()
 {
   std::vector<std::string> res;
   const char* v = getenv("CEPH_DEDUP_BENCH_MERGERS");
-  std::stringstream ss(v && *v ? v : "map,kway");
+  std::stringstream ss(v && *v ? v : "map,kway,kway_lf");
   std::string t;
   while (std::getline(ss, t, ',')) {
-    if (t == "map" || t == "kway") {
+    if (t == "map" || t == "kway" || t == "kway_lf") {
       res.push_back(t);
     }
   }
@@ -280,7 +284,7 @@ void process_shard_map(const bench_params_t& p, std::vector<Generator>& gens,
 void process_shard_kway(const bench_params_t& p, std::vector<Generator>& gens,
                         unsigned shard, uint64_t round,
                         const bench_clock::time_point& deadline,
-                        thread_stats_t& st)
+                        thread_stats_t& st, bool lowest_first)
 {
   std::vector<int> osds;
   osds.reserve(gens.size());
@@ -305,14 +309,26 @@ void process_shard_kway(const bench_params_t& p, std::vector<Generator>& gens,
       return; // partial shard, merged items are accounted already
     }
     bench_clock::duration t{};
-    if (!fetch_round(gens, next_target, completed,
-                     [&](Generator& g, std::vector<DedupItem>&& batch) {
-                       st.items += batch.size();
-                       auto t0 = bench_clock::now();
-                       merger.add_batch(g.get_osd(), std::move(batch),
-                                        g.done());
-                       t += bench_clock::now() - t0;
-                     })) {
+    auto consume = [&](Generator& g, std::vector<DedupItem>&& batch) {
+      st.items += batch.size();
+      auto t0 = bench_clock::now();
+      merger.add_batch(g.get_osd(), std::move(batch), g.done());
+      t += bench_clock::now() - t0;
+    };
+    if (lowest_first) {
+      // fetch from the OSDs holding back merging (generator == OSD index)
+      auto t0 = bench_clock::now();
+      auto targets = merger.next_targets(MAX_TARGETS);
+      t += bench_clock::now() - t0;
+      if (targets.empty()) {
+        break;
+      }
+      for (int osd : targets) {
+        std::vector<DedupItem> batch;
+        gens[osd].next_batch(&batch);
+        consume(gens[osd], std::move(batch));
+      }
+    } else if (!fetch_round(gens, next_target, completed, consume)) {
       break;
     }
     auto t0 = bench_clock::now();
@@ -447,6 +463,30 @@ TEST(DedupMerge, KWayExplicitFrontier)
   EXPECT_TRUE(m.done());
 }
 
+TEST(DedupMerge, KWayNextTargets)
+{
+  auto noop = [](const std::string&, const DedupKWayMerger::objects_t&) {};
+  DedupKWayMerger m({1, 2, 3});
+  // nothing delivered yet, all are equally behind
+  EXPECT_EQ(std::vector<int>({1, 2, 3}), m.next_targets(5));
+  EXPECT_EQ(std::vector<int>({1, 2}), m.next_targets(2));
+  m.add_batch(1, {make_item(5, 11, 1)}, false);
+  m.add_batch(2, {make_item(2, 21, 2)}, false);
+  // OSD 3 hasn't delivered anything, OSD 2 is behind OSD 1
+  EXPECT_EQ(std::vector<int>({3, 2, 1}), m.next_targets(5));
+  m.add_batch(3, {make_item(4, 31, 3)}, false);
+  EXPECT_EQ(std::vector<int>({2, 3}), m.next_targets(2));
+  m.emit(noop);
+  // completed OSDs aren't suggested
+  m.add_batch(2, {}, true);
+  EXPECT_EQ(std::vector<int>({3, 1}), m.next_targets(5));
+  m.add_batch(3, {}, true);
+  m.add_batch(1, {}, true);
+  EXPECT_TRUE(m.next_targets(5).empty());
+  m.emit(noop);
+  EXPECT_TRUE(m.done());
+}
+
 TEST(DedupMerge, KWayMatchesMap)
 {
   bench_params_t p;
@@ -495,7 +535,33 @@ TEST(DedupMerge, KWayMatchesMap)
       });
     ASSERT_FALSE(expected.empty());
 
-    // feed k-way merger batch by batch, OSDs in a varying order
+    // feed k-way merger batch by batch, OSDs in a varying order,
+    // then fetching from the OSDs suggested by the merger
+    groups_t actual_lf;
+    {
+      DedupKWayMerger kway(osds);
+      std::vector<size_t> next(gens.size(), 0);
+      auto on_dup = [&actual_lf](const std::string& d,
+                                 const DedupKWayMerger::objects_t& objs) {
+        for (auto& [hash, o] : objs) {
+          actual_lf[d].insert(hash);
+        }
+      };
+      for (auto targets = kway.next_targets(4); !targets.empty();
+           targets = kway.next_targets(4)) {
+        for (int osd : targets) {
+          bool last = next[osd] + 1 == batches[osd].size();
+          // keep batches intact for the next pass
+          auto b = batches[osd][next[osd]++];
+          kway.add_batch(osd, std::move(b), last);
+        }
+        kway.emit(on_dup);
+      }
+      kway.emit(on_dup);
+      EXPECT_TRUE(kway.done());
+    }
+    EXPECT_EQ(expected, actual_lf) << "lowest first, shard " << shard;
+
     groups_t actual;
     DedupKWayMerger kway(osds);
     std::vector<size_t> next(gens.size(), 0);
@@ -564,8 +630,17 @@ TEST(DedupMerge, Benchmark)
   };
 
   for (auto& merger : mergers) {
-  auto process_shard = merger == "kway" ? process_shard_kway
-                                        : process_shard_map;
+  auto process_shard =
+    [&merger](const bench_params_t& p, std::vector<Generator>& gens,
+              unsigned shard, uint64_t round,
+              const bench_clock::time_point& deadline, thread_stats_t& st) {
+      if (merger == "map") {
+        process_shard_map(p, gens, shard, round, deadline, st);
+      } else {
+        process_shard_kway(p, gens, shard, round, deadline, st,
+                           merger == "kway_lf");
+      }
+    };
   for (unsigned threads : thread_counts) {
     // return memory freed by the previous iteration to the OS
     malloc_trim(0);

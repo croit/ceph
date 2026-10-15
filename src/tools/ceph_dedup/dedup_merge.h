@@ -64,24 +64,31 @@ public:
  * digest is below the last digest delivered by every not yet completed
  * source. Hence only records ahead of the slowest source are kept in
  * memory rather than the whole shard.
+ *
+ * next_targets() suggests the sources to fetch from next: the ones holding
+ * back emission, i.e. having the lowest last delivered digests. Fetching
+ * them first keeps the amount of buffered records low.
  */
 class DedupKWayMerger {
 public:
   using objects_t = DedupShardMerger::objects_t;
 
 private:
+  // <last digest delivered, source index>
+  using frontiers_t = std::set<std::pair<std::string, size_t>>;
   struct source_t {
+    int osd = -1;
     std::vector<librados::DedupItem> buf; // pending records
     size_t pos = 0;                       // first pending record in buf
     bool completed = false;
     // last digest delivered, valid while not completed
-    std::multiset<std::string>::iterator frontier;
+    frontiers_t::iterator frontier;
   };
   std::vector<source_t> sources;
   std::unordered_map<int, size_t> osd_to_source;
   // last digests delivered by not completed sources, empty string for ones
   // which haven't delivered anything yet
-  std::multiset<std::string> frontiers;
+  frontiers_t frontiers;
   // min-heap of sources having pending records, by their head digest
   std::vector<size_t> heap;
 
@@ -133,7 +140,8 @@ public:
     sources.resize(osds.size());
     for (size_t i = 0; i < osds.size(); ++i) {
       osd_to_source[osds[i]] = i;
-      sources[i].frontier = frontiers.insert(std::string());
+      sources[i].osd = osds[i];
+      sources[i].frontier = frontiers.emplace(std::string(), i).first;
     }
   }
 
@@ -156,7 +164,7 @@ public:
     } else if (frontier) {
       std::string f = *frontier; // might refer to items being moved below
       frontiers.erase(s.frontier);
-      s.frontier = frontiers.insert(std::move(f));
+      s.frontier = frontiers.emplace(std::move(f), &s - sources.data()).first;
     }
     if (items.empty()) {
       return;
@@ -184,7 +192,7 @@ public:
     size_t res = 0;
     while (!heap.empty()) {
       size_t si = heap.front();
-      if (!frontiers.empty() && !(head(si) < *frontiers.begin())) {
+      if (!frontiers.empty() && !(head(si) < frontiers.begin()->first)) {
         break; // more records with this digest might come
       }
       heap_pop();
@@ -209,6 +217,20 @@ public:
     // Everything still pending or yet to come has a digest not below
     // the lowest frontier, hence the current group is complete.
     res += flush_group(f);
+    return res;
+  }
+
+  /// Up to n not completed OSDs having delivered the lowest digests so far
+  /// (those which haven't delivered anything go first), lowest first.
+  /// These are the ones holding back emission, hence fetching from them
+  /// first keeps the amount of buffered records low.
+  std::vector<int> next_targets(size_t n) const {
+    std::vector<int> res;
+    res.reserve(std::min(n, frontiers.size()));
+    for (auto it = frontiers.begin(); it != frontiers.end() && res.size() < n;
+         ++it) {
+      res.push_back(sources[it->second].osd);
+    }
     return res;
   }
 

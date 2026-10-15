@@ -490,9 +490,15 @@ void SearchForDuplicates::process_shard(unsigned shard)
     groups.emplace_back(digest, objs);
   };
   while (!io_ctx.dedup_candidate_list_is_end(c) && !m_stop) {
+    // Query up to 4 OSDs in parallel, 1000 records from each. Choose the
+    // ones holding back merging, i.e. having the lowest last digests
+    // delivered, to keep the amount of records buffered by merger low.
+    auto targets = merger.next_targets(4);
+    if (targets.empty()) {
+      break; // shouldn't happen as merger tracks the same OSDs as cursor
+    }
     std::vector<DedupItemBatch> batches;
-    // query up to 4 OSDs in parallel, 1000 records from each
-    r = io_ctx.dedup_candidate_list(c, 4, 1000, &batches,
+    r = io_ctx.dedup_candidate_list(c, targets, 1000, &batches,
 				    newer_than, prune_older_than);
     if (r < 0) {
       std::lock_guard l{glock};
