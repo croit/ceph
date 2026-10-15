@@ -61,11 +61,13 @@ bool OnodeReformatRecompressEngine::execute(OnodeReformatContext& ctx,
   auto& wctx = ctx.get_write_context();
   auto min_alloc_size = ctx.store.get_min_alloc_size();
   // do reformat if
-  // - compression enabled
+  // - compression enabled and compressor is available (its plugin might
+  //   have failed to load),
   // - object isn't cached (meaning it's not being written at the moment),
   // - and there are no shared blobs within the span as this might increase
   //   used space.
-  bool will_do = wctx.compress && span_stat.allocated > 0 &&
+  bool will_do = wctx.compress && wctx.compressor &&
+                 span_stat.allocated > 0 &&
                  span_stat.cached == 0 && span_stat.allocated_shared ==0;
   if (will_do) {
     uint64_t need = 0;
@@ -127,6 +129,7 @@ bool OnodeReformatRecompressEngine::execute(OnodeReformatContext& ctx,
   } else {
     ldout(ctx.store.cct, 10) << " reformat:'" << args << "'"
       << " omitted, compress " << wctx.compress
+      << " compressor " << (wctx.compressor ? "available" : "unavailable")
       << " alloc " << span_stat.allocated
       << " shared alloc " << span_stat.allocated_shared
       << " cached " << span_stat.cached

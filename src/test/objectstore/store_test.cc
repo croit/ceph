@@ -14574,6 +14574,79 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   }
 }
 
+// Recompression engine shouldn't crash and should skip the object if
+// compression is enabled but the compressor isn't available, e.g. as its
+// plugin failed to load.
+TEST_P(StoreTestReformatting, RecompressNoCompressorTest) {
+  // enforce 'ssd' settings to avoid deferred writes
+  // which result in cached data blocks and hence
+  // prevents from reformatting
+  SetVal(g_conf(), "bluestore_debug_enforce_settings", "ssd");
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  // Compression is forced but there is no default compressor, hence
+  // write contexts get compression enabled with no compressor.
+  // This doesn't depend on which compressor plugins are loadable.
+  SetVal(g_conf(), "bluestore_compression_mode", "force");
+  SetVal(g_conf(), "bluestore_compression_algorithm", "");
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  int r;
+  coll_t cid;
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  auto ch = store->create_new_collection(cid);
+  const PerfCounters* logger = store->get_perf_counters();
+
+  pool_opts_t popts;
+  popts.set(pool_opts_t::DEEP_SCRUB_REFORMAT, "recompress");
+  store->set_collection_opts(ch, popts);
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+  uint64_t len = 512 * 1024;
+  bufferlist bl;
+  bl.append(std::string(len, 'a'));
+  {
+    C_SaferCond c;
+    ObjectStore::Transaction t;
+    t.write(cid, obj, 0, len, bl, CEPH_OSD_OP_FLAG_FADVISE_DONTNEED);
+    t.register_on_complete(&c);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+    c.wait();
+  }
+  // remount to get rid of cached data which prevents from reformatting
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+  store->set_collection_opts(ch, popts);
+  logger = store->get_perf_counters();
+
+  auto reformats0 = logger->get_tavg_ns(l_bluestore_reformat_lat).second;
+  auto attempts0 = logger->get(l_bluestore_reformat_compress_attempted);
+  for (int i = 0; i < 2; i++) {
+    bufferlist rbl;
+    r = store->read(ch, obj, 0, len, rbl,
+		    CEPH_OSD_OP_FLAG_SCRUB | CEPH_OSD_OP_FLAG_PRIMARY);
+    ASSERT_EQ(r, (int)len);
+    ASSERT_TRUE(bl_eq(bl, rbl));
+  }
+  // reformatting was offered but recompression wasn't attempted
+  ASSERT_EQ(reformats0 + 2, logger->get_tavg_ns(l_bluestore_reformat_lat).second);
+  ASSERT_EQ(attempts0, logger->get(l_bluestore_reformat_compress_attempted));
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove_collection(cid);
+    r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  }
+}
+
 // Unknown (e.g. misspelled) engines in DEEP_SCRUB_REFORMAT pool option
 // should be ignored without affecting known ones.
 TEST_P(StoreTestReformatting, UnknownReformatEngineTest) {
