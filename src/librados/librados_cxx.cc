@@ -1991,7 +1991,7 @@ int librados::IoCtx::dedup_candidate_list_slice(
 int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
   const size_t max_targets,
   const size_t per_target_max_items,
-  std::vector<DedupItem>* result,
+  std::vector<DedupItemBatch>* result,
   uint32_t newer_than,
   uint32_t prune_older_than)
 {
@@ -2042,8 +2042,12 @@ int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
       }
       continue;
     }
+    DedupItemBatch& batch = result->emplace_back();
+    batch.osd = cursor.osds[target];
+    batch.completed = target_completed;
+    batch.items.reserve(items.size());
     for (auto& i : items) {
-      DedupItem& di = result->emplace_back();
+      DedupItem& di = batch.items.emplace_back();
       di.digest = std::move(i.digest);
       di.hash = i.hash;
       di.timestamp = i.timestamp;
@@ -2058,6 +2062,24 @@ int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
     }
   }
   return r < 0 ? r : count;
+}
+
+int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
+  const size_t max_targets,
+  const size_t per_target_max_items,
+  std::vector<DedupItem>* result,
+  uint32_t newer_than,
+  uint32_t prune_older_than)
+{
+  ceph_assert(result != nullptr);
+  std::vector<DedupItemBatch> batches;
+  int r = dedup_candidate_list(cursor, max_targets, per_target_max_items,
+			       &batches, newer_than, prune_older_than);
+  for (auto& b : batches) {
+    result->insert(result->end(), std::make_move_iterator(b.items.begin()),
+		   std::make_move_iterator(b.items.end()));
+  }
+  return r;
 }
 
 bool librados::IoCtx::dedup_candidate_list_is_end(

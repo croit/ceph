@@ -172,6 +172,16 @@ inline namespace v14_2_0 {
     int osd = -1;           ///< OSD the record has been retrieved from
   };
 
+  /// Deduplication info records retrieved from a single OSD by a single
+  /// request, sorted by digest
+  class CEPH_RADOS_API DedupItemBatch
+  {
+  public:
+    int osd = -1;
+    bool completed = false; ///< no more records at the OSD for the cursor
+    std::vector<DedupItem> items;
+  };
+
   /**
    * Cursor for deduplication info listing.
    *
@@ -1234,6 +1244,20 @@ inline namespace v14_2_0 {
       const size_t max_targets,
       const size_t per_target_max_items,
       std::vector<DedupItem>* result,
+      uint32_t newer_than = 0,
+      uint32_t prune_older_than = 0);
+
+    /**
+     * Same as above but provides records per OSD: a batch for every OSD
+     * queried successfully, along with the OSD's completion status.
+     * Every OSD provides its records sorted by digest, and a batch
+     * continues the previous one from the same OSD.
+     * Batches are appended to *result.
+     */
+    int dedup_candidate_list(DedupItemCursor& cursor,
+      const size_t max_targets,
+      const size_t per_target_max_items,
+      std::vector<DedupItemBatch>* result,
       uint32_t newer_than = 0,
       uint32_t prune_older_than = 0);
 
