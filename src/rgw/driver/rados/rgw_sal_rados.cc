@@ -401,6 +401,11 @@ int RadosBucket::remove(const DoutPrefixProvider* dpp,
 
     for (const auto& obj : results.objs) {
       rgw_obj_key key(obj.key);
+      // This is a selected version, not an unqualified object DELETE.
+      // Listings encode NULL instances as empty; preserve their identity.
+      if (versioned() && key.instance.empty()) {
+        key.instance = "null";
+      }
       /* xxx dang */
       ret = rgw_remove_object(dpp, store, this, key, y);
       if (ret < 0 && ret != -ENOENT) {
@@ -2937,8 +2942,13 @@ int RadosObject::load_obj_state(const DoutPrefixProvider* dpp, optional_yield y,
   RGWObjState *pstate{nullptr};
 
   int ret = store->getRados()->get_obj_state(dpp, rados_ctx, bucket->get_info(), get_obj(), &pstate, &manifest, follow_olh, y);
-  if (ret < 0) {
-    if (ret == -ENOENT) {
+  // Preserve metadata for the explicit NULL OLH/no-data deletion preflight,
+  // without turning an absent payload into a successful object read.
+  const bool null_instance_without_data = ret == -ENOENT && pstate &&
+                                          get_instance() == "null" &&
+                                          pstate->is_olh && !pstate->exists;
+  if (ret < 0 && !null_instance_without_data) {
+    if (ret == -ENOENT && pstate) {
       state.is_dm = pstate->is_dm;
     }
     return ret;
@@ -3773,6 +3783,7 @@ int RadosObject::delete_object(const DoutPrefixProvider* dpp,
   RGWRados::Object::Delete del_op(&del_target);
 
   del_op.params.bucket_owner = bucket->get_info().owner;
+  del_op.params.null_verid = (get_instance() == "null");
   del_op.params.versioning_status =
     (flags & FLAG_PREVENT_VERSIONING)
     ? 0
