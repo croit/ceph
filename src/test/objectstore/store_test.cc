@@ -14574,6 +14574,157 @@ TEST_P(StoreTestReformatting, CollectCsumTest) {
   }
 }
 
+// Onode's data_version is bumped on data modifications only and persists
+TEST_P(StoreTestReformatting, DataVersionTest) {
+  SetVal(g_conf(), "bluestore_write_v2", GetParam());
+  g_conf().apply_changes(nullptr);
+  DeferredSetup();
+
+  BlueStore* bstore = dynamic_cast<BlueStore*> (store.get());
+  int r;
+  coll_t cid;
+  // clone targets should share the hash, i.e. be snapshots
+  ghobject_t obj(hobject_t(sobject_t("Object 1", CEPH_NOSNAP)));
+  ghobject_t obj2 = obj;
+  obj2.hobj.snap = 1;
+  ghobject_t obj3 = obj;
+  obj3.hobj.snap = 2;
+  auto ch = store->create_new_collection(cid);
+  auto apply = [&](ObjectStore::Transaction&& t) {
+    int r = queue_transaction(store, ch, std::move(t));
+    ASSERT_EQ(r, 0);
+  };
+  auto version = [&](const ghobject_t& o) {
+    uint64_t nid = 0, v = 0;
+    EXPECT_EQ(0, bstore->get_object_data_version(ch, o, &nid, &v));
+    return v;
+  };
+  auto nid = [&](const ghobject_t& o) {
+    uint64_t nid = 0, v = 0;
+    EXPECT_EQ(0, bstore->get_object_data_version(ch, o, &nid, &v));
+    return nid;
+  };
+  bufferlist bl;
+  bl.append(std::string(64 * 1024, 'a'));
+  {
+    ObjectStore::Transaction t;
+    t.create_collection(cid, 0);
+    t.touch(cid, obj3);
+    apply(std::move(t));
+  }
+  uint64_t v3 = version(obj3);
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, obj, 0, bl.length(), bl);
+    apply(std::move(t));
+  }
+  uint64_t v = version(obj);
+  ASSERT_GT(v, 0u);
+
+  // metadata changes don't bump
+  {
+    ObjectStore::Transaction t;
+    t.setattr(cid, obj, "attr", bl);
+    map<string, bufferlist> kv{{"key", bl}};
+    t.omap_setkeys(cid, obj, kv);
+    t.set_alloc_hint(cid, obj, 4096, 4096, 0);
+    apply(std::move(t));
+  }
+  ASSERT_EQ(v, version(obj));
+
+  // data changes do, touch too
+  {
+    ObjectStore::Transaction t;
+    t.touch(cid, obj);
+    apply(std::move(t));
+  }
+  ASSERT_GT(version(obj), v);
+  v = version(obj);
+  {
+    ObjectStore::Transaction t;
+    t.zero(cid, obj, 0, 4096);
+    apply(std::move(t));
+  }
+  ASSERT_GT(version(obj), v);
+  v = version(obj);
+  {
+    ObjectStore::Transaction t;
+    t.truncate(cid, obj, 32 * 1024);
+    apply(std::move(t));
+  }
+  ASSERT_GT(version(obj), v);
+  v = version(obj);
+  {
+    ObjectStore::Transaction t;
+    bufferlist bl4k;
+    bl4k.substr_of(bl, 0, 4096);
+    t.write(cid, obj, 0, bl4k.length(), bl4k);
+    apply(std::move(t));
+  }
+  ASSERT_GT(version(obj), v);
+  v = version(obj);
+
+  // clone and clone_range bump the destination only
+  {
+    ObjectStore::Transaction t;
+    t.clone(cid, obj, obj2);
+    apply(std::move(t));
+  }
+  ASSERT_EQ(v, version(obj));
+  ASSERT_GT(version(obj2), 0u);
+  {
+    ObjectStore::Transaction t;
+    t.clone_range(cid, obj, obj3, 0, 4096, 0);
+    apply(std::move(t));
+  }
+  ASSERT_EQ(v, version(obj));
+  ASSERT_GT(version(obj3), v3);
+
+  // versions persist
+  uint64_t v2 = version(obj2);
+  v3 = version(obj3);
+  ch.reset();
+  ASSERT_EQ(0, store->umount());
+  ASSERT_EQ(0, store->mount());
+  ch = store->open_collection(cid);
+  ASSERT_EQ(v, version(obj));
+  ASSERT_EQ(v2, version(obj2));
+  ASSERT_EQ(v3, version(obj3));
+
+  // recreated object restarts data_version but gets another nid, hence
+  // <nid, data_version> differs even after the same number of modifications
+  ghobject_t obj4(hobject_t(sobject_t("Object 4", CEPH_NOSNAP)));
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, obj4, 0, bl.length(), bl);
+    apply(std::move(t));
+  }
+  uint64_t v4 = version(obj4);
+  uint64_t nid4 = nid(obj4);
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj4);
+    apply(std::move(t));
+  }
+  {
+    ObjectStore::Transaction t;
+    t.write(cid, obj4, 0, bl.length(), bl);
+    apply(std::move(t));
+  }
+  ASSERT_EQ(v4, version(obj4));
+  ASSERT_NE(nid4, nid(obj4));
+
+  {
+    ObjectStore::Transaction t;
+    t.remove(cid, obj);
+    t.remove(cid, obj2);
+    t.remove(cid, obj3);
+    t.remove(cid, obj4);
+    t.remove_collection(cid);
+    apply(std::move(t));
+  }
+}
+
 // Deep scrub reads large objects in osd_deep_scrub_stride chunks, dedup
 // info should be collected from consecutive chunk reads of an object.
 TEST_P(StoreTestReformatting, CollectCsumChunkedTest) {

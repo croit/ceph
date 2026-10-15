@@ -1315,6 +1315,13 @@ struct bluestore_onode_t {
 
   std::map<uint32_t, uint64_t> zone_offset_refs;  ///< (zone, offset) refs to this onode
 
+  /// bumped on every modification of the object's data (but not its
+  /// metadata, e.g. xattrs or omap), lets verify data hasn't been modified
+  /// since some point, e.g. when dedup info has been collected.
+  /// Restarts for a recreated object, hence to be paired with nid to
+  /// identify the object's state.
+  uint64_t data_version = 0;
+
   enum {
     FLAG_OMAP = 1,         ///< object may have omap data
     FLAG_PGMETA_OMAP = 2,  ///< omap data is in meta omap prefix
@@ -1407,6 +1414,9 @@ struct bluestore_onode_t {
     if (struct_v >= 3) {
       denc(v.segment_size, p);
     }
+    if (struct_v >= 4) {
+      denc_varint(v.data_version, p);
+    }
   }
 
   enum {
@@ -1429,11 +1439,19 @@ struct bluestore_onode_t {
   // There is no change in any other encoding, object will be read without troubles.
   // Object that is only read, does not lose its v3 version.
   // When object is written back, its encoded in v2, losing its segment_size setting.
+  //
+  // v4 adds data_version. Objects created or read on earlier versions get
+  // data_version = 0. On downgrade older BlueStore skips data_version and
+  // drops it when writing the object back. Objects having no segment_size
+  // (encoded as v2 otherwise) are encoded in v4 once data_version is set.
 
   DENC_HELPERS
   void bound_encode(size_t& p, uint64_t features) const {
-    __u8 struct_v_to_use = 3;
-    if ((features & FLAG_DEBUG_FORCE_V2) != 0) {
+    __u8 struct_v_to_use = 4;
+    // FLAG_DEBUG_FORCE_V2 is applied for objects with no segment_size set,
+    // i.e. not only for debugging. Keep data_version if any though: v4 is
+    // still compatible with older versions which skip the unknown fields.
+    if ((features & FLAG_DEBUG_FORCE_V2) != 0 && data_version == 0) {
       struct_v_to_use = 2;
     }
     DENC_START_UNCHECKED(struct_v_to_use, 1, p);
@@ -1442,8 +1460,11 @@ struct bluestore_onode_t {
   }
   void encode(::ceph::buffer::list::contiguous_appender& p, uint64_t features) const {
     DENC_DUMP_PRE(bluestore_onode_t);
-    __u8 struct_v_to_use = 3;
-    if ((features & FLAG_DEBUG_FORCE_V2) != 0) {
+    __u8 struct_v_to_use = 4;
+    // FLAG_DEBUG_FORCE_V2 is applied for objects with no segment_size set,
+    // i.e. not only for debugging. Keep data_version if any though: v4 is
+    // still compatible with older versions which skip the unknown fields.
+    if ((features & FLAG_DEBUG_FORCE_V2) != 0 && data_version == 0) {
       struct_v_to_use = 2;
     }
     DENC_START_UNCHECKED(struct_v_to_use, 1, p);
@@ -1451,12 +1472,16 @@ struct bluestore_onode_t {
     DENC_FINISH(p);
   }
   void decode(::ceph::buffer::ptr::const_iterator& p, uint64_t features = 0) {
-    DENC_START_UNCHECKED(3, 1, p);
+    DENC_START_UNCHECKED(4, 1, p);
     _denc_friend(*this, p, struct_v); //decode what is
     if ((features & FLAG_DEBUG_FORCE_V2) != 0) {
       this->segment_size = 0;
     }
     DENC_FINISH(p);
+  }
+
+  void bump_data_version() {
+    ++data_version;
   }
 
   void dump(ceph::Formatter *f) const;

@@ -3644,6 +3644,10 @@ public:
 			    std::string* pnext,
 			    bool* pcompleted = nullptr) override;
   int clear_dedup_info(int64_t pool, bool async_compact);
+  /// object's onode nid and data_version, see
+  /// bluestore_onode_t::data_version
+  int get_object_data_version(CollectionHandle& ch, const ghobject_t& oid,
+                              uint64_t* nid, uint64_t* data_version);
   int64_t estimate_dedup_info(int64_t pool, uint64_t* entry_count);
 
   int omap_get(
@@ -4136,12 +4140,17 @@ private:
     WriteContext *wctx,
     std::set<SharedBlob*> *maybe_unshared_blobs=0);
 
+  // bumps onode's data_version, see bluestore_onode_t::data_version.
+  // The caller is responsible for persisting the onode (write_onode()).
+  void _bump_data_version(OnodeRef& o);
+  // bump_ver: bump object's data_version on success
   int _write(TransContext *txc,
 	     CollectionRef& c,
 	     OnodeRef& o,
 	     uint64_t offset, size_t len,
 	     ceph::buffer::list& bl,
-	     uint32_t fadvise_flags);
+	     uint32_t fadvise_flags,
+	     bool bump_ver);
   void _pad_zeros(ceph::buffer::list *bl, uint64_t *offset,
 		  uint64_t chunk_size);
 
@@ -4187,7 +4196,8 @@ private:
     uint32_t scan_left, uint32_t scan_right);
   int _touch(TransContext *txc,
 	     CollectionRef& c,
-	     OnodeRef& o);
+	     OnodeRef& o,
+	     bool bump_ver);
   int _do_zero(TransContext *txc,
 	       CollectionRef& c,
 	       OnodeRef& o,
@@ -4195,7 +4205,8 @@ private:
   int _zero(TransContext *txc,
 	    CollectionRef& c,
 	    OnodeRef& o,
-	    uint64_t offset, size_t len);
+	    uint64_t offset, size_t len,
+	    bool bump_ver);
   void _do_truncate(TransContext *txc,
 		   CollectionRef& c,
 		   OnodeRef& o,
@@ -4204,7 +4215,8 @@ private:
   int _truncate(TransContext *txc,
 		CollectionRef& c,
 		OnodeRef& o,
-		uint64_t offset);
+		uint64_t offset,
+		bool bump_ver);
   int _remove(TransContext *txc,
 	      CollectionRef& c,
 	      OnodeRef& o);
@@ -4266,12 +4278,14 @@ private:
   int _clone(TransContext *txc,
 	     CollectionRef& c,
 	     OnodeRef& oldo,
-	     OnodeRef& newo);
+	     OnodeRef& newo,
+	     bool bump_ver);
   int _clone_range(TransContext *txc,
 		   CollectionRef& c,
 		   OnodeRef& oldo,
 		   OnodeRef& newo,
-		   uint64_t srcoff, uint64_t length, uint64_t dstoff);
+		   uint64_t srcoff, uint64_t length, uint64_t dstoff,
+		   bool bump_ver);
   int _rename(TransContext *txc,
 	      CollectionRef& c,
 	      OnodeRef& oldo,

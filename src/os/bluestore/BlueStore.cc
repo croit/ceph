@@ -14607,6 +14607,20 @@ int BlueStore::dedup_candidate_list(
     pcompleted);
 }
 
+int BlueStore::get_object_data_version(CollectionHandle& ch,
+  const ghobject_t& oid, uint64_t* nid, uint64_t* data_version)
+{
+  Collection* c = static_cast<Collection*>(ch.get());
+  std::shared_lock l(c->lock);
+  OnodeRef o = c->get_onode(oid, false);
+  if (!o || !o->exists) {
+    return -ENOENT;
+  }
+  *nid = o->onode.nid;
+  *data_version = o->onode.data_version;
+  return 0;
+}
+
 int BlueStore::clear_dedup_info(int64_t pool, bool async_compact)
 {
   ceph_assert(db);
@@ -16898,7 +16912,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
     case Transaction::OP_CREATE:
     case Transaction::OP_TOUCH:
     case Transaction::OP_TOUCH_TEMP:
-      r = _touch(txc, c, o);
+      r = _touch(txc, c, o, true);
       break;
 
     case Transaction::OP_WRITE:
@@ -16908,7 +16922,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
 	uint32_t fadvise_flags = i.get_fadvise_flags();
         bufferlist bl;
         i.decode_bl(bl);
-	r = _write(txc, c, o, off, len, bl, fadvise_flags);
+	r = _write(txc, c, o, off, len, bl, fadvise_flags, true);
       }
       break;
 
@@ -16916,7 +16930,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
       {
         uint64_t off = op->off;
         uint64_t len = op->len;
-	r = _zero(txc, c, o, off, len);
+	r = _zero(txc, c, o, off, len, true);
       }
       break;
 
@@ -16929,7 +16943,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
     case Transaction::OP_TRUNCATE:
       {
         uint64_t off = op->off;
-	r = _truncate(txc, c, o, off);
+	r = _truncate(txc, c, o, off, true);
       }
       break;
 
@@ -16976,7 +16990,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
           const ghobject_t& noid = i.get_oid(op->dest_oid);
 	  no = c->get_onode(noid, true);
 	}
-	r = _clone(txc, c, o, no);
+	r = _clone(txc, c, o, no, true);
       }
       break;
 
@@ -16994,7 +17008,7 @@ void BlueStore::_txc_add_transaction(TransContext *txc, Transaction *t)
         uint64_t srcoff = op->off;
         uint64_t len = op->len;
         uint64_t dstoff = op->dest_off;
-	r = _clone_range(txc, c, o, no, srcoff, len, dstoff);
+	r = _clone_range(txc, c, o, no, srcoff, len, dstoff, true);
       }
       break;
 
@@ -17163,14 +17177,25 @@ void BlueStore::_txc_exec_reformat_write(Collection* c,  OnodeRef o,
 // -----------------
 // write operations
 
+void BlueStore::_bump_data_version(OnodeRef& o)
+{
+  o->onode.bump_data_version();
+  dout(20) << __func__ << " " << o->oid << " data_version 0x" << std::hex
+	   << o->onode.data_version << std::dec << dendl;
+}
+
 int BlueStore::_touch(TransContext *txc,
 		      CollectionRef& c,
-		      OnodeRef& o)
+		      OnodeRef& o,
+		      bool bump_ver)
 {
   dout(15) << __func__ << " " << c->cid << " " << o->oid << dendl;
   int r = 0;
   auto start = mono_clock::now();
   _assign_nid(txc, o);
+  if (bump_ver) {
+    _bump_data_version(o);
+  }
   txc->write_onode(o);
   logger->tinc_with_max(l_bluestore_touch_lat, mono_clock::now() - start);
   dout(10) << __func__ << " " << c->cid << " " << o->oid << " = " << r << dendl;
@@ -18823,7 +18848,8 @@ int BlueStore::_write(TransContext *txc,
 		      OnodeRef& o,
 		      uint64_t offset, size_t length,
 		      bufferlist& bl,
-		      uint32_t fadvise_flags)
+		      uint32_t fadvise_flags,
+		      bool bump_ver)
 {
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " 0x" << std::hex << offset << "~" << length
@@ -18842,6 +18868,9 @@ int BlueStore::_write(TransContext *txc,
       _choose_write_options(c.get(), o, fadvise_flags, &wctx);
       r = _do_write(txc, c, o, offset, length, bl, wctx);
     }
+    if (r >= 0 && bump_ver) {
+      _bump_data_version(o);
+    }
     txc->write_onode(o);
   }
   auto finish = mono_clock::now();
@@ -18855,7 +18884,8 @@ int BlueStore::_write(TransContext *txc,
 int BlueStore::_zero(TransContext *txc,
 		     CollectionRef& c,
 		     OnodeRef& o,
-		     uint64_t offset, size_t length)
+		     uint64_t offset, size_t length,
+		     bool bump_ver)
 {
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " 0x" << std::hex << offset << "~" << length << std::dec
@@ -18867,6 +18897,10 @@ int BlueStore::_zero(TransContext *txc,
   } else {
     _assign_nid(txc, o);
     r = _do_zero(txc, c, o, offset, length);
+    if (r >= 0 && bump_ver) {
+      _bump_data_version(o);
+    }
+    txc->write_onode(o);
   }
   logger->tinc_with_max(l_bluestore_zero_lat, mono_clock::now() - start);
   dout(10) << __func__ << " " << c->cid << " " << o->oid
@@ -18899,7 +18933,6 @@ int BlueStore::_do_zero(TransContext *txc,
     dout(20) << __func__ << " extending size to " << offset + length
 	     << dendl;
   }
-  txc->write_onode(o);
 
   dout(10) << __func__ << " " << c->cid << " " << o->oid
 	   << " 0x" << std::hex << offset << "~" << length << std::dec
@@ -18942,14 +18975,13 @@ void BlueStore::_do_truncate(
   }
 
   o->onode.size = offset;
-
-  txc->write_onode(o);
 }
 
 int BlueStore::_truncate(TransContext *txc,
 			 CollectionRef& c,
 			 OnodeRef& o,
-			 uint64_t offset)
+			 uint64_t offset,
+			 bool bump_ver)
 {
   dout(15) << __func__ << " " << c->cid << " " << o->oid
 	   << " 0x" << std::hex << offset << std::dec
@@ -18961,6 +18993,10 @@ int BlueStore::_truncate(TransContext *txc,
     r = -E2BIG;
   } else {
     _do_truncate(txc, c, o, offset);
+    if (bump_ver) {
+      _bump_data_version(o);
+    }
+    txc->write_onode(o);
   }
   log_latency_fn(
     __func__,
@@ -19460,7 +19496,8 @@ int BlueStore::_set_alloc_hint(
 int BlueStore::_clone(TransContext *txc,
 		      CollectionRef& c,
 		      OnodeRef& oldo,
-		      OnodeRef& newo)
+		      OnodeRef& newo,
+		      bool bump_ver)
 {
   dout(15) << __func__ << " " << c->cid << " " << oldo->oid << " -> "
 	   << newo->oid << dendl;
@@ -19534,6 +19571,9 @@ int BlueStore::_clone(TransContext *txc,
     txc->t->set(prefix, new_tail, new_tail_value);
   }
 
+  if (bump_ver) {
+    _bump_data_version(newo);
+  }
   txc->write_onode(newo);
   r = 0;
 
@@ -19579,7 +19619,8 @@ int BlueStore::_clone_range(TransContext *txc,
 			    CollectionRef& c,
 			    OnodeRef& oldo,
 			    OnodeRef& newo,
-			    uint64_t srcoff, uint64_t length, uint64_t dstoff)
+			    uint64_t srcoff, uint64_t length, uint64_t dstoff,
+			    bool bump_ver)
 {
   dout(15) << __func__ << " " << c->cid << " " << oldo->oid << " -> "
 	   << newo->oid << " from 0x" << std::hex << srcoff << "~" << length
@@ -19615,6 +19656,9 @@ int BlueStore::_clone_range(TransContext *txc,
     }
   }
 
+  if (bump_ver) {
+    _bump_data_version(newo);
+  }
   txc->write_onode(newo);
   r = 0;
 

@@ -1479,6 +1479,7 @@ void bluestore_onode_t::dump(Formatter *f) const
   f->dump_unsigned("expected_object_size", expected_object_size);
   f->dump_unsigned("expected_write_size", expected_write_size);
   f->dump_unsigned("alloc_hint_flags", alloc_hint_flags);
+  f->dump_unsigned("data_version", data_version);
 }
 
 list<bluestore_onode_t> bluestore_onode_t::generate_test_instances()
@@ -1490,6 +1491,7 @@ list<bluestore_onode_t> bluestore_onode_t::generate_test_instances()
   onode1.size = 99999;
   onode1.expected_object_size = 123456;
   onode1.expected_write_size = 7890;
+  onode1.data_version = 42;
   onode1.set_flag(FLAG_OMAP | FLAG_PERPOOL_OMAP | FLAG_PERPG_OMAP);
 
   ceph::buffer::ptr buf1 = ceph::buffer::create(50);
