@@ -30,6 +30,7 @@
 
 #include "librados/AioCompletionImpl.h"
 #include "librados/IoCtxImpl.h"
+#include "librados/DedupItemImpl.h"
 #include "librados/ObjectOperationImpl.h"
 #include "librados/PoolAsyncCompletionImpl.h"
 #include "librados/RadosClient.h"
@@ -42,6 +43,8 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <bit>
+#include <limits>
 #include <list>
 #include <stdexcept>
 #include <system_error>
@@ -1951,7 +1954,117 @@ int librados::IoCtx::hit_set_get(uint32_t hash,  AioCompletion *c, time_t stamp,
   return io_ctx_impl->hit_set_get(hash, c->pc, stamp, pbl);
 }
 
+std::ostream& librados::operator<<(std::ostream& out,
+  const librados::DedupItemCursor& c)
+{
+  out << "dedup_cursor(shard " << c.shard << "/" << (1ull << c.shard_bits)
+      << ", osds " << c.num_completed << "/" << c.osds.size() << " done)";
+  return out;
+}
 
+int librados::IoCtx::dedup_candidate_list_slice(
+  const size_t n,
+  const size_t m,
+  DedupItemCursor* cursor)
+{
+  ceph_assert(cursor != nullptr);
+  // shard count must be a power of 2 as shards are determined
+  // by digest's most significant bits
+  if (m == 0 || (m & (m - 1)) != 0 || m > (1ull << 32) || n >= m) {
+    return -EINVAL;
+  }
+  std::vector<int> osds;
+  int r = io_ctx_impl->get_dedup_osds(&osds);
+  if (r < 0) {
+    return r;
+  }
+  cursor->shard = n;
+  cursor->shard_bits = std::countr_zero(uint64_t(m));
+  cursor->osds = std::move(osds);
+  cursor->positions.assign(cursor->osds.size(), std::string());
+  cursor->completed.assign(cursor->osds.size(), false);
+  cursor->num_completed = 0;
+  cursor->next_target = 0;
+  return 0;
+}
+
+int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
+  const size_t max_targets,
+  const size_t per_target_max_items,
+  std::vector<DedupItem>* result,
+  uint32_t newer_than,
+  uint32_t prune_older_than)
+{
+  ceph_assert(result != nullptr);
+  if (max_targets == 0 || per_target_max_items == 0 ||
+      per_target_max_items > std::numeric_limits<uint32_t>::max()) {
+    return -EINVAL;
+  }
+  if (cursor.is_end()) {
+    return 0;
+  }
+  using waiter_t = ceph::async::waiter<boost::system::error_code,
+				       std::vector<librados::DedupItemImpl>,
+				       bool,
+				       std::string>;
+  // <target index, waiter>
+  std::vector<std::pair<size_t, std::unique_ptr<waiter_t>>> in_flight;
+
+  // pick up to max_targets incomplete OSDs in a round-robin manner
+  const size_t num_targets = cursor.osds.size();
+  size_t t = cursor.next_target % num_targets;
+  for (size_t i = 0; i < num_targets && in_flight.size() < max_targets; ++i) {
+    if (!cursor.completed[t]) {
+      auto& w = in_flight.emplace_back(t, std::make_unique<waiter_t>()).second;
+      io_ctx_impl->objecter->enumerate_dedup_items<librados::DedupItemImpl>(
+	io_ctx_impl->poolid,
+	cursor.osds[t],
+	cursor.shard,
+	cursor.shard_bits,
+	cursor.positions[t],
+	per_target_max_items,
+	newer_than,
+	prune_older_than,
+	*w);
+    }
+    t = (t + 1) % num_targets;
+  }
+  cursor.next_target = t;
+
+  // wait for all the submitted requests, even if some of them fail
+  int r = 0;
+  int count = 0;
+  for (auto& [target, w] : in_flight) {
+    auto [ec, items, target_completed, next] = w->wait();
+    if (ec) {
+      if (r == 0) {
+	r = ceph::from_error_code(ec);
+      }
+      continue;
+    }
+    for (auto& i : items) {
+      DedupItem& di = result->emplace_back();
+      di.digest = std::move(i.digest);
+      di.hash = i.hash;
+      di.timestamp = i.timestamp;
+      di.age = i.age;
+      di.osd = i.osd;
+      ++count;
+    }
+    cursor.positions[target] = std::move(next);
+    if (target_completed && !cursor.completed[target]) {
+      cursor.completed[target] = true;
+      ++cursor.num_completed;
+    }
+  }
+  return r < 0 ? r : count;
+}
+
+bool librados::IoCtx::dedup_candidate_list_is_end(
+  const DedupItemCursor& cursor)
+{
+  return cursor.is_end();
+}
 
 uint64_t librados::IoCtx::get_last_version()
 {

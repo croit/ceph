@@ -77,6 +77,7 @@ class MGetPoolStatsReply;
 class MStatfsReply;
 class MCommandReply;
 class MWatchNotify;
+class MOSDDedupListReply;
 struct ObjectOperation;
 template<typename T>
 struct EnumerationContext;
@@ -2325,6 +2326,9 @@ public:
     ceph_tid_t tid = 0;
     std::vector<std::string> cmd;
     ceph::buffer::list inbl;
+    // When set, builds the request message to be sent instead of MCommand.
+    // Invoked on every (re)send, tid is assigned by the caller.
+    std::function<MessageRef()> make_request;
 
     // target_osd == -1 means target_pg is valid
     const int target_osd = -1;
@@ -2377,6 +2381,9 @@ public:
   void _finish_command(CommandOp *c, boost::system::error_code ec,
 		       std::string&& rs, ceph::buffer::list&& bl);
   void handle_command_reply(MCommandReply *m);
+  void handle_dedup_list_reply(MOSDDedupListReply *m);
+  void _handle_command_reply(Message *m, int r, std::string&& rs,
+			     ceph::buffer::list&& bl);
 
   // -- lingering ops --
 
@@ -3041,6 +3048,22 @@ public:
       std::move(cmd),
       std::move(inbl),
       std::move(onfinish));
+    submit_command(c, ptid);
+  }
+  // Send a custom request message to the OSD and track it like a command:
+  // the message is resent on session reset and the op fails if the OSD
+  // goes down/DNE or times out. The reply handler is expected to complete
+  // the op via _handle_command_reply().
+  void osd_request_(int osd, std::function<MessageRef()>&& make_request,
+		    ceph_tid_t *ptid,
+		    decltype(CommandOp::onfinish)&& onfinish) {
+    ceph_assert(osd >= 0);
+    auto c = new CommandOp(
+      osd,
+      {},
+      {},
+      std::move(onfinish));
+    c->make_request = std::move(make_request);
     submit_command(c, ptid);
   }
   template<typename CompletionToken>
@@ -3871,6 +3894,39 @@ public:
     ceph::buffer::list&& bl,
     boost::system::error_code ec,
     std::unique_ptr<EnumerationContext<T>>&& ectx);
+
+  template<typename T>
+  using enumerate_dedup_items_cb_t =
+    fu2::unique_function<void(boost::system::error_code,
+			      std::vector<T>,
+			      bool,          // completed
+			      std::string)&&>; // next position
+
+  /**
+   * List deduplication info records collected by a specific OSD for a pool.
+   *
+   * Only records for the digest shard specified by @shard are returned,
+   * i.e. ones whose @shard_bits most significant digest bits are equal
+   * to @shard. Listing starts after @next_pos (an opaque cursor, empty to
+   * start from the beginning) and returns up to @max entries.
+   * On completion @on_finish receives the entries, a flag indicating
+   * there is nothing more to list for the shard and the cursor to continue
+   * from.
+   * Records made more than @newer_than seconds ago are skipped
+   * (0 - no restriction), records older than @prune_older_than seconds
+   * are removed at the OSD (0 - remove nothing).
+   */
+  template<typename T>
+  void enumerate_dedup_items(
+    int64_t pool_id,
+    int osd,
+    uint64_t shard,
+    unsigned shard_bits,
+    const std::string& next_pos,
+    const uint32_t max,
+    uint32_t newer_than,
+    uint32_t prune_older_than,
+    enumerate_dedup_items_cb_t<T> on_finish);
 
   // -------------------------
   // pool ops

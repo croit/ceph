@@ -2107,6 +2107,28 @@ void librados::IoCtxImpl::object_list_slice(
       hobject_t::_reverse_bits(rev_finish), poolid, string());
 }
 
+int librados::IoCtxImpl::get_dedup_osds(std::vector<int>* osds)
+{
+  ceph_assert(objecter);
+  ceph_assert(osds);
+
+  osds->clear();
+  return objecter->with_osdmap(
+    [&](const OSDMap& osdmap) {
+      if (!osdmap.get_pg_pool(poolid)) {
+	return -ENOENT;
+      }
+      for (int osd = 0; osd < osdmap.get_max_osd(); ++osd) {
+	// OSDs lacking dedup listing support can't keep dedup info either
+	if (osdmap.is_up(osd) &&
+	    HAVE_FEATURE(osdmap.get_xinfo(osd).features, OSD_DEDUP_LIST)) {
+	  osds->push_back(osd);
+	}
+      }
+      return 0;
+    });
+}
+
 int librados::IoCtxImpl::application_enable(const std::string& app_name,
                                             bool force)
 {

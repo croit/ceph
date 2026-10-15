@@ -161,6 +161,61 @@ inline namespace v14_2_0 {
     std::string locator;
   };
 
+  /// Deduplication info record collected by an OSD during deep scrub
+  class CEPH_RADOS_API DedupItem
+  {
+  public:
+    std::string digest;     ///< raw (binary) content digest (MD5)
+    uint32_t hash = 0;      ///< object hash
+    uint64_t timestamp = 0; ///< when the record has been made, ns, OSD's clock
+    double age = 0.0;       ///< seconds since the record has been made
+    int osd = -1;           ///< OSD the record has been retrieved from
+  };
+
+  /**
+   * Cursor for deduplication info listing.
+   *
+   * Deduplication info is kept on per-OSD basis, hence the cursor tracks
+   * listing progress for every up OSD (records stay at an OSD after the
+   * pool's PGs move away from it).
+   * The listing might be split into shards determined by the most
+   * significant bits of the content digest, see
+   * IoCtx::dedup_candidate_list_slice(). Since records with the same digest
+   * always belong to the same shard, all the duplicates are
+   * reported within a single shard listing.
+   */
+  class CEPH_RADOS_API DedupItemCursor
+  {
+    uint64_t shard = 0;
+    unsigned shard_bits = 0;
+    std::vector<int> osds;
+    std::vector<std::string> positions; ///< per osd listing position
+    std::vector<bool> completed;        ///< per osd completion flag
+    size_t num_completed = 0;
+    size_t next_target = 0;             ///< osd index to start next round from
+
+  public:
+    /// true when all the OSDs have been listed
+    bool is_end() const {
+      return num_completed == osds.size();
+    }
+    uint64_t get_shard() const {
+      return shard;
+    }
+    uint64_t get_shard_count() const {
+      return 1ull << shard_bits;
+    }
+    const std::vector<int>& get_osds() const {
+      return osds;
+    }
+
+    friend class IoCtx;
+    friend CEPH_RADOS_API std::ostream& operator<<(std::ostream&,
+      const librados::DedupItemCursor&);
+  };
+  CEPH_RADOS_API std::ostream& operator<<(std::ostream&, const librados::DedupItemCursor&);
+
+
   /// DEPRECATED; do not use
   class CEPH_RADOS_API WatchCtx {
   public:
@@ -1138,6 +1193,52 @@ inline namespace v14_2_0 {
      */
     int hit_set_get(uint32_t hash, AioCompletion *c, time_t stamp,
 		    bufferlist *pbl);
+
+    /**
+     * Initialize the cursor for deduplication info listing of the
+     * pool's shard n out of m.
+     *
+     * Shards are determined by log2(m) most significant bits of the
+     * content digest, hence m must be a power of 2 (up to 2^32).
+     * The listing is performed against every up OSD supporting it.
+     * Records kept by down OSDs are omitted, which is acceptable as
+     * deduplication info is best-effort anyway.
+     *
+     * Note: listing requires pool-wide read OSD caps, pruning
+     * (see dedup_candidate_list()) requires pool-wide write caps as well.
+     *
+     * @returns 0 on success, -EINVAL for invalid n/m, -ENOENT if the pool
+     * doesn't exist
+     */
+    int dedup_candidate_list_slice(
+      const size_t n,
+      const size_t m,
+      DedupItemCursor* cursor);
+
+    /**
+     * List the next portion of deduplication info records for the cursor.
+     *
+     * Up to max_targets OSDs (which aren't completed yet) are queried in
+     * parallel with up to per_target_max_items records requested from each.
+     * Retrieved records are appended to *result and the cursor is advanced.
+     * Use dedup_candidate_list_is_end() to check for listing completion.
+     *
+     * @param newer_than skip records made more than this amount of seconds
+     *   ago, 0 means no restriction
+     * @param prune_older_than make OSDs remove records older than this
+     *   amount of seconds, 0 means don't remove anything
+     * @returns number of records retrieved or negative error code.
+     *   The cursor isn't advanced for OSDs which reported an error.
+     */
+    int dedup_candidate_list(DedupItemCursor& cursor,
+      const size_t max_targets,
+      const size_t per_target_max_items,
+      std::vector<DedupItem>* result,
+      uint32_t newer_than = 0,
+      uint32_t prune_older_than = 0);
+
+    /// true if there is nothing more to list for the cursor
+    bool dedup_candidate_list_is_end(const DedupItemCursor& cursor);
 
     uint64_t get_last_version();
 

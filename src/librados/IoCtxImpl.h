@@ -127,6 +127,10 @@ struct librados::IoCtxImpl {
     const size_t m,
     hobject_t *split_start,
     hobject_t *split_finish);
+  // collect OSDs which might keep deduplication info for the pool:
+  // all up OSDs supporting dedup info listing since records stay
+  // at an OSD after PGs are moved away from it.
+  int get_dedup_osds(std::vector<int>* osds);
 
   int create(const object_t& oid, bool exclusive);
   int write(const object_t& oid, bufferlist& bl, size_t len, uint64_t off);

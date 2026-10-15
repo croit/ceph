@@ -47,6 +47,7 @@
 
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
+#include "messages/MOSDDedupList.h"
 
 #include "messages/MWatchNotify.h"
 
@@ -64,6 +65,7 @@
 #include "neorados/RADOSImpl.h"
 
 #include "osdc/SplitOp.h"
+#include "librados/DedupItemImpl.h"
 
 using std::list;
 using std::make_pair;
@@ -1089,6 +1091,11 @@ Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef &m)
     } else {
       return Dispatcher::UNHANDLED();
     }
+
+  case MSG_OSD_DEDUP_LIST_REPLY:
+    m->get(); /* ref to be consumed */
+    handle_dedup_list_reply(ref_cast<MOSDDedupListReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case MSG_GETPOOLSTATSREPLY:
     m->get(); /* ref to be consumed */
@@ -5253,6 +5260,20 @@ void Objecter::blocklist_self(bool set)
 
 void Objecter::handle_command_reply(MCommandReply *m)
 {
+  _handle_command_reply(m, m->r, std::move(m->rs),
+			std::move(m->get_data()));
+}
+
+void Objecter::handle_dedup_list_reply(MOSDDedupListReply *m)
+{
+  cb::list bl;
+  encode(m->result, bl);
+  _handle_command_reply(m, m->r, {}, std::move(bl));
+}
+
+void Objecter::_handle_command_reply(Message *m, int r, std::string&& rs,
+				     cb::list&& bl)
+{
   unique_lock wl(rwlock);
   if (!initialized) {
     m->put();
@@ -5290,7 +5311,7 @@ void Objecter::handle_command_reply(MCommandReply *m)
     return;
   }
 
-  if (m->r == -EAGAIN) {
+  if (r == -EAGAIN) {
     ldout(cct,10) << __func__ << " tid " << m->get_tid()
 		  << " got EAGAIN, requesting map and resending" << dendl;
     // NOTE: This might resend twice... once now, and once again when
@@ -5305,9 +5326,8 @@ void Objecter::handle_command_reply(MCommandReply *m)
   sl.unlock();
 
   unique_lock sul(s->lock);
-  _finish_command(c, m->r < 0 ? bs::error_code(-m->r, osd_category()) :
-		  bs::error_code(), std::move(m->rs),
-		  std::move(m->get_data()));
+  _finish_command(c, r < 0 ? bs::error_code(-r, osd_category()) :
+		  bs::error_code(), std::move(rs), std::move(bl));
   sul.unlock();
 
   m->put();
@@ -5440,11 +5460,17 @@ void Objecter::_send_command(CommandOp *c)
   ldout(cct, 10) << "_send_command " << c->tid << dendl;
   ceph_assert(c->session);
   ceph_assert(c->session->con);
-  auto m = new MCommand(monc->monmap.fsid);
-  m->cmd = c->cmd;
-  m->set_data(c->inbl);
+  MessageRef m;
+  if (c->make_request) {
+    m = c->make_request();
+  } else {
+    auto mc = make_message<MCommand>(monc->monmap.fsid);
+    mc->cmd = c->cmd;
+    mc->set_data(c->inbl);
+    m = std::move(mc);
+  }
   m->set_tid(c->tid);
-  c->session->con->send_message(m);
+  c->session->con->send_message2(std::move(m));
   logger->inc(l_osdc_command_send);
 }
 
@@ -5850,6 +5876,129 @@ void Objecter::_enumerate_reply<neorados::Entry>(
   cb::list&& bl,
   bs::error_code ec,
   std::unique_ptr<EnumerationContext<neorados::Entry>>&& ctx);
+
+template<typename T>
+void Objecter::enumerate_dedup_items(
+  int64_t pool_id,
+  int osd,
+  uint64_t shard,
+  unsigned shard_bits,
+  const std::string& next_pos,
+  const uint32_t max,
+  uint32_t newer_than,
+  uint32_t prune_older_than,
+  enumerate_dedup_items_cb_t<T> on_finish)
+{
+  if (osd < 0) {
+    lderr(cct) << __func__ << ": invalid osd " << osd << dendl;
+    std::move(on_finish)(osdc_errc::precondition_violated, {}, false, {});
+    return;
+  }
+  if (max < 1) {
+    lderr(cct) << __func__ << ": result size may not be zero" << dendl;
+    std::move(on_finish)(osdc_errc::precondition_violated, {}, false, {});
+    return;
+  }
+  if (shard_bits > 32 || shard >= (1ull << shard_bits)) {
+    lderr(cct) << __func__ << ": invalid shard " << shard
+	       << " for " << shard_bits << " bits" << dendl;
+    std::move(on_finish)(osdc_errc::precondition_violated, {}, false, {});
+    return;
+  }
+  {
+    shared_lock rl(rwlock);
+    if (!osdmap->get_pg_pool(pool_id)) {
+      lderr(cct) << __func__ << ": pool " << pool_id << " DNE in osd epoch "
+		 << osdmap->get_epoch() << dendl;
+      rl.unlock();
+      std::move(on_finish)(osdc_errc::pool_dne, {}, false, {});
+      return;
+    }
+    // Pre-dedup-list OSDs are unable to decode MOSDDedupList.
+    // Non-existent OSDs are handled by command machinery below.
+    if (osdmap->exists(osd) &&
+	!HAVE_FEATURE(osdmap->get_xinfo(osd).features, OSD_DEDUP_LIST)) {
+      ldout(cct, 1) << __func__ << ": osd." << osd
+		    << " doesn't support dedup info listing" << dendl;
+      rl.unlock();
+      std::move(on_finish)(
+	bs::errc::make_error_code(bs::errc::operation_not_supported),
+	{}, false, {});
+      return;
+    }
+  }
+
+  ldout(cct, 10) << __func__ << " osd." << osd << " pool " << pool_id
+		 << " shard " << shard << "/" << (1ull << shard_bits)
+		 << " max " << max << dendl;
+
+  auto make_request =
+    [this, pool_id, shard, shard_bits, next_pos, max,
+     newer_than, prune_older_than]() -> MessageRef {
+      return make_message<MOSDDedupList>(
+	monc->get_fsid(),
+	osdmap->get_epoch(),
+	pool_id,
+	shard,
+	shard_bits,
+	next_pos,
+	max,
+	newer_than,
+	prune_older_than);
+    };
+  auto e = boost::asio::prefer(
+    service.get_executor(),
+    boost::asio::execution::outstanding_work.tracked);
+  osd_request_(osd, std::move(make_request), nullptr,
+    asio::bind_executor(e,
+      [this, osd, on_finish = std::move(on_finish)]
+      (bs::error_code ec, std::string, cb::list bl) mutable {
+	if (ec) {
+	  ldout(cct, 1) << "enumerate_dedup_items osd." << osd
+			<< " failed: " << ec.message() << dendl;
+	  std::move(on_finish)(ec, {}, false, {});
+	  return;
+	}
+	osd_dedup_list_result_t res;
+	try {
+	  auto p = bl.cbegin();
+	  decode(res, p);
+	} catch (const cb::error& err) {
+	  lderr(cct) << "enumerate_dedup_items osd." << osd
+		     << " malformed reply: " << err.what() << dendl;
+	  std::move(on_finish)(bs::errc::make_error_code(bs::errc::bad_message),
+			       {}, false, {});
+	  return;
+	}
+	std::vector<T> ls;
+	ls.reserve(res.entries.size());
+	for (auto& i : res.entries) {
+	  T& t = ls.emplace_back();
+	  t.digest = std::move(i.digest);
+	  t.hash = hobject_t::_reverse_bits(i.oid_hash);
+	  t.timestamp = i.timestamp;
+	  t.age = res.now > i.timestamp ? (res.now - i.timestamp) / 1e9 : 0.0;
+	  t.osd = osd;
+	}
+	ldout(cct, 20) << "enumerate_dedup_items osd." << osd
+		       << " got " << ls.size() << " entries, completed "
+		       << res.completed << dendl;
+	std::move(on_finish)(ec, std::move(ls), res.completed,
+			     std::move(res.next));
+      }));
+}
+
+template
+void Objecter::enumerate_dedup_items<librados::DedupItemImpl>(
+  int64_t pool_id,
+  int osd,
+  uint64_t shard,
+  unsigned shard_bits,
+  const std::string& next_pos,
+  const uint32_t max,
+  uint32_t newer_than,
+  uint32_t prune_older_than,
+  enumerate_dedup_items_cb_t<librados::DedupItemImpl> on_finish);
 
 namespace {
   using namespace librados;
