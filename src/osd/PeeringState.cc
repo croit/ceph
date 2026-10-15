@@ -4191,6 +4191,8 @@ void PeeringState::update_calc_stats()
   info.stats.last_scrub_stamp = info.history.last_scrub_stamp;
   info.stats.last_deep_scrub = info.history.last_deep_scrub;
   info.stats.last_deep_scrub_stamp = info.history.last_deep_scrub_stamp;
+  info.stats.last_deep_scrub_start_stamp =
+    info.history.last_deep_scrub_start_stamp;
   info.stats.last_clean_scrub_stamp = info.history.last_clean_scrub_stamp;
   info.stats.last_epoch_clean = info.history.last_epoch_clean;
 
@@ -5692,6 +5694,7 @@ PeeringState::Primary::Primary(my_context ctx)
     ps->info.stats.last_fullsized = t;
     ps->info.stats.last_scrub_stamp = t;
     ps->info.stats.last_deep_scrub_stamp = t;
+    ps->info.stats.last_deep_scrub_start_stamp = t;
     ps->info.stats.last_clean_scrub_stamp = t;
   }
 }

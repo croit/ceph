@@ -125,6 +125,7 @@ void PGScrubber::notify_scrub_start(bool deep)
 {
   LOG_PREFIX(PGScrubber::notify_scrub_start);
   DEBUGDPP("deep: {}", pg, deep);
+  scrub_start_stamp = ceph_clock_now();
   pg.peering_state.state_set(PG_STATE_SCRUBBING);
   if (deep) {
     pg.peering_state.state_set(PG_STATE_DEEP_SCRUB);
@@ -318,6 +319,7 @@ void PGScrubber::emit_scrub_result(
       history.last_scrub_stamp = now;
       if (deep) {
 	history.last_deep_scrub_stamp = now;
+	history.last_deep_scrub_start_stamp = scrub_start_stamp;
       }
       return false; // notify_scrub_end will flush stats to osd
     });

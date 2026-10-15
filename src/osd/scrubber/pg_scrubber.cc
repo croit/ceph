@@ -2090,6 +2090,8 @@ PgScrubber::emit_scrub_result()
         if (m_is_deep) {
           history.last_deep_scrub = m_pg->recovery_state.get_info().last_update;
           history.last_deep_scrub_stamp = now;
+          // zero if unknown
+          history.last_deep_scrub_start_stamp = m_scrub_start_stamp;
         }
 
         if (m_is_deep) {
@@ -2682,6 +2684,12 @@ PgScrubber::PgScrubber(PG* pg)
   m_fsm = std::make_unique<ScrubMachine>(m_pg, this);
   m_fsm->initiate();
   m_scrub_job.emplace(m_osds->cct, m_pg->pg_id, m_osds->get_nodeid());
+}
+
+void PgScrubber::set_scrub_start_stamp(utime_t stamp)
+{
+  dout(20) << fmt::format("{}: to {}", __func__, stamp) << dendl;
+  m_scrub_start_stamp = stamp;
 }
 
 void PgScrubber::set_scrub_duration(std::chrono::milliseconds duration)

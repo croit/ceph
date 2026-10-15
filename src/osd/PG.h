@@ -286,6 +286,8 @@ public:
     utime_t t, pg_history_t &history, pg_stat_t &stats) {
     stats.last_deep_scrub_stamp = t;
     history.last_deep_scrub_stamp = t;
+    stats.last_deep_scrub_start_stamp = t;
+    history.last_deep_scrub_start_stamp = t;
   }
 
   void set_last_deep_scrub_stamp(utime_t t) {

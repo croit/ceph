@@ -215,6 +215,9 @@ struct ScrubMachineListener {
 
   virtual void set_scrub_duration(std::chrono::milliseconds duration) = 0;
 
+  /// the time the scrub session being completed has started at
+  virtual void set_scrub_start_stamp(utime_t stamp) = 0;
+
   /**
    * Manipulate the 'I am being scrubbed now' Scrubber's flag
    */

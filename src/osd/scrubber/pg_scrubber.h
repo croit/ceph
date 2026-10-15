@@ -574,6 +574,8 @@ class PgScrubber : public ScrubPgIF,
 
   void set_scrub_duration(std::chrono::milliseconds duration) final;
 
+  void set_scrub_start_stamp(utime_t stamp) final;
+
   std::ostream& gen_prefix(std::ostream& out) const final;
 
   /// facilitate scrub-backend access to SnapMapper mappings
@@ -892,6 +894,9 @@ class PgScrubber : public ScrubPgIF,
    * parameter when building the scrub maps.
    */
   bool m_is_deep{false};
+
+  /// the start time of the scrub session being completed (zero if unknown)
+  utime_t m_scrub_start_stamp;
 
   /**
    * If set: affects the backend & scrubber-backend functions called after all

@@ -2382,6 +2382,7 @@ struct pg_stat_t {
   utime_t last_scrub_stamp;
   utime_t last_deep_scrub_stamp;
   utime_t last_clean_scrub_stamp;
+  utime_t last_deep_scrub_start_stamp; ///< when the last deep scrub started
   int32_t last_scrub_duration{0};
 
   object_stat_collection_t stats;
@@ -2973,6 +2974,7 @@ struct pg_history_t {
   utime_t last_scrub_stamp;
   utime_t last_deep_scrub_stamp;
   utime_t last_clean_scrub_stamp;
+  utime_t last_deep_scrub_start_stamp; ///< when the last deep scrub started
 
   /// upper bound on how long prior interval readable (relative to encode time)
   ceph::timespan prior_readable_until_ub = ceph::timespan::zero();
@@ -2995,6 +2997,7 @@ struct pg_history_t {
       l.last_scrub_stamp == r.last_scrub_stamp &&
       l.last_deep_scrub_stamp == r.last_deep_scrub_stamp &&
       l.last_clean_scrub_stamp == r.last_clean_scrub_stamp &&
+      l.last_deep_scrub_start_stamp == r.last_deep_scrub_start_stamp &&
       l.prior_readable_until_ub == r.prior_readable_until_ub;
   }
 
@@ -3007,7 +3010,8 @@ struct pg_history_t {
       same_primary_since(created),
       last_scrub_stamp(stamp),
       last_deep_scrub_stamp(stamp),
-      last_clean_scrub_stamp(stamp) {}
+      last_clean_scrub_stamp(stamp),
+      last_deep_scrub_start_stamp(stamp) {}
   
   bool merge(const pg_history_t &other) {
     // Here, we only update the fields which cannot be calculated from the OSDmap.
@@ -3067,8 +3071,14 @@ struct pg_history_t {
       last_deep_scrub = other.last_deep_scrub;
       modified = true;
     }
+    // the start stamp goes along with the completion one
     if (other.last_deep_scrub_stamp > last_deep_scrub_stamp) {
       last_deep_scrub_stamp = other.last_deep_scrub_stamp;
+      last_deep_scrub_start_stamp = other.last_deep_scrub_start_stamp;
+      modified = true;
+    } else if (other.last_deep_scrub_stamp == last_deep_scrub_stamp &&
+	       other.last_deep_scrub_start_stamp > last_deep_scrub_start_stamp) {
+      last_deep_scrub_start_stamp = other.last_deep_scrub_start_stamp;
       modified = true;
     }
     if (other.last_clean_scrub_stamp > last_clean_scrub_stamp) {

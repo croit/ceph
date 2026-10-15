@@ -2987,6 +2987,7 @@ void pg_stat_t::dump(Formatter *f) const
   f->dump_stream("last_scrub_stamp") << last_scrub_stamp;
   f->dump_stream("last_deep_scrub") << last_deep_scrub;
   f->dump_stream("last_deep_scrub_stamp") << last_deep_scrub_stamp;
+  f->dump_stream("last_deep_scrub_start_stamp") << last_deep_scrub_start_stamp;
   f->dump_stream("last_clean_scrub_stamp") << last_clean_scrub_stamp;
   f->dump_int("objects_scrubbed", objects_scrubbed);
   f->dump_int("log_size", log_size);
@@ -3118,7 +3119,7 @@ bool operator==(const pg_scrubbing_status_t& l, const pg_scrubbing_status_t& r)
 
 void pg_stat_t::encode(ceph::buffer::list &bl) const
 {
-  ENCODE_START(31, 22, bl);
+  ENCODE_START(32, 22, bl);
   encode(version, bl);
   encode(reported_seq, bl);
   encode(reported_epoch, bl);
@@ -3182,6 +3183,7 @@ void pg_stat_t::encode(ceph::buffer::list &bl) const
   encode(scrub_sched_status.m_ordinal_of_requested_replica, bl);
   encode(scrub_sched_status.m_num_to_reserve, bl);
   encode(last_degraded, bl);
+  encode(last_deep_scrub_start_stamp, bl);
 
   ENCODE_FINISH(bl);
 }
@@ -3190,7 +3192,7 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
 {
   bool tmp;
   uint32_t old_state;
-  DECODE_START(31, bl);
+  DECODE_START(32, bl);
   decode(version, bl);
   decode(reported_seq, bl);
   decode(reported_epoch, bl);
@@ -3297,6 +3299,11 @@ void pg_stat_t::decode(ceph::buffer::list::const_iterator &bl)
     } else {
       last_degraded = last_clean;
     }
+    if (struct_v >= 32) {
+      decode(last_deep_scrub_start_stamp, bl);
+    } else {
+      last_deep_scrub_start_stamp = utime_t();
+    }
   }
   DECODE_FINISH(bl);
 }
@@ -3332,6 +3339,7 @@ list<pg_stat_t> pg_stat_t::generate_test_instances()
   a.last_deep_scrub = eversion_t(13, 14);
   a.last_deep_scrub_stamp = utime_t(15, 16);
   a.last_clean_scrub_stamp = utime_t(17, 18);
+  a.last_deep_scrub_start_stamp = utime_t(14, 15);
   a.last_scrub_duration = 3617;
   a.scrub_duration = 0.003;
   a.snaptrimq_len = 1048576;
@@ -3391,6 +3399,7 @@ bool operator==(const pg_stat_t& l, const pg_stat_t& r)
     l.last_scrub_stamp == r.last_scrub_stamp &&
     l.last_deep_scrub_stamp == r.last_deep_scrub_stamp &&
     l.last_clean_scrub_stamp == r.last_clean_scrub_stamp &&
+    l.last_deep_scrub_start_stamp == r.last_deep_scrub_start_stamp &&
     l.stats == r.stats &&
     l.stats_invalid == r.stats_invalid &&
     l.log_size == r.log_size &&
@@ -3599,7 +3608,7 @@ list<pool_stat_t> pool_stat_t::generate_test_instances()
 
 void pg_history_t::encode(ceph::buffer::list &bl) const
 {
-  ENCODE_START(10, 4, bl);
+  ENCODE_START(11, 4, bl);
   encode(epoch_created, bl);
   encode(last_epoch_started, bl);
   encode(last_epoch_clean, bl);
@@ -3617,12 +3626,13 @@ void pg_history_t::encode(ceph::buffer::list &bl) const
   encode(last_interval_clean, bl);
   encode(epoch_pool_created, bl);
   encode(prior_readable_until_ub, bl);
+  encode(last_deep_scrub_start_stamp, bl);
   ENCODE_FINISH(bl);
 }
 
 void pg_history_t::decode(ceph::buffer::list::const_iterator &bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(10, 4, 4, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(11, 4, 4, bl);
   decode(epoch_created, bl);
   decode(last_epoch_started, bl);
   if (struct_v >= 3)
@@ -3670,6 +3680,11 @@ void pg_history_t::decode(ceph::buffer::list::const_iterator &bl)
   if (struct_v >= 10) {
     decode(prior_readable_until_ub, bl);
   }
+  if (struct_v >= 11) {
+    decode(last_deep_scrub_start_stamp, bl);
+  } else {
+    last_deep_scrub_start_stamp = utime_t();
+  }
   DECODE_FINISH(bl);
 }
 
@@ -3690,6 +3705,7 @@ void pg_history_t::dump(Formatter *f) const
   f->dump_stream("last_scrub_stamp") << last_scrub_stamp;
   f->dump_stream("last_deep_scrub") << last_deep_scrub;
   f->dump_stream("last_deep_scrub_stamp") << last_deep_scrub_stamp;
+  f->dump_stream("last_deep_scrub_start_stamp") << last_deep_scrub_start_stamp;
   f->dump_stream("last_clean_scrub_stamp") << last_clean_scrub_stamp;
   f->dump_float(
     "prior_readable_until_ub",
@@ -3718,6 +3734,7 @@ list<pg_history_t> pg_history_t::generate_test_instances()
   o.back().last_deep_scrub_stamp = utime_t(14, 15);
   o.back().last_clean_scrub_stamp = utime_t(16, 17);
   o.back().last_epoch_marked_full = 18;
+  o.back().last_deep_scrub_start_stamp = utime_t(13, 14);
   return o;
 }
 

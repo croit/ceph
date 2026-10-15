@@ -728,9 +728,12 @@ sc::result WaitDigestUpdate::react(const ScrubFinished&)
 
   session.m_osd_counters->inc(session.m_counters_idx->successful_cnt);
 
-  // set the 'scrub duration'
+  // set the 'scrub duration' and start stamp
   auto duration = machine.get_time_scrubbing();
   scrbr->set_scrub_duration(ceil<milliseconds>(duration));
+  scrbr->set_scrub_start_stamp(
+    machine.m_session_started_at ? utime_t(*machine.m_session_started_at)
+				 : utime_t());
   machine.m_session_started_at.reset();
   session.m_osd_counters->tinc(
       session.m_counters_idx->successful_elapsed, duration);

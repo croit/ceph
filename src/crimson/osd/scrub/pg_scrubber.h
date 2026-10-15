@@ -35,6 +35,9 @@ class PGScrubber : public crimson::BlockerT<PGScrubber>, ScrubContext {
 
   PG &pg;
 
+  /// the time the ongoing scrub has started at
+  utime_t scrub_start_stamp;
+
   /// PG alias for logging in header functions
   DoutPrefixProvider &dpp;
 
