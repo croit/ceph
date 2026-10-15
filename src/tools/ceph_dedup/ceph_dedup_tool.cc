@@ -105,7 +105,7 @@ po::options_description make_usage() {
     ("help,h", ": produce help message")
     ("op estimate --pool <POOL> --chunk-size <CHUNK_SIZE> --chunk-algorithm <ALGO> --fingerprint-algorithm <FP_ALGO>", 
      ": estimate how many chunks are redundant")
-    ("op search-dups --pool <POOL> [--dedup-shards <SHARDS>] [--newer-than <SECONDS> | --since-last-scrub] [--prune-older-than <SECONDS>]",
+    ("op search-dups --pool <POOL> [--dedup-shards <SHARDS>] [--dedup-batch-size <RECORDS>] [--dedup-parallel-osds <OSDS>] [--newer-than <SECONDS> | --since-last-scrub] [--prune-older-than <SECONDS>]",
       ": search for duplicate objects using content digests collected by OSDs during deep scrub")
     ("op chunk-scrub --chunk-pool <POOL>",
      ": perform chunk scrub")
@@ -143,6 +143,8 @@ po::options_description make_usage() {
     ("source-length", po::value<uint64_t>(), ": set source length")
     ("dedup-cdc-chunk-size", po::value<unsigned int>(), ": set dedup chunk size for cdc")
     ("dedup-shards", po::value<unsigned>()->default_value(16), ": number of digest shards to split duplicates search into, must be a power of 2")
+    ("dedup-batch-size", po::value<uint32_t>()->default_value(1000), ": max digests to retrieve from an OSD per request; memory used per search thread is proportional to this times OSD count")
+    ("dedup-parallel-osds", po::value<unsigned>()->default_value(4), ": number of OSDs to query in parallel by every search thread")
     ("newer-than", po::value<uint32_t>()->default_value(0), ": ignore digests collected more than given amount of seconds ago")
     ("prune-older-than", po::value<uint32_t>()->default_value(0), ": remove digests collected more than given amount of seconds ago")
     ("since-last-scrub", ": use only digests collected by the last deep scrub of every PG")
@@ -262,6 +264,8 @@ struct dedup_pg_cutoffs_t {
 class SearchForDuplicates : public CrawlerThread
 {
   unsigned shard_count;
+  uint32_t batch_size;     // max records to retrieve from an OSD per request
+  unsigned parallel_osds;  // OSDs to query in parallel
   uint32_t newer_than;
   uint32_t prune_older_than;
   const dedup_pg_cutoffs_t* pg_cutoffs;
@@ -278,10 +282,13 @@ class SearchForDuplicates : public CrawlerThread
 public:
   SearchForDuplicates(
     IoCtx& io_ctx, int n, int m, int32_t report_period,
-    unsigned shard_count, uint32_t newer_than, uint32_t prune_older_than,
+    unsigned shard_count, uint32_t batch_size, unsigned parallel_osds,
+    uint32_t newer_than, uint32_t prune_older_than,
     const dedup_pg_cutoffs_t* pg_cutoffs) :
     CrawlerThread(io_ctx, n, m, ObjectCursor(), ObjectCursor(), report_period, 0, 0),
     shard_count(shard_count),
+    batch_size(batch_size),
+    parallel_osds(parallel_osds),
     newer_than(newer_than),
     prune_older_than(prune_older_than),
     pg_cutoffs(pg_cutoffs) {
@@ -490,15 +497,16 @@ void SearchForDuplicates::process_shard(unsigned shard)
     groups.emplace_back(digest, objs);
   };
   while (!io_ctx.dedup_candidate_list_is_end(c) && !m_stop) {
-    // Query up to 4 OSDs in parallel, 1000 records from each. Choose the
-    // ones holding back merging, i.e. having the lowest last digests
-    // delivered, to keep the amount of records buffered by merger low.
-    auto targets = merger.next_targets(4);
+    // Query up to parallel_osds OSDs in parallel, up to batch_size records
+    // from each. Choose the ones holding back merging, i.e. having
+    // the lowest last digests delivered, to keep the amount of records
+    // buffered by merger low.
+    auto targets = merger.next_targets(parallel_osds);
     if (targets.empty()) {
       break; // shouldn't happen as merger tracks the same OSDs as cursor
     }
     std::vector<DedupItemBatch> batches;
-    r = io_ctx.dedup_candidate_list(c, targets, 1000, &batches,
+    r = io_ctx.dedup_candidate_list(c, targets, batch_size, &batches,
 				    newer_than, prune_older_than);
     if (r < 0) {
       std::lock_guard l{glock};
@@ -948,6 +956,8 @@ int search_dups(const po::variables_map& opts)
   unsigned max_thread = get_opts_max_thread(opts);
   uint32_t report_period = get_opts_report_period(opts);
   unsigned shard_count = opts["dedup-shards"].as<unsigned>();
+  uint32_t batch_size = opts["dedup-batch-size"].as<uint32_t>();
+  unsigned parallel_osds = opts["dedup-parallel-osds"].as<unsigned>();
   uint32_t newer_than = opts["newer-than"].as<uint32_t>();
   uint32_t prune_older_than = opts["prune-older-than"].as<uint32_t>();
   bool since_last_scrub = opts.count("since-last-scrub");
@@ -966,6 +976,14 @@ int search_dups(const po::variables_map& opts)
   }
   if (shard_count == 0 || (shard_count & (shard_count - 1)) != 0) {
     std::cerr << "dedup-shards should be a power of 2" << std::endl;
+    return 1;
+  }
+  if (batch_size == 0) {
+    std::cerr << "dedup-batch-size should be positive" << std::endl;
+    return 1;
+  }
+  if (parallel_osds == 0) {
+    std::cerr << "dedup-parallel-osds should be positive" << std::endl;
     return 1;
   }
   pool_name = get_opts_pool_name(opts);
@@ -1014,7 +1032,8 @@ int search_dups(const po::variables_map& opts)
   for (unsigned i = 0; i < max_thread; i++) {
     std::unique_ptr<CrawlerThread> ptr(
       new SearchForDuplicates(io_ctx, i, max_thread,
-	report_period, shard_count, newer_than, prune_older_than,
+	report_period, shard_count, batch_size, parallel_osds,
+	newer_than, prune_older_than,
 	since_last_scrub ? &pg_cutoffs : nullptr));
     ptr->set_debug(debug);
     ptr->create("search_thread");
