@@ -1261,6 +1261,22 @@ inline namespace v14_2_0 {
       uint32_t newer_than = 0,
       uint32_t prune_older_than = 0);
 
+    /**
+     * Same as above but queries the specified OSDs (out of
+     * cursor.get_osds()) in parallel rather than choosing them in a
+     * round-robin manner, e.g. the ones a merging algorithm needs records
+     * from. Completed OSDs are skipped.
+     *
+     * @returns number of records retrieved or negative error code,
+     *   -EINVAL if an OSD isn't the cursor's one
+     */
+    int dedup_candidate_list(DedupItemCursor& cursor,
+      const std::vector<int>& osds,
+      const size_t per_target_max_items,
+      std::vector<DedupItemBatch>* result,
+      uint32_t newer_than = 0,
+      uint32_t prune_older_than = 0);
+
     /// true if there is nothing more to list for the cursor
     bool dedup_candidate_list_is_end(const DedupItemCursor& cursor);
 

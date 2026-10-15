@@ -43,6 +43,7 @@
 #include <map>
 #include <set>
 #include <vector>
+#include <algorithm>
 #include <bit>
 #include <limits>
 #include <list>
@@ -1996,12 +1997,52 @@ int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
   uint32_t prune_older_than)
 {
   ceph_assert(result != nullptr);
-  if (max_targets == 0 || per_target_max_items == 0 ||
-      per_target_max_items > std::numeric_limits<uint32_t>::max()) {
+  if (max_targets == 0) {
     return -EINVAL;
   }
   if (cursor.is_end()) {
     return 0;
+  }
+  // pick up to max_targets incomplete OSDs in a round-robin manner
+  std::vector<int> osds;
+  const size_t num_targets = cursor.osds.size();
+  size_t t = cursor.next_target % num_targets;
+  for (size_t i = 0; i < num_targets && osds.size() < max_targets; ++i) {
+    if (!cursor.completed[t]) {
+      osds.push_back(cursor.osds[t]);
+    }
+    t = (t + 1) % num_targets;
+  }
+  cursor.next_target = t;
+  return dedup_candidate_list(cursor, osds, per_target_max_items, result,
+			      newer_than, prune_older_than);
+}
+
+int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
+  const std::vector<int>& osds,
+  const size_t per_target_max_items,
+  std::vector<DedupItemBatch>* result,
+  uint32_t newer_than,
+  uint32_t prune_older_than)
+{
+  ceph_assert(result != nullptr);
+  if (per_target_max_items == 0 ||
+      per_target_max_items > std::numeric_limits<uint32_t>::max()) {
+    return -EINVAL;
+  }
+  // map OSDs to cursor's targets, cursor.osds are sorted
+  std::vector<size_t> targets;
+  targets.reserve(osds.size());
+  for (int osd : osds) {
+    auto it = std::lower_bound(cursor.osds.begin(), cursor.osds.end(), osd);
+    if (it == cursor.osds.end() || *it != osd) {
+      return -EINVAL;
+    }
+    size_t t = it - cursor.osds.begin();
+    if (!cursor.completed[t] &&
+	std::find(targets.begin(), targets.end(), t) == targets.end()) {
+      targets.push_back(t);
+    }
   }
   using waiter_t = ceph::async::waiter<boost::system::error_code,
 				       std::vector<librados::DedupItemImpl>,
@@ -2009,27 +2050,19 @@ int librados::IoCtx::dedup_candidate_list(DedupItemCursor& cursor,
 				       std::string>;
   // <target index, waiter>
   std::vector<std::pair<size_t, std::unique_ptr<waiter_t>>> in_flight;
-
-  // pick up to max_targets incomplete OSDs in a round-robin manner
-  const size_t num_targets = cursor.osds.size();
-  size_t t = cursor.next_target % num_targets;
-  for (size_t i = 0; i < num_targets && in_flight.size() < max_targets; ++i) {
-    if (!cursor.completed[t]) {
-      auto& w = in_flight.emplace_back(t, std::make_unique<waiter_t>()).second;
-      io_ctx_impl->objecter->enumerate_dedup_items<librados::DedupItemImpl>(
-	io_ctx_impl->poolid,
-	cursor.osds[t],
-	cursor.shard,
-	cursor.shard_bits,
-	cursor.positions[t],
-	per_target_max_items,
-	newer_than,
-	prune_older_than,
-	*w);
-    }
-    t = (t + 1) % num_targets;
+  for (size_t t : targets) {
+    auto& w = in_flight.emplace_back(t, std::make_unique<waiter_t>()).second;
+    io_ctx_impl->objecter->enumerate_dedup_items<librados::DedupItemImpl>(
+      io_ctx_impl->poolid,
+      cursor.osds[t],
+      cursor.shard,
+      cursor.shard_bits,
+      cursor.positions[t],
+      per_target_max_items,
+      newer_than,
+      prune_older_than,
+      *w);
   }
-  cursor.next_target = t;
 
   // wait for all the submitted requests, even if some of them fail
   int r = 0;
