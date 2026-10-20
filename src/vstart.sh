@@ -141,7 +141,9 @@ fi
 [ -z "$CEPH_CONF_PATH" ] && CEPH_CONF_PATH=$CEPH_DIR
 CEPH_OUT_CLIENT_DIR=${CEPH_OUT_CLIENT_DIR:-$CEPH_OUT_DIR}
 
-if [ $CEPH_NUM_OSD -gt 3 ]; then
+# OSD=0 means OSDs are added outside vstart, so their count is unknown: use
+# Ceph's own default of 3 rather than a pool size of 0.
+if [ $CEPH_NUM_OSD -gt 3 ] || [ $CEPH_NUM_OSD -eq 0 ]; then
     OSD_POOL_DEFAULT_SIZE=3
 else
     OSD_POOL_DEFAULT_SIZE=$CEPH_NUM_OSD
