@@ -18,6 +18,33 @@ log = logging.getLogger(__name__)
 class TestMisc(CephFSTestCase):
     CLIENTS_REQUIRED = 2
 
+    def test_create_with_async_dirops_disabled(self):
+        """Disabling async dirops must preserve the negotiated create reply."""
+        for mount in (self.mount_a, self.mount_b):
+            session = self.get_session(mount.get_global_id())
+            features = session['client_metadata']['client_features']['feature_bits']
+            if not int(features, 16) & (1 << 13):  # CEPHFS_FEATURE_DELEG_INO
+                self.skipTest("Require clients supporting delegated inodes")
+
+        option = 'mds_allow_async_dirops'
+        original = self.fs.mds_asok(['config', 'get', option])[option]
+        try:
+            self.fs.mds_asok(['config', 'set', option, 'true'])
+            self.mount_a.run_shell(['touch', 'async_enabled'], timeout=30)
+
+            self.fs.mds_asok(['config', 'set', option, 'false'])
+            # Exercise both a fresh session and a session opened before the
+            # change. Neither may receive the legacy create-reply encoding.
+            self.mount_b.umount_wait()
+            self.mount_b.mount_wait()
+            self.mount_b.run_shell(['touch', 'async_disabled_fresh'], timeout=30)
+            self.mount_a.run_shell(['touch', 'async_disabled_existing'], timeout=30)
+
+            self.fs.mds_asok(['config', 'set', option, 'true'])
+            self.mount_a.run_shell(['touch', 'async_reenabled'], timeout=30)
+        finally:
+            self.fs.mds_asok(['config', 'set', option, str(original).lower()])
+
     def test_statfs_on_deleted_fs(self):
         """
         That statfs does not cause monitors to SIGSEGV after fs deletion.
