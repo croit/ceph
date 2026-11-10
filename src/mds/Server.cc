@@ -2505,13 +2505,14 @@ void Server::set_reply_extra_bl(const cref_t<MClientRequest> &req, inodeno_t ino
 {
   Session *session = mds->get_session(req);
 
-  if (mds_allow_async_dirops && session->info.has_feature(CEPHFS_FEATURE_DELEG_INO)) {
+  if (session->info.has_feature(CEPHFS_FEATURE_DELEG_INO)) {
     openc_response_t ocresp;
 
     dout(10) << "adding created_ino and delegated_inos" << dendl;
     ocresp.created_ino = ino;
 
-    if (delegate_inos_pct && !req->is_queued_for_replay()) {
+    if (mds_allow_async_dirops && delegate_inos_pct &&
+        !req->is_queued_for_replay()) {
       // Try to delegate some prealloc_inos to the client, if it's down to half the max
       unsigned frac = 100 / delegate_inos_pct;
       if (session->delegated_inos.size() < (unsigned)g_conf()->mds_client_prealloc_inos / frac / 2)
