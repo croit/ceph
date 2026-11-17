@@ -342,6 +342,14 @@ void MDSDaemon::set_up_admin_socket()
 				     ,asok_hook
 				     ,"lock a path");
   ceph_assert(r == 0);
+  r = admin_socket->register_command("unlink_hold_cap_deferral"
+                                     " name=action,type=CephChoices,strings="
+                                     "status|arm_unlink_hold|release_unlink_hold|"
+                                     "arm_defer_caps|release_defer_caps|clear_events"
+                                     " name=arg,type=CephString,req=false"
+				     ,asok_hook
+				     ,"hold a named unlink after it took its locks, or defer one client's cap messages (testing only)");
+  ceph_assert(r == 0);
   r = admin_socket->register_command("cache status",
                                      asok_hook,
                                      "show cache status");

@@ -20,6 +20,7 @@
 #include "events/EOpen.h"
 #include "events/EUpdate.h"
 #include "Locker.h"
+#include "UnlinkHoldAndCapDeferral.h"
 #include "MDBalancer.h"
 #include "MDCache.h"
 #include "MDLog.h"
@@ -3146,6 +3147,8 @@ bool Locker::should_defer_client_cap_frozen(CInode *in)
 
 void Locker::handle_client_caps(const cref_t<MClientCaps> &m)
 {
+  if (unlink_hold_cap_deferral::maybe_defer_caps(m))
+    return;
   client_t client = m->get_source().num();
   snapid_t follows = m->get_snap_follows();
   auto op = m->get_op();
@@ -4018,6 +4021,8 @@ bool Locker::_do_cap_update(CInode *in, Capability *cap,
 
 void Locker::handle_client_cap_release(const cref_t<MClientCapRelease> &m)
 {
+  if (unlink_hold_cap_deferral::maybe_defer_caps(m))
+    return;
   client_t client = m->get_source().num();
   dout(10) << "handle_client_cap_release " << *m << dendl;
 
