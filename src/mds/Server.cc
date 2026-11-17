@@ -20,6 +20,7 @@
 #include <boost/range/adaptor/reversed.hpp>
 
 #include "MDSRank.h"
+#include "UnlinkHoldAndCapDeferral.h"
 #include "Server.h"
 #include "Locker.h"
 #include "MDCache.h"
@@ -8116,6 +8117,8 @@ void Server::handle_client_unlink(MDRequestRef& mdr)
       return;
 
     mdr->locking_state |= MutationImpl::ALL_LOCKED;
+    if (unlink_hold_cap_deferral::maybe_hold_unlink(mdr, dn->get_name()))
+      return;
   }
 
   if (in->is_dir() &&

@@ -42,6 +42,7 @@
 
 
 #include "MDSRank.h"
+#include "UnlinkHoldAndCapDeferral.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -2936,6 +2937,12 @@ void MDSRankDispatcher::handle_asok_command(
     mdcache->cache_status(f);
   } else if (command == "lock path") {
     r = command_lock_path(f, cmdmap, *css);
+  } else if (command == "unlink_hold_cap_deferral") {
+    std::string action, arg;
+    cmd_getval(cmdmap, "action", action);
+    cmd_getval(cmdmap, "arg", arg);
+    std::lock_guard l(mds_lock);
+    r = unlink_hold_cap_deferral::command(this, action, arg, f, *css);
   } else if (command == "dump tree") {
     command_dump_tree(cmdmap, *css, f);
   } else if (command == "dump loads") {
