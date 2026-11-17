@@ -10,6 +10,10 @@ modes (see README.md):
   toggle    borrow, then mds_allow_async_dirops=false after the cycle formed
   direct    a different (libcephfs) client unlinks, kernel cap acks deferred;
             documents the variant that does not form a cycle
+  restart   kernel client first builds real lock caches; then
+            mds_allow_async_dirops=false is set persistently (ceph config set),
+            the MDS is failed/respawned, and the borrow schedule is run
+            (REPRO_CONFIG_WHO selects the config section, default mds)
 
 Actors (each a separate CephFS client session):
   H  libcephfs  unlinks /e/h (hard link to F); held after taking F.snap X
@@ -33,7 +37,7 @@ import cluster  # noqa: E402
 
 arm = Path(sys.argv[1]).resolve()
 mode = sys.argv[2]
-assert mode in ('borrow', 'prevent', 'toggle', 'direct'), mode
+assert mode in ('borrow', 'prevent', 'toggle', 'direct', 'restart'), mode
 env = cluster.arm_env(arm)
 if os.environ.get('REPRO_REEXEC') != '1':
     env['REPRO_REEXEC'] = '1'
@@ -178,6 +182,8 @@ setup.close(fd)
 setup.link('/d/f', '/e/h')
 fd = setup.open('/d/x1', 'w', 0o644)   # unlinked by the kernel client in step 3
 setup.close(fd)
+fd = setup.open('/d/x0', 'w', 0o644)   # restart mode: builds a lock cache first
+setup.close(fd)
 D_ino = setup.stat('/d').st_ino
 F_ino = setup.stat('/d/f').st_ino
 setup.unmount()
@@ -197,6 +203,81 @@ os.stat(mnt / 'd' / 'x1')
 kc = kernel_session_id()
 log('kernel client id %d' % kc)
 
+
+
+def dir_op_caps(client_id):
+    """DIR_CREATE (Fc) / DIR_UNLINK (Fr) bits issued to a client on D."""
+    caps = {c['client_id']: c['issued'] for c in asok('dump', 'inode', str(D_ino))['client_caps']}
+    issued = caps.get(client_id, '')
+    fbits = issued.split('F', 1)[1] if 'F' in issued else ''
+    return issued, [b for b in 'cr' if b in fbits]
+
+
+def mds_log_count(needle, after_respawn=False):
+    """Count MDS log lines containing needle.  With after_respawn, only lines
+    written by the respawned process count: everything after the last
+    'respawning with exe' marker, excluding the '-NNN>' recent-event dump."""
+    import re
+    with open(arm / 'out/mds.a.log', errors='replace') as f:
+        lines = f.readlines()
+    if after_respawn:
+        marks = [i for i, line in enumerate(lines) if 'respawning with exe' in line]
+        lines = lines[marks[-1] + 1:] if marks else []
+    dump = re.compile(r'^\s*-?\d+>')
+    return sum(1 for line in lines if needle in line and not dump.match(line))
+
+
+restart_info = None
+if mode == 'restart':
+    # a. with async dirops on, the kernel client builds real lock caches
+    with open(mnt / 'd' / 'w0', 'w') as f:      # create -> CREATE lock cache
+        f.write('x')
+    os.unlink(mnt / 'd' / 'x0')                 # unlink -> UNLINK lock cache
+    time.sleep(1)
+    before = dir_op_caps(kc)
+    created_before = mds_log_count('create_lock_cache for client.%d/' % kc)
+    log('before restart: kernel caps on D %s dir-op bits %s, lock caches created %d'
+        % (before[0], before[1], created_before))
+    if not created_before or not before[1]:
+        raise RuntimeError('precondition failed: no kernel lock cache / dir-op caps')
+    snapshot('r0-before-restart')
+    # b. persistent setting via the monitors, then fail the MDS (it respawns,
+    #    replays the journal and clients reconnect)
+    who = os.environ.get('REPRO_CONFIG_WHO', 'mds')   # e.g. mds or global
+    run([ceph, 'config', 'set', who, 'mds_allow_async_dirops', 'false'])
+    log('ceph config set %s mds_allow_async_dirops false' % who)
+    old_pid = [p for p, exe in cluster.owned_processes(arm) if exe.endswith('ceph-mds')]
+    run([ceph, 'mds', 'fail', 'a'])
+    log('ceph mds fail a (pid %s)' % old_pid)
+
+    def mds_active():
+        try:
+            st = json.loads(run([ceph, 'fs', 'status', '-f', 'json'], check=False) or '{}')
+            ranks = [m for m in st.get('mdsmap', []) if m.get('rank') == 0]
+            return bool(ranks) and ranks[0].get('state') == 'active' and \
+                asok('status')['state'] == 'up:active'
+        except Exception:
+            return False
+    wait_for('MDS active again after fail', mds_active, timeout=180)
+    wait_for('kernel client reconnected',
+             lambda: any(s['id'] == kc and s['state'] == 'open'
+                         for s in asok('session', 'ls')), timeout=120)
+    os.listdir(mnt / 'd')
+    os.stat(mnt / 'd' / 'f')
+    os.stat(mnt / 'd' / 'x1')
+    time.sleep(1)
+    got = asok('config', 'get', 'mds_allow_async_dirops')['mds_allow_async_dirops']
+    after = dir_op_caps(kc)
+    log('after restart: option %s, kernel caps on D %s dir-op bits %s' % (got, after[0], after[1]))
+    if got != 'false':
+        raise RuntimeError('option not false after restart: %r' % got)
+    restart_info = {'config_who': who,
+                    'kernel_caps_before': before[0], 'dir_op_bits_before': before[1],
+                    'lock_caches_created_before': created_before,
+                    'option_after_restart': got, 'kernel_caps_after': after[0],
+                    'dir_op_bits_after': after[1]}
+    snapshot('r1-after-restart')
+
 H, L, U, G = (client(r) for r in ('H', 'L', 'U', 'G'))
 hid, lid, uid, gid = (session_id(r) for r in ('H', 'L', 'U', 'G'))
 log('client ids H=%d L=%d U=%d G=%d K=%d' % (hid, lid, uid, gid, kc))
@@ -205,7 +286,7 @@ log('mds_allow_async_dirops at start: %s' % asok('config', 'get', 'mds_allow_asy
 snapshot('00-initial')
 
 # ---------------------------------------------------------------- schedule
-borrow = mode in ('borrow', 'prevent', 'toggle')
+borrow = mode in ('borrow', 'prevent', 'toggle', 'restart')
 if mode == 'direct':
     U.stat('/d/f')             # libcephfs U unlinks without a fresh lookup
 
@@ -305,6 +386,12 @@ if mode == 'toggle':
     snapshot('06-after-toggle')
     result['pending_after_toggle'] = pending
     result['released_by_toggle'] = result['deadlock_before_toggle'] and not pending
+if restart_info is not None:
+    restart_info['lock_caches_created_after_restart'] = mds_log_count(
+        'create_lock_cache for client.', after_respawn=True)
+    restart_info['lock_cache_attach_after_restart'] = mds_log_count(
+        'found lock cache for', after_respawn=True)
+    result['restart'] = restart_info
 for t in (th, tl, tu, tg):
     result[t.name] = {'returned': bool(t.done_at), 'error': t.error}
 (ev / 'result.json').write_text(json.dumps(result, indent=2) + '\n')

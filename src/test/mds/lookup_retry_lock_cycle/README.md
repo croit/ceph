@@ -47,6 +47,7 @@ N X           -> waits for L's N RD
 | `prevent` | `mds_allow_async_dirops=false` (admin socket, verified) before the kernel unlinks | no lock cache; everything completes |
 | `toggle` | as `borrow`, then `mds_allow_async_dirops=false` after the cycle formed | stays blocked (no wakeup) |
 | `direct` | U is a different (libcephfs) client and the kernel's cap acks are deferred | completes: see the notes below |
+| `restart` | kernel client first builds lock caches; then `ceph config set <REPRO_CONFIG_WHO, default mds> mds_allow_async_dirops false`, `ceph mds fail`, then the `borrow` schedule | without the startup fix: deadlock; with it: completes |
 
 ## Usage (root, kernel `ceph` module available)
 
@@ -75,6 +76,20 @@ step. The MDS log is `<arm>/out/mds.a.log` (`debug mds = 20`).
 
 Final D state in `borrow`: `ifile excl->sync w=1`, `inest lock w=1`,
 `isnap sync` with readers.
+
+Restart runs (option persisted as false, MDS failed and respawned; the MDS log
+shows `set_mon_vals mds_allow_async_dirops = false` after the respawn):
+
+| MDS | Config section | Lock caches created / borrowed after respawn | Outcome |
+| --- | --- | --- | --- |
+| without the Server startup fix | `mds` | 1 / 1 | **deadlock** |
+| without the Server startup fix | `global` | 1 / 1 | **deadlock** |
+| with "mds: initialize mds_allow_async_dirops from config at startup" | `mds` | 0 / 0 | all completed |
+
+`Server::mds_allow_async_dirops` defaults to `true` and was only updated by
+`handle_conf_change()`. A freshly started or failed-over MDS therefore kept
+creating lock caches even though `config get` reported `false`. Setting the
+same value again does not help (`(no change)`, so no notification).
 
 ## Notes and limits
 
