@@ -269,6 +269,7 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
   max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
   delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
+  mds_allow_async_dirops = g_conf().get_val<bool>("mds_allow_async_dirops");
   max_caps_per_client = g_conf().get_val<uint64_t>("mds_max_caps_per_client");
   cap_acquisition_throttle = g_conf().get_val<uint64_t>("mds_session_cap_acquisition_throttle");
   max_caps_throttle_ratio = g_conf().get_val<double>("mds_session_max_caps_throttle_ratio");
