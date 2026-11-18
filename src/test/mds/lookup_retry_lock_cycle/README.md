@@ -25,8 +25,14 @@ client session:
 | H | libcephfs | unlink `/e/h` (hard link to F) | takes F.snap X; parked by `unlink_hold_cap_deferral arm_unlink_hold h` |
 | L | libcephfs | lookup `/d/f` | takes dentry N RD, waits on F.snap RD |
 | K | kernel, `nowsync` | first unlink in `/d` (sync) | MDS creates an UNLINK lock cache on D, issues DIR_UNLINK |
-| U | same kernel client | unlink `/d/f` (async) | attaches to the lock cache (borrows D.file/D.nest WR), waits on N X |
+| U | same kernel client | unlink `/d/f` | attaches to the lock cache (borrows D.file/D.nest WR), waits on N X |
 | G | libcephfs | getattr/lookup of `/d` | starts the D.file transition to sync and invalidates lock caches |
+| X | libcephfs | create `/d/x2` (`noloner`, `evict`, `failover` only) | forces D.file EXCL->LOCK and drops the kernel loner |
+
+The MDS attaches every create/unlink of the lock cache's owner in that
+directory to the cache, whether the client sent it asynchronously or not. In
+these runs U's `unlink()` call blocks, so the kernel sent it synchronously;
+the cycle needs the lock cache, not an asynchronous request.
 
 Then H is released. F.snap X drops and L retries. Because U keeps the lock
 cache alive, D.file is still *cached*, so L requests D.file WR and waits while
@@ -48,6 +54,9 @@ N X           -> waits for L's N RD
 | `toggle` | as `borrow`, then `mds_allow_async_dirops=false` after the cycle formed | stays blocked (no wakeup) |
 | `direct` | U is a different (libcephfs) client and the kernel's cap acks are deferred | completes: see the notes below |
 | `restart` | kernel client first builds lock caches; then `ceph config set <REPRO_CONFIG_WHO, default mds> mds_allow_async_dirops false`, `ceph mds fail`, then the `borrow` schedule | without the startup fix: deadlock; with it: completes |
+| `noloner` | as `borrow`, but X creates a file in D first (no loner) and the getattr comes from the kernel client itself | deadlock in the no-loner state (`lock->sync`) |
+| `evict` | `noloner`, then evict X, then evict the kernel client | see the results below |
+| `failover` | `noloner`, then `ceph mds fail` | whether the respawned MDS completes the blocked requests (not run yet) |
 
 ## Usage (root, kernel `ceph` module available)
 
@@ -77,6 +86,15 @@ step. The MDS log is `<arm>/out/mds.a.log` (`debug mds = 20`).
 Final D state in `borrow`: `ifile excl->sync w=1`, `inest lock w=1`,
 `isnap sync` with readers.
 
+`noloner` (2026-11-17): deadlock; final D state `ifile lock->sync w=1`,
+`inest lock w=1`, no loner, every client holding `pAsLsXs` on D, and the
+blocked getattr comes from the same client as the blocked unlink.
+
+`evict` (2026-11-17): evicting X does not release anything. Evicting the
+kernel client that owns the borrowed lock cache aborts the MDS with
+`FAILED ceph_assert(!mdr->is_batch_head())` (`Server.cc`, reached from
+`C_MDL_DropCache` -> `drop_locks`), so eviction is not a safe way out.
+
 Restart runs (option persisted as false, MDS failed and respawned; the MDS log
 shows `set_mon_vals mds_allow_async_dirops = false` after the respawn):
 
@@ -93,9 +111,9 @@ same value again does not help (`(no change)`, so no notification).
 
 ## Notes and limits
 
-- The kernel client is the only active client, so it is the loner and the
-  final state is `excl->sync`. A variant without a loner (`lock->sync`, many
-  clients holding caps on the directory) has not been reproduced.
+- In `borrow` the kernel client is the only active client, so it is the
+  loner and the final state is `excl->sync`. `noloner` reaches the same cycle
+  without a loner (`lock->sync`).
 - DIR_CREATE/DIR_UNLINK caps are issued only while D.file is EXCL (loner).
   A writer from a *different* client forces EXCL->LOCK, which revokes them
   first, so in the `direct` variant the lock cache has no issued caps when it
