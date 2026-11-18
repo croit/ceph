@@ -109,6 +109,31 @@ shows `set_mon_vals mds_allow_async_dirops = false` after the respawn):
 creating lock caches even though `config get` reported `false`. Setting the
 same value again does not help (`(no change)`, so no notification).
 
+## Fix: "mds: drop locks before waiting for a cached directory's filelock in path_traverse"
+
+If a retried request already holds the dentry rdlock but not the cached
+directory's filelock wrlock, `path_traverse` now drops all of the request's
+locks and retries, so the next attempt takes the wrlock first. The MDS log
+line is `rdlocked without ... wrlock, dropping locks and retrying`.
+
+`async_dirop_visibility.py <arm> [iterations]` checks the reason the extra
+wrlock exists: in a fresh directory per iteration, the MDS process of the arm
+is paused (SIGSTOP) while the `nowsync` kernel client creates a file. If
+`open()` returns during the pause, the create was asynchronous. Another client
+then looks the file up, the MDS is resumed, and the lookup must find it.
+
+Results (2026-11-18, `mds_allow_async_dirops=true`, kernel 6.12):
+
+| Run | MDS without the fix | MDS with the fix |
+| --- | --- | --- |
+| `borrow` (2 runs) | deadlock (earlier runs) | completed; new path taken once per run |
+| `noloner` (2 runs) | deadlock (earlier runs) | completed; new path taken once per run |
+| randomized schedules, 40 iterations | n/a | none stuck; new path taken 9 times |
+| `async_dirop_visibility.py`, 20 iterations | 20/20 creates async, 20/20 visible | 20/20 creates async, 20/20 visible |
+
+With the fix, L's lookup returns ENOENT because U's unlink of `/d/f`
+completes first.
+
 ## Notes and limits
 
 - In `borrow` the kernel client is the only active client, so it is the
