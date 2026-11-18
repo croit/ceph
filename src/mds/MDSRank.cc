@@ -3957,6 +3957,7 @@ const char** MDSRankDispatcher::get_tracked_conf_keys() const
     "mds_session_metadata_threshold",
     "mds_hide_batch_head_ceph_assert",
     "mds_allow_async_dirops",
+    "mds_traverse_drop_locks_for_lock_cache",
     NULL
   };
   return KEYS;

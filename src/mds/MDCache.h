@@ -1371,6 +1371,10 @@ class MDCache {
   // Stores the symlink target on the file object's head
   bool symlink_recovery;
 
+  // path_traverse: drop locks instead of waiting for a cached directory's
+  // filelock wrlock while holding the dentry rdlock
+  bool traverse_drop_locks_for_lock_cache;
+
   // File size recovery
   RecoveryQueue recovery_queue;
 
