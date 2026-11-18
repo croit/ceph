@@ -8456,6 +8456,18 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
 	  if (cur->filelock.is_cached() &&
 	      !(mdr->lock_cache &&
 		static_cast<const MutationImpl*>(mdr->lock_cache)->is_wrlocked(&cur->filelock))) {
+	    if (!mdr->is_wrlocked(&cur->filelock) && mdr->is_rdlocked(&dn->lock)) {
+	      // An earlier attempt rdlocked the dentry before the directory had
+	      // a lock cache. Requests attached to the lock cache hold the
+	      // filelock wrlock and then xlock the dentry, so waiting for the
+	      // wrlock while holding the dentry rdlock can deadlock. Drop all
+	      // locks and retry; the next attempt takes the wrlock first.
+	      dout(10) << "traverse: " << *dn << " rdlocked without " << cur->filelock
+		       << " wrlock, dropping locks and retrying" << dendl;
+	      mds->locker->drop_locks(mdr.get());
+	      mds->queue_waiter(cf.build());
+	      return 1;
+	    }
 	    lov.add_wrlock(&cur->filelock);
 	  }
 	  lov.add_rdlock(&dn->lock);
