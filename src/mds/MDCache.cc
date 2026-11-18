@@ -142,6 +142,8 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   export_ephemeral_random_max = g_conf().get_val<double>("mds_export_ephemeral_random_max");
 
   symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
+  traverse_drop_locks_for_lock_cache =
+    g_conf().get_val<bool>("mds_traverse_drop_locks_for_lock_cache");
 
   lru.lru_set_midpoint(g_conf().get_val<double>("mds_cache_mid"));
 
@@ -202,6 +204,12 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
   if (changed.count("mds_symlink_recovery")) {
     symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
     dout(10) << "Storing symlink targets on file object's head " << symlink_recovery << dendl;
+  }
+  if (changed.count("mds_traverse_drop_locks_for_lock_cache")) {
+    traverse_drop_locks_for_lock_cache =
+      g_conf().get_val<bool>("mds_traverse_drop_locks_for_lock_cache");
+    dout(10) << "mds_traverse_drop_locks_for_lock_cache "
+	     << traverse_drop_locks_for_lock_cache << dendl;
   }
 
   migrator->handle_conf_change(changed, mdsmap);
@@ -8450,6 +8458,20 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
 	  if (cur->filelock.is_cached() &&
 	      !(mdr->lock_cache &&
 		static_cast<const MutationImpl*>(mdr->lock_cache)->is_wrlocked(&cur->filelock))) {
+	    if (traverse_drop_locks_for_lock_cache &&
+		!mdr->is_wrlocked(&cur->filelock) && mdr->is_rdlocked(&dn->lock)) {
+	      // An earlier attempt rdlocked the dentry before the directory had
+	      // a lock cache. Requests attached to the lock cache hold the
+	      // filelock wrlock and then xlock the dentry, so waiting for the
+	      // wrlock while holding the dentry rdlock can deadlock. Drop all
+	      // locks and retry; the next attempt takes the wrlock first.
+	      // Controlled by mds_traverse_drop_locks_for_lock_cache.
+	      dout(10) << "traverse: " << *dn << " rdlocked without " << cur->filelock
+		       << " wrlock, dropping locks and retrying" << dendl;
+	      mds->locker->drop_locks(mdr.get());
+	      mds->queue_waiter(cf.build());
+	      return 1;
+	    }
 	    lov.add_wrlock(&cur->filelock);
 	  }
 	  lov.add_rdlock(&dn->lock);

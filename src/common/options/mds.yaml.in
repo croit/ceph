@@ -914,6 +914,22 @@ options:
   - mds
   fmt_desc: MDS will enable/disable the async dirop feature.
   with_legacy: true
+- name: mds_traverse_drop_locks_for_lock_cache
+  type: bool
+  level: advanced
+  desc: drop locks before waiting for a cached directory's filelock in path
+    traversal
+  long_desc: When a retried request traverses a directory whose filelock is
+    cached by a lock cache, and it already holds the dentry rdlock from an
+    earlier attempt but not the directory's filelock wrlock, drop all of its
+    locks and retry instead of waiting for the wrlock while holding the
+    rdlock. This avoids a lock-order cycle with requests attached to the lock
+    cache. Set to false to restore the previous behavior.
+  default: true
+  services:
+  - mds
+  flags:
+  - runtime
 - name: mds_dump_cache_on_map
   type: bool
   level: dev
