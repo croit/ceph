@@ -3,7 +3,7 @@
 Usage: repro.py <arm-dir> <mode>
 
 modes (see README.md):
-  borrow    kernel client's async unlink borrows its UNLINK lock cache; a
+  borrow    kernel client's next unlink borrows its UNLINK lock cache; a
             lookup retry then requests a parent ifile wrlock while holding the
             dentry rdlock -> deadlock after all delay points are released
   prevent   mds_allow_async_dirops=false (verified) before the kernel unlinks
@@ -14,12 +14,19 @@ modes (see README.md):
             mds_allow_async_dirops=false is set persistently (ceph config set),
             the MDS is failed/respawned, and the borrow schedule is run
             (REPRO_CONFIG_WHO selects the config section, default mds)
+  noloner   borrow, but before the getattr another client creates a file in
+            D (its ifile wrlock forces EXCL->LOCK and drops the kernel loner)
+            and the getattr is issued by the kernel client itself
+  evict     noloner; once the cycle is confirmed, evict an uninvolved client
+            (X), then the kernel client that owns the borrowed lock cache
+  failover  noloner; once the cycle is confirmed, `ceph mds fail` and check
+            that the respawned MDS completes the blocked requests
 
 Actors (each a separate CephFS client session):
   H  libcephfs  unlinks /e/h (hard link to F); held after taking F.snap X
   L  libcephfs  lookup /d/f  (takes dentry N RD, waits on F.snap RD)
   K  kernel     nowsync mount; sync unlink creates the UNLINK lock cache,
-                its next (async) unlink of /d/f is U
+                its next unlink of /d/f (U) attaches to that cache
   G  libcephfs  getattr/lookup of /d (starts the D.file transition to sync)
 """
 import glob
@@ -37,7 +44,7 @@ import cluster  # noqa: E402
 
 arm = Path(sys.argv[1]).resolve()
 mode = sys.argv[2]
-assert mode in ('borrow', 'prevent', 'toggle', 'direct', 'restart'), mode
+assert mode in ('borrow', 'prevent', 'toggle', 'direct', 'restart', 'noloner', 'evict', 'failover'), mode
 env = cluster.arm_env(arm)
 if os.environ.get('REPRO_REEXEC') != '1':
     env['REPRO_REEXEC'] = '1'
@@ -279,6 +286,7 @@ if mode == 'restart':
     snapshot('r1-after-restart')
 
 H, L, U, G = (client(r) for r in ('H', 'L', 'U', 'G'))
+X = client('X') if mode in ('noloner', 'evict', 'failover') else None
 hid, lid, uid, gid = (session_id(r) for r in ('H', 'L', 'U', 'G'))
 log('client ids H=%d L=%d U=%d G=%d K=%d' % (hid, lid, uid, gid, kc))
 asok('unlink_hold_cap_deferral', 'clear_events')
@@ -286,7 +294,7 @@ log('mds_allow_async_dirops at start: %s' % asok('config', 'get', 'mds_allow_asy
 snapshot('00-initial')
 
 # ---------------------------------------------------------------- schedule
-borrow = mode in ('borrow', 'prevent', 'toggle', 'restart')
+borrow = mode in ('borrow', 'prevent', 'toggle', 'restart', 'noloner', 'evict', 'failover')
 if mode == 'direct':
     U.stat('/d/f')             # libcephfs U unlinks without a fresh lookup
 
@@ -314,8 +322,10 @@ if borrow:
     log('kernel unlinked /d/x1')
     time.sleep(1)
     snapshot('02-after-kernel-unlink')
-    # 4. kernel client's next unlink is asynchronous (nowsync); the MDS
-    #    attaches it to K (borrowing K's D.file/D.nest WR) and it waits on N X.
+    # 4. kernel client's next unlink: the MDS attaches it to K (borrowing
+    #    K's D.file/D.nest WR) and it waits on N X. Any create/unlink of the
+    #    cache owner attaches, whether the client sent it async or not; in
+    #    these runs the unlink() call blocks, so it was sent synchronously.
     tu = Blocking('U-unlink', lambda: os.unlink(mnt / 'd' / 'f'))
     tu.start()
     u_owner = kc
@@ -334,13 +344,32 @@ snapshot('025-U-waiting')
 if mode == 'direct':
     asok('unlink_hold_cap_deferral', 'arm_defer_caps', str(kc))
 
-# 5. G getattr on D needs D.file RD: starts LOCK/EXCL -> SYNC, invalidating
-#    lock caches on D.
-tg = Blocking('G-getattr', lambda: G.statx('/d', cephfs.CEPH_STATX_SIZE |
-                                           cephfs.CEPH_STATX_MTIME, 0))
-tg.start()
-wait_for('G getattr waits on D.file', waiting(gid, ('getattr', 'lookup'), 'failed to rdlock'),
-         threads=[tg])
+if mode in ('noloner', 'evict', 'failover'):
+    # 4b. another client writes D (create): its ifile wrlock is incompatible
+    #     with the kernel client's EXCL, so D.file goes EXCL->LOCK and the
+    #     loner is dropped, as with many clients holding caps on D.
+    fdx = X.open('/d/x2', 'w', 0o644)
+    X.close(fdx)
+    log('client X created /d/x2')
+    time.sleep(1)
+    snapshot('027-after-X-create')
+    # 5. the kernel client itself stats D; lacking Fs it sends a getattr.
+    import subprocess as sp
+    gproc = sp.Popen(['stat', '-c', '%s %Y', str(mnt / 'd')], stdout=sp.DEVNULL,
+                     stderr=sp.DEVNULL)
+    tg = Blocking('G-getattr', lambda: gproc.wait())
+    tg.start()
+    gid = kc
+    wait_for('kernel getattr waits on D.file', waiting(kc, ('getattr', 'lookup'), 'failed to rdlock'),
+             threads=[tg])
+else:
+    # 5. G getattr on D needs D.file RD: starts LOCK/EXCL -> SYNC, invalidating
+    #    lock caches on D.
+    tg = Blocking('G-getattr', lambda: G.statx('/d', cephfs.CEPH_STATX_SIZE |
+                                               cephfs.CEPH_STATX_MTIME, 0))
+    tg.start()
+    wait_for('G getattr waits on D.file', waiting(gid, ('getattr', 'lookup'), 'failed to rdlock'),
+             threads=[tg])
 snapshot('03-G-waiting')
 
 # 6. release H: F.snap X drops and L retries its traversal.
@@ -392,6 +421,39 @@ if restart_info is not None:
     restart_info['lock_cache_attach_after_restart'] = mds_log_count(
         'found lock cache for', after_respawn=True)
     result['restart'] = restart_info
+if mode == 'failover' and pending:
+    run([ceph, 'mds', 'fail', 'a'])
+    log('ceph mds fail a, cycle formed')
+    t0 = time.time()
+
+    def active_again():
+        try:
+            return asok('status')['state'] == 'up:active'
+        except Exception:
+            return False
+    time.sleep(2)
+    wait_for('MDS active again after fail', active_again, timeout=180)
+    result['failover_active_after_s'] = round(time.time() - t0, 1)
+    deadline = time.time() + 90
+    while time.time() < deadline and not (tl.done_at and tg.done_at):
+        time.sleep(1)
+    result['pending_after_failover'] = mds_pending()
+    result['L_returned_after_failover'] = bool(tl.done_at)
+    result['G_returned_after_failover'] = bool(tg.done_at)
+    result['released_by_failover'] = bool(tl.done_at) and not result['pending_after_failover']
+    snapshot('06-after-failover')
+if mode == 'evict' and pending:
+    xid = session_id('X')
+    asok('session', 'evict', 'id=%d' % xid)
+    log('evicted uninvolved client X (client.%d)' % xid)
+    result['pending_after_evict_uninvolved'] = observe(30)
+    snapshot('06-after-evict-X')
+    asok('session', 'evict', 'id=%d' % kc)
+    log('evicted kernel client (client.%d, owner of the borrowed lock cache)' % kc)
+    result['pending_after_evict_owner'] = observe(30)
+    snapshot('07-after-evict-owner')
+    result['released_by_evicting_owner'] = not result['pending_after_evict_owner']
+    result['released_by_evicting_uninvolved'] = not result['pending_after_evict_uninvolved']
 for t in (th, tl, tu, tg):
     result[t.name] = {'returned': bool(t.done_at), 'error': t.error}
 (ev / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
