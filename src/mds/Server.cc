@@ -266,6 +266,7 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   forward_all_requests_to_auth = g_conf().get_val<bool>("mds_forward_all_requests_to_auth");
   replay_unsafe_with_closed_session = g_conf().get_val<bool>("mds_replay_unsafe_with_closed_session");
   allow_batched_ops = g_conf().get_val<bool>("mds_allow_batched_ops");
+  skip_purging_remote_links = g_conf().get_val<bool>("mds_skip_purging_remote_links");
   cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
   max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
   delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
@@ -1344,6 +1345,9 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
   }
   if (changed.count("mds_allow_batched_ops")) {
     allow_batched_ops = g_conf().get_val<bool>("mds_allow_batched_ops");
+  }
+  if (changed.count("mds_skip_purging_remote_links")) {
+    skip_purging_remote_links = g_conf().get_val<bool>("mds_skip_purging_remote_links");
   }
   if (changed.count("mds_cap_revoke_eviction_timeout")) {
     cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
@@ -5073,6 +5077,13 @@ void Server::handle_client_readdir(MDRequestRef& mdr)
     // better for the MDS to do the work, if we think the client will stat any of these files.
     if (dnl->is_remote() && !in) {
       in = mdcache->get_inode(dnl->get_remote_ino());
+      if (skip_purging_remote_links && in &&
+	  in->state_test(CInode::STATE_PURGING)) {
+	// Nothing may take a new reference on a purging inode, and the
+	// entry goes away with it: leave it out of the listing.
+	dout(10) << "skipping remote link to purging " << *in << " on " << *dn << dendl;
+	continue;
+      }
       if (in) {
 	dn->link_remote(dnl, in);
       } else if (dn->state_test(CDentry::STATE_BADREMOTEINO)) {
@@ -11870,8 +11881,16 @@ bool Server::build_snap_diff(
     // better for the MDS to do the work, if we think the client will stat any of these files.
     if (dnl->is_remote() && !in) {
       in = mdcache->get_inode(dnl->get_remote_ino());
-      dout(20) << __func__ << " remote in: " << *in << " ino " << std::hex << dnl->get_remote_ino() << std::dec << dendl;
+      if (skip_purging_remote_links && in &&
+	  in->state_test(CInode::STATE_PURGING)) {
+	// Nothing may take a new reference on a purging inode, and the
+	// entry goes away with it: leave it out of the diff.
+	dout(10) << __func__ << " skipping remote link to purging " << *in
+		 << " on " << *dn << dendl;
+	continue;
+      }
       if (in) {
+	dout(20) << __func__ << " remote in: " << *in << " ino " << std::hex << dnl->get_remote_ino() << std::dec << dendl;
 	dn->link_remote(dnl, in);
       } else if (dn->state_test(CDentry::STATE_BADREMOTEINO)) {
 	dout(10) << "skipping bad remote ino on " << *dn << dendl;

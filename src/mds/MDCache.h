@@ -1374,6 +1374,8 @@ class MDCache {
   // path_traverse: drop locks instead of waiting for a cached directory's
   // filelock wrlock while holding the dentry rdlock
   bool traverse_drop_locks_for_lock_cache;
+  // path_traverse: treat a remote dentry whose inode is being purged as gone
+  bool skip_purging_remote_links;
 
   // File size recovery
   RecoveryQueue recovery_queue;

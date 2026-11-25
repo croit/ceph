@@ -930,6 +930,23 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_skip_purging_remote_links
+  type: bool
+  level: advanced
+  desc: leave out remote dentries whose inode is being purged in readdir,
+    snapdiff and path traversal
+  long_desc: When a remote (hard link or snapshot) dentry resolves to an inode
+    that is being purged, readdir and snapdiff leave the entry out and path
+    traversal returns ENOENT instead of linking the dentry to the inode. A
+    link would add a reference to the purging inode and abort the MDS with
+    "rogue reference to purging inode" or in MDCache::remove_inode(). Off by
+    default; dirfrag fetch never links such dentries regardless of this
+    option.
+  default: false
+  services:
+  - mds
+  flags:
+  - runtime
 - name: mds_dump_cache_on_map
   type: bool
   level: dev
