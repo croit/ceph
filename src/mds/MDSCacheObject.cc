@@ -3,7 +3,11 @@
 
 #include "MDSCacheObject.h"
 #include "MDSContext.h"
+#include "common/BackTrace.h"
+#include "common/Clock.h"
 #include "common/Formatter.h"
+
+#include <sstream>
 
 std::string_view MDSCacheObject::generic_pin_name(int p) const {
   switch (p) {
@@ -19,7 +23,48 @@ std::string_view MDSCacheObject::generic_pin_name(int p) const {
     case PIN_CLIENTLEASE: return "clientlease";
     case PIN_DISCOVERBASE: return "discoverbase";
     case PIN_SCRUBQUEUE: return "scrubqueue";
+    case PIN_INJECTED: return "injected";
     default: ceph_abort(); return std::string_view();
+  }
+}
+
+void MDSCacheObject::pin_track_event(int by, bool get)
+{
+  PinTrackEvent ev;
+  ev.by = by;
+  ev.get = get;
+  ev.stamp = ceph_clock_now();
+  if (get && !pin_track_expected(by)) {
+    ClibBackTrace bt(2);
+    std::ostringstream os;
+    bt.print(os);
+    ev.backtrace = os.str();
+  }
+  if (pin_track->events.size() >= PIN_TRACK_MAX_EVENTS) {
+    pin_track->events.pop_front();
+    pin_track->dropped++;
+  }
+  pin_track->events.push_back(std::move(ev));
+}
+
+void MDSCacheObject::print_pin_track(std::ostream& out) const
+{
+  if (!pin_track) {
+    out << "pin tracking not active";
+    return;
+  }
+  out << "pin events of still-held pin types (" << pin_track->events.size()
+      << " events kept, " << pin_track->dropped << " older dropped):";
+  for (const auto& ev : pin_track->events) {
+#ifdef MDS_REF_SET
+    auto it = ref_map.find(ev.by);
+    if (it == ref_map.end() || it->second <= 0)
+      continue;
+#endif
+    out << "\n  " << (ev.get ? "get " : "put ") << pin_name(ev.by)
+	<< " at " << ev.stamp;
+    if (!ev.backtrace.empty())
+      out << " from:\n" << ev.backtrace;
   }
 }
 

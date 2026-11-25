@@ -350,9 +350,47 @@ void MDCache::remove_inode(CInode *o)
 	 << " inode_refs=" << o->get_num_ref()
 	 << " inode (named pins and state): " << *o
 	 << dendl;
+    CachedStackStringStream css;
+    print_requests_referencing(o, *css);
+    derr << "remove_inode requests referencing the inode:" << css->strv() << dendl;
+    if (o->is_pin_tracked()) {
+      CachedStackStringStream pss;
+      o->print_pin_track(*pss);
+      derr << "remove_inode inode " << pss->strv() << dendl;
+    }
   }
   ceph_assert(o->get_num_ref() == 0);
-  delete o; 
+  delete o;
+}
+
+void MDCache::print_requests_referencing(MDSCacheObject *o, std::ostream& out)
+{
+  int n = 0;
+  for (const auto& p : active_requests) {
+    const MDRequestRef& mdr = p.second;
+    const auto *os = mdr->find_object_state(o);
+    CachedStackStringStream locks;
+    for (const auto& lop : mdr->locks) {
+      if (lop.lock->get_parent() != o)
+	continue;
+      *locks << " " << *lop.lock
+	     << (lop.is_xlock() ? "/x" : lop.is_wrlock() ? "/w" :
+		 lop.is_rdlock() ? "/r" : lop.is_remote_wrlock() ? "/remote-w" :
+		 "/statepin");
+    }
+    if (!os && locks->strv().empty())
+      continue;
+    out << "\n  " << *mdr << " flag_point=" << mdr->state_string()
+	<< " age=" << mdr->get_duration();
+    if (os)
+      out << " pinned=" << os->pinned << " auth_pinned=" << os->auth_pinned
+	  << " remote_auth_pinned=" << os->remote_auth_pinned;
+    if (!locks->strv().empty())
+      out << " locks:" << locks->strv();
+    ++n;
+  }
+  if (!n)
+    out << " none";
 }
 
 file_layout_t MDCache::gen_default_file_layout(const MDSMap &mdsmap)

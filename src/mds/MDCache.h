@@ -741,6 +741,9 @@ class MDCache {
 
   void remove_inode(CInode *in);
 
+  // debug: list active requests that pin, auth-pin or lock the object
+  void print_requests_referencing(MDSCacheObject *o, std::ostream& out);
+
   void touch_dentry(CDentry *dn) {
     if (dn->state_test(CDentry::STATE_BOTTOMLRU)) {
       bottom_lru.lru_midtouch(dn);

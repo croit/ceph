@@ -77,6 +77,27 @@ static void dump_purge_state_mismatch(
        << ", expected dentry refs: dirty=" << !!dn->is_dirty()
        << ", fragmenting=" << state_fragmenting
        << ", inodepin=" << !!in_refs << ", purging=1" << dendl;
+
+  // who holds the references: active requests, and (with
+  // mds_debug_purge_pin_tracking) the pins taken since the purge started
+  CachedStackStringStream css;
+  mds->mdcache->print_requests_referencing(in, *css);
+  derr << __func__ << ": phase=" << phase
+       << ", requests referencing the inode:" << css->strv() << dendl;
+  css->reset();
+  mds->mdcache->print_requests_referencing(dn, *css);
+  derr << __func__ << ": phase=" << phase
+       << ", requests referencing the dentry:" << css->strv() << dendl;
+  if (in->is_pin_tracked()) {
+    css->reset();
+    in->print_pin_track(*css);
+    derr << __func__ << ": phase=" << phase << ", inode " << css->strv() << dendl;
+  }
+  if (dn->is_pin_tracked()) {
+    css->reset();
+    dn->print_pin_track(*css);
+    derr << __func__ << ": phase=" << phase << ", dentry " << css->strv() << dendl;
+  }
 }
 
 class StrayManagerIOContext : public virtual MDSIOContextBase {
@@ -185,6 +206,12 @@ void StrayManager::purge(CDentry *dn)
 	item.old_pools.push_back(p);
     }
     item.snapc = *snapc;
+  }
+
+  if (g_conf().get_val<bool>("mds_inject_purge_rogue_pin")) {
+    // test only: leak a reference so the purge callback finds a rogue one
+    derr << __func__ << ": injecting rogue pin on " << *in << dendl;
+    in->get(CInode::PIN_INJECTED);
   }
 
   purge_queue.push(item, new C_IO_PurgeStrayPurged(
@@ -331,6 +358,7 @@ void StrayManager::_purge_stray_logged(CDentry *dn, version_t pdv, MutationRef& 
   in->state_clear(CInode::STATE_ORPHAN);
   dn->state_clear(CDentry::STATE_PURGING | CDentry::STATE_PURGINGPINNED);
   dn->put(CDentry::PIN_PURGING);
+  dn->stop_pin_track();  // the inode's record goes away with the inode
 
 
   // drop dentry?
@@ -368,6 +396,13 @@ void StrayManager::enqueue(CDentry *dn, bool trunc)
    * enqueing it twice */
   dn->state_set(CDentry::STATE_PURGING);
   in->state_set(CInode::STATE_PURGING);
+
+  // record who takes references while the stray is purged; printed only if
+  // the purge finds a rogue reference
+  if (g_conf().get_val<bool>("mds_debug_purge_pin_tracking")) {
+    dn->start_pin_track();
+    in->start_pin_track();
+  }
 
   /* We must clear this as soon as enqueuing it, to prevent the journal
    * expiry code from seeing a dirty parent and trying to write a backtrace */
@@ -841,6 +876,8 @@ void StrayManager::_truncate_stray_logged(CDentry *dn, MutationRef& mut)
   in->state_clear(CInode::STATE_PURGING);
   dn->state_clear(CDentry::STATE_PURGING | CDentry::STATE_PURGINGPINNED);
   dn->put(CDentry::PIN_PURGING);
+  in->stop_pin_track();
+  dn->stop_pin_track();
 
   dn->get_dir()->auth_unpin(this);
 

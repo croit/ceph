@@ -139,6 +139,10 @@ public:
     default: return generic_pin_name(p);
     }
   }
+  bool pin_track_expected(int by) const override {
+    return by == PIN_DIRTY || by == PIN_INODEPIN || by == PIN_FRAGMENTING ||
+	   by == PIN_PURGING;
+  }
 
   // -- wait --
   //static const int WAIT_LOCK_OFFSET = 8;
