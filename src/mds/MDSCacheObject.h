@@ -1,7 +1,10 @@
 #ifndef CEPH_MDSCACHEOBJECT_H
 #define CEPH_MDSCACHEOBJECT_H
 
+#include <deque>
+#include <memory>
 #include <ostream>
+#include <string>
 #include <string_view>
 
 #include "common/config.h"
@@ -77,6 +80,23 @@ class MDSCacheObject {
   static const int PIN_CLIENTLEASE = 1009;
   static const int PIN_DISCOVERBASE = 1010;
   static const int PIN_SCRUBQUEUE = 1011;     // for scrub of inode and dir
+  static const int PIN_INJECTED   = 1012;     // test only: mds_inject_purge_rogue_pin
+
+  // -- pin tracking (debug) --
+  // While an object is tracked, every get/put is recorded in memory; gets
+  // of unexpected pin types also record a backtrace. Nothing is logged
+  // until print_pin_track() is called.
+  struct PinTrackEvent {
+    int by = 0;
+    bool get = false;
+    utime_t stamp;
+    std::string backtrace;
+  };
+  struct PinTrack {
+    std::deque<PinTrackEvent> events;
+    uint64_t dropped = 0;
+  };
+  static const size_t PIN_TRACK_MAX_EVENTS = 32;
 
   // -- state --
   const static int STATE_AUTH      = (1<<30);
@@ -157,6 +177,8 @@ class MDSCacheObject {
 #ifdef MDS_REF_SET
       ref_map[by]--;
 #endif
+      if (pin_track)
+	pin_track_event(by, false);
       if (ref == 0)
 	last_put();
       if (state_test(STATE_NOTIFYREF))
@@ -180,7 +202,20 @@ class MDSCacheObject {
       ref_map[by] = 0;
     ref_map[by]++;
 #endif
+    if (pin_track)
+      pin_track_event(by, true);
   }
+
+  void start_pin_track() {
+    if (!pin_track)
+      pin_track = std::make_unique<PinTrack>();
+  }
+  void stop_pin_track() { pin_track.reset(); }
+  bool is_pin_tracked() const { return !!pin_track; }
+  // pin types whose gets are recorded without a backtrace
+  virtual bool pin_track_expected(int by) const { return by == PIN_DIRTY; }
+  // recorded events of the pin types that are still held
+  void print_pin_track(std::ostream& out) const;
 
   void print_pin_set(std::ostream& out) const {
 #ifdef MDS_REF_SET
@@ -309,6 +344,9 @@ class MDSCacheObject {
 #ifdef MDS_REF_SET
   mempool::mds_co::flat_map<int,int> ref_map;
 #endif
+
+  std::unique_ptr<PinTrack> pin_track;
+  void pin_track_event(int by, bool get);
 
   int auth_pins = 0;
 #ifdef MDS_AUTHPIN_SET

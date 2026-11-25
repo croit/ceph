@@ -914,6 +914,20 @@ options:
   - mds
   fmt_desc: MDS will enable/disable the async dirop feature.
   with_legacy: true
+- name: mds_debug_purge_pin_tracking
+  type: bool
+  level: advanced
+  desc: record who takes references on strays while they are purged
+  long_desc: While a stray inode and its dentry are being purged, record
+    every reference taken or dropped on them, with a backtrace for
+    unexpected reference types. The records are kept in memory only and are
+    logged only when the purge finds a rogue reference (just before the MDS
+    aborts). Applies to strays queued for purge after it is enabled.
+  default: false
+  services:
+  - mds
+  flags:
+  - runtime
 - name: mds_traverse_drop_locks_for_lock_cache
   type: bool
   level: advanced
@@ -1039,6 +1053,19 @@ options:
   services:
   - mds
   fmt_desc: probabilistically inject corrupt CDentry::first at journal load
+  flags:
+  - runtime
+- name: mds_inject_purge_rogue_pin
+  type: bool
+  level: dev
+  default: false
+  services:
+  - mds
+  desc: leak a reference on each stray inode sent to the purge queue
+  long_desc: Test only. Every stray inode that is purged takes an extra
+    reference that is never dropped, so the purge callback aborts with
+    "rogue reference to purging inode". Used to test
+    mds_debug_purge_pin_tracking.
   flags:
   - runtime
 - name: mds_kill_mdstable_at
