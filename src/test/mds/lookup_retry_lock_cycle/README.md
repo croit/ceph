@@ -90,10 +90,16 @@ Final D state in `borrow`: `ifile excl->sync w=1`, `inest lock w=1`,
 `inest lock w=1`, no loner, every client holding `pAsLsXs` on D, and the
 blocked getattr comes from the same client as the blocked unlink.
 
-`evict` (2026-11-17): evicting X does not release anything. Evicting the
-kernel client that owns the borrowed lock cache aborts the MDS with
+`evict` (2026-11-17, without "mds: clear `batch_op_map` when the batch op is
+released"): evicting X does not release anything. Evicting the kernel client
+that owns the borrowed lock cache aborts the MDS with
 `FAILED ceph_assert(!mdr->is_batch_head())` (`Server.cc`, reached from
 `C_MDL_DropCache` -> `drop_locks`), so eviction is not a safe way out.
+
+`evict` with that fix and "mds: use SimpleLock::WAIT_ALL for wait mask" (both
+on this branch; `mds_traverse_drop_locks_for_lock_cache=false` so the deadlock
+still forms): two runs, no abort; evicting the kernel client releases every
+blocked request.
 
 Restart runs (option persisted as false, MDS failed and respawned; the MDS log
 shows `set_mon_vals mds_allow_async_dirops = false` after the respawn):
