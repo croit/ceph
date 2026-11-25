@@ -144,6 +144,8 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
   traverse_drop_locks_for_lock_cache =
     g_conf().get_val<bool>("mds_traverse_drop_locks_for_lock_cache");
+  skip_purging_remote_links =
+    g_conf().get_val<bool>("mds_skip_purging_remote_links");
 
   lru.lru_set_midpoint(g_conf().get_val<double>("mds_cache_mid"));
 
@@ -210,6 +212,12 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
       g_conf().get_val<bool>("mds_traverse_drop_locks_for_lock_cache");
     dout(10) << "mds_traverse_drop_locks_for_lock_cache "
 	     << traverse_drop_locks_for_lock_cache << dendl;
+  }
+  if (changed.count("mds_skip_purging_remote_links")) {
+    skip_purging_remote_links =
+      g_conf().get_val<bool>("mds_skip_purging_remote_links");
+    dout(10) << "mds_skip_purging_remote_links "
+	     << skip_purging_remote_links << dendl;
   }
 
   migrator->handle_conf_change(changed, mdsmap);
@@ -8514,6 +8522,15 @@ int MDCache::path_traverse(MDRequestRef& mdr, MDSContextFactory& cf,
         ceph_assert(dnl->is_remote());
         // do i have it?
         in = get_inode(dnl->get_remote_ino());
+        if (skip_purging_remote_links && in &&
+	    in->state_test(CInode::STATE_PURGING)) {
+	  // Nothing may take a new reference on a purging inode, and the
+	  // entry goes away with it: treat it as gone.
+	  dout(7) << "traverse: remote link to purging " << *in << " on " << *dn << dendl;
+	  if (pdnvec)
+	    pdnvec->clear();   // no trace for an entry we report as missing
+	  return -CEPHFS_ENOENT;
+	}
         if (in) {
 	  dout(7) << "linking in remote in " << *in << dendl;
 	  dn->link_remote(dnl, in);

@@ -566,6 +566,8 @@ private:
   int64_t bal_fragment_size_max = 0;
   bool hide_batch_head_ceph_assert = false;
   bool allow_batched_ops = true;
+  // readdir/snapdiff: leave out remote dentries whose inode is being purged
+  bool skip_purging_remote_links = false;
 
   double inject_rename_corrupt_dentry_first = 0.0;
 
