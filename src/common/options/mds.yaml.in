@@ -1068,6 +1068,21 @@ options:
     mds_debug_purge_pin_tracking.
   flags:
   - runtime
+- name: mds_inject_stale_snap_dentry_bug
+  type: bool
+  level: dev
+  default: false
+  services:
+  - mds
+  desc: restore the old stale snapshot dentry handling (testing only)
+  long_desc: Testing only. A partial dirfrag fetch advances snap_purged_thru
+    again, and a dirfrag fetch links a remote dentry to an inode that is
+    being purged. Together they let a stale remote snapshot dentry take a
+    reference on a stray while it is purged, so the MDS aborts with
+    "rogue reference to purging inode" or in MDCache::remove_inode().
+    Used to reproduce that crash on an MDS that has the fix.
+  flags:
+  - runtime
 - name: mds_kill_mdstable_at
   type: int
   level: dev
